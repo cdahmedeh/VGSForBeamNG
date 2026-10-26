@@ -1,0 +1,15 @@
+{
+  "domElement": "<vgs-display></vgs-display>",
+  "directive": "vgsDisplay",
+  "name": "VGS Display",
+  "author": "Ahmed",
+  "version": "0.1",
+  "description": "Per-wheel grip use, torque and steering, laid out like the vehicle. Inspired by Enthusia's VGS. Click the app for numbers.",
+  "css": {
+    "width": "220px",
+    "height": "240px",
+    "bottom": "140px",
+    "right": "20px"
+  },
+  "types": ["ui.apps.categories.debug"]
+}
