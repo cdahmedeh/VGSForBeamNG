@@ -6,8 +6,9 @@
  *                greyish red just past the limit, deeper and more saturated as it slides more
  *   Outline    : torque applied — grey neutral, greener with drive, redder with braking
  *   Rotation   : each wheel's live steering angle
- *   Underneath : axles (brighter when driven), chassis spine, engine block or
- *                electric motors where they sit, driveshafts and differentials
+ *   Underneath : axles (fainter where nothing drives them), chassis spine, engine
+ *                block or electric motors where they sit, gearbox, driveshafts and
+ *                differentials (hollow open, centre block limited-slip, solid locked)
  *                to the wheels each one drives (tinted by the torque flowing)
  *   Dot outside a wheel : red ABS / blue ESC acting on that wheel
  *   Dot under the engine : green, traction control intervening
@@ -38,6 +39,9 @@
   var DRIVETRAIN = {
     spine:      'rgba(255, 255, 255, 0.13)',
     axle:       'rgba(255, 255, 255, 0.22)',
+    axleIdle:   'rgba(255, 255, 255, 0.12)',   // axle line where nothing drives the wheels
+    diffBg:     'rgb(22, 25, 31)',
+    gearbox:    'rgba(200, 205, 214, 0.88)',
     axleDriven: 'rgba(255, 255, 255, 0.5)',
     diff:       'rgba(236, 240, 246, 0.75)',
     engine:     'rgba(236, 240, 246, 0.88)',
@@ -55,8 +59,13 @@
   function dotRadius(tyreW) { return clamp(tyreW * 0.3, 2.5, 4.5); }
 
   // Drawing sizes in metres (scaled with the vehicle)
-  var TYRE_W = 0.34, TYRE_H = 0.8, PAD = 0.28, BODY_GAP = 0.45;
+  var TYRE_W = 0.23, TYRE_H = 0.8, PAD = 0.28, BODY_GAP = 0.45;
+  // tyres are drawn this much wider than they really are (same length), so they're easy to see
+  var TYRE_WIDEN = 1.5;
   var ENGINE_W = 0.62, ENGINE_H = 0.48, MOTOR_R = 0.2, DIFF = 0.2;
+  // gearbox and centre-diff placement when the vehicle doesn't locate them (metres)
+  var GB_SIZE = 0.34, GB_OFFSET = 0.5, CDIFF_NEAR = 0.75, CDIFF_BACK = 0.4, CDIFF_LEVEL = 0.45;
+  var TRANSVERSE_TOL = 0.3;   // engine this close (fore/aft) to a driven axle: mounted sideways
   var AXLE_TOL = 0.3; // wheels within this many metres fore/aft share an axle
   var DOT_SPACE = 0.3; // room beside the outer wheels for assist dots
   var TC_DOT_SPACE = 0.25; // room under an engine for the traction-control dot
@@ -120,11 +129,12 @@
     return axles;
   }
 
-  // Real tyre size in metres: length (top view) = diameter, width = tyre width.
+  // Tyre size in metres: length (top view) = diameter; width = tyre width, widened by TYRE_WIDEN.
+  // Dual tyres that would then touch are spread apart (see findTyreSets).
   function tyreDims(w) {
     var r = +w.rd, wd = +w.wd;
     w._len = (r > 0.1 && r < 3) ? 2 * r : TYRE_H;
-    w._wd = (wd > 0.04 && wd < 2) ? wd : TYRE_W;
+    w._wd = ((wd > 0.04 && wd < 2) ? wd : TYRE_W) * TYRE_WIDEN;
   }
 
   // Within each axle, group wheels on the same side that sit close together (dual tyres).
@@ -235,12 +245,164 @@
     return rM;
   }
 
-  // Axles, chassis spine, differentials, driveshafts and power sources (under the tyres).
+  // ----- Drive graph --------------------------------------------------------
+  // Nodes { k: 'src'|'gb'|'diff'|'wheel', p: parent index (1-based, 0 = none), ... } in
+  // parent-first order. The vehicle sends it (body.dt); for older data, or the preview,
+  // it's built here: a gearbox behind each engine, a differential on each axle a source
+  // drives two or more wheels of, and a centre differential when it drives several axles.
+  function synthDrivetrain(wheels, sources) {
+    var nodes = [], axles = findAxles(wheels);
+    function add(n) { nodes.push(n); return nodes.length; }
+    toArray(sources).forEach(function (src, si) {
+      var ids = toArray(src.w).map(Number);
+      var root = add({ k: 'src', si: si, p: 0 });
+      var top = src.k === 'ev' ? root : add({ k: 'gb', p: root });
+      var groups = [];
+      axles.forEach(function (a) {
+        var seen = {}, mine = [];
+        a.wheels.forEach(function (w) {
+          if (ids.indexOf(+w.i) !== -1 && !seen[w.i]) { seen[w.i] = true; mine.push(+w.i); }
+        });
+        if (mine.length) groups.push(mine);
+      });
+      var parent = groups.length > 1 ? add({ k: 'diff', p: top, st: 'lsd' }) : top;
+      groups.forEach(function (g) {
+        var at = g.length > 1 ? add({ k: 'diff', p: parent, st: 'open' }) : parent;
+        g.forEach(function (i) { add({ k: 'wheel', w: i, p: at }); });
+      });
+    });
+    return nodes;
+  }
+
+  // Positions (metres) for every node. Wheels and axle differentials sit at their wheels;
+  // engines where the vehicle puts them; gearboxes and centre differentials where the
+  // vehicle's structure names them, otherwise next to the engine / gearbox.
+  function placeDrivetrain(body, centreX, sourceX) {
+    var raw = toArray(body.dt);
+    if (!raw.length) raw = synthDrivetrain(body.wheels, body.sources);
+    var nodes = raw.map(function (n) { var c = {}; for (var k in n) c[k] = n[k]; c.kids = []; return c; });
+    var wheelById = {};
+    body.wheels.forEach(function (w) { if (!(w.i in wheelById)) wheelById[w.i] = w; });
+    nodes.forEach(function (n) {
+      n.parent = +n.p > 0 ? (nodes[+n.p - 1] || null) : null;
+      if (n.parent) n.parent.kids.push(n);
+    });
+    function under(n) {
+      if (n.ws) return n.ws;
+      var ws = [];
+      if (n.k === 'wheel') { if (wheelById[n.w]) ws.push(wheelById[n.w]); }
+      else n.kids.forEach(function (c) { ws = ws.concat(under(c)); });
+      return (n.ws = ws);
+    }
+    function mean(ws, key) { return ws.reduce(function (s, w) { return s + (+w[key] || 0); }, 0) / ws.length; }
+    function known(v) { return v !== undefined && v !== null && isFinite(+v); }
+    var midY = body.wheels.length ? mean(body.wheels, 'y') : 0;   // middle of the wheelbase
+
+    nodes.forEach(function (n) {
+      var ws = under(n);
+      if (n.k === 'wheel' && ws.length) { n.x = +ws[0].x; n.y = +ws[0].y; }
+      else if (n.k === 'diff' && ws.length) {
+        var ys = ws.map(function (w) { return +w.y; });
+        if (Math.max.apply(null, ys) - Math.min.apply(null, ys) < AXLE_TOL) {
+          n.axle = true; n.x = mean(ws, 'x'); n.y = mean(ws, 'y');
+        }
+      }
+    });
+    nodes.forEach(function (n) {
+      var P = n.parent;
+      n.dead = !!(+n.dc || (P && P.dead));   // disconnected here or further up
+      if (n.k === 'src') {
+        var s = body.sources[+n.si];
+        if (!s) return;
+        n.src = s; n.x = sourceX(s); n.y = +s.y; n.shift = n.x - +s.x;
+        return;
+      }
+      if (!P || P.x === undefined) return;
+      if (n.k === 'gb') {
+        // always in line with its engine (on the centreline for an engine drawn there); only
+        // the fore/aft position is taken from the vehicle when it locates the transmission
+        n.shift = P.shift || 0;
+        n.x = P.x;
+        if (known(n.gy)) { n.y = +n.gy; return; }
+        var ws = under(n), dy = ws.length ? mean(ws, 'y') - P.y : -1;
+        // an engine sitting on one of its driven axles is mounted sideways: put the gearbox just
+        // behind it, towards the middle of the vehicle; otherwise towards the wheels it drives
+        var onAxle = ws.some(function (w) { return Math.abs(+w.y - P.y) < TRANSVERSE_TOL; });
+        if (onAxle || Math.abs(dy) < 0.3) dy = midY - P.y;
+        n.y = P.y + (dy > 0 ? 1 : -1) * GB_OFFSET;
+      } else if (n.k === 'diff' && !n.axle) {
+        n.shift = P.shift || 0;
+        if (known(n.gx) && known(n.gy)) { n.x = +n.gx + n.shift; n.y = +n.gy; return; }
+        var anchors = n.kids.map(function (c) {
+          if (c.y !== undefined) return c.y;
+          var cw = under(c);
+          return cw.length ? mean(cw, 'y') : P.y;
+        });
+        if (!anchors.length) return;
+        var ahead = anchors.some(function (y) { return y > P.y + 0.2; });
+        var behind = anchors.some(function (y) { return y < P.y - 0.2; });
+        var level = anchors.some(function (y) { return Math.abs(y - P.y) <= 0.2; });
+        var farthest = anchors.reduce(function (f, y) { return Math.abs(y - P.y) > Math.abs(f - P.y) ? y : f; }, anchors[0]);
+        if (level && (ahead || behind)) {
+          // feeds the axle it sits on plus another (transverse-engine AWD): on the centreline
+          // just past that axle's diff, towards the other axle
+          n.y = P.y + (farthest > P.y ? 1 : -1) * Math.min(CDIFF_LEVEL, Math.abs(farthest - P.y) * 0.4);
+        } else if (ahead && behind) {
+          // feeds both ends (AWD transfer case): just past the gearbox, towards the far axle
+          var far = anchors.reduce(function (f, y) { return Math.abs(y - P.y) > Math.abs(f - P.y) ? y : f; }, anchors[0]);
+          n.y = P.y + (far > P.y ? 1 : -1) * Math.min(CDIFF_NEAR, Math.abs(far - P.y) * 0.6);
+        } else {
+          // feeds axles on one side (truck inter-axle diff): just ahead of the nearest one
+          var near = anchors.reduce(function (f, y) { return Math.abs(y - P.y) < Math.abs(f - P.y) ? y : f; }, anchors[0]);
+          n.y = near + (P.y > near ? 1 : -1) * Math.min(CDIFF_BACK, Math.abs(P.y - near) / 2);
+        }
+        n.x = centreX;
+      }
+    });
+    return nodes;
+  }
+
+  // open: hollow; limited-slip: hollow with a centre block; locked: solid
+  function drawDiff(ctx, p, d, st, dead) {
+    ctx.save();
+    if (dead) ctx.globalAlpha = 0.5;
+    var x = p.x - d / 2, y = p.y - d / 2;
+    if (st === 'locked') {
+      ctx.fillStyle = DRIVETRAIN.diff; ctx.fillRect(x, y, d, d);
+      ctx.strokeStyle = DRIVETRAIN.engineEdge; ctx.lineWidth = 1; ctx.strokeRect(x + 0.5, y + 0.5, d - 1, d - 1);
+    } else {
+      var lw = clamp(d * 0.16, 1.2, 2);
+      ctx.fillStyle = DRIVETRAIN.diffBg; ctx.fillRect(x, y, d, d);
+      ctx.strokeStyle = DRIVETRAIN.diff; ctx.lineWidth = lw;
+      ctx.strokeRect(x + lw / 2, y + lw / 2, d - lw, d - lw);
+      if (st === 'lsd') {
+        var c = Math.max(2, d * 0.34);
+        ctx.fillStyle = DRIVETRAIN.diff; ctx.fillRect(p.x - c / 2, p.y - c / 2, c, c);
+      }
+    }
+    ctx.restore();
+  }
+
+  // gearbox: small block with a shift-gate "H"
+  function drawGearbox(ctx, p, size) {
+    ctx.save();
+    roundRect(ctx, p.x - size / 2, p.y - size / 2, size, size, Math.min(3, size * 0.2));
+    ctx.fillStyle = DRIVETRAIN.gearbox; ctx.fill();
+    ctx.strokeStyle = DRIVETRAIN.engineEdge; ctx.lineWidth = 1.2; ctx.stroke();
+    var g = size * 0.24;
+    ctx.strokeStyle = 'rgba(0, 0, 0, 0.6)'; ctx.lineWidth = Math.max(1, size * 0.09); ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(p.x - g, p.y - g); ctx.lineTo(p.x - g, p.y + g);
+    ctx.moveTo(p.x + g, p.y - g); ctx.lineTo(p.x + g, p.y + g);
+    ctx.moveTo(p.x - g, p.y);     ctx.lineTo(p.x + g, p.y);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // Axles, chassis spine, driveshafts, differentials, gearbox and power sources (under the tyres).
   // map(x, y) converts vehicle metres to canvas pixels; s = pixels per metre.
   function drawDrivetrain(ctx, body, map, s) {
     var g = body.geo, axles = g.axles;
-    var byId = {};
-    body.wheels.forEach(function (w) { byId[w.i] = w; });
     ctx.save();
     ctx.lineCap = 'round';
 
@@ -256,67 +418,81 @@
       });
       return (left > 0) !== (right > 0) ? +src.x : centreX;
     }
+    var nodes = placeDrivetrain(body, centreX, sourceX);
     var drivenWidth = clamp(0.09 * s, 2, 4.5);
+    var ew = clamp(ENGINE_W * s, 12, 34), eh = clamp(ENGINE_H * s, 9, 26);   // engine block (px)
+    var diffPx = clamp(DIFF * s, 6, 12), gbPx = clamp(GB_SIZE * s, 9, 18), tcDots = [];
 
-    // chassis spine, front axle to rear axle
+    // Pixel position of every node. The engine block is drawn larger than life so it stays
+    // readable, so a gearbox placed at its real spot (right against the engine) would be hidden
+    // under it: move it just clear of the block.
+    nodes.forEach(function (n) { if (n.x !== undefined) n.pt = map(n.x, n.y); });
+    nodes.forEach(function (n) {
+      var E = n.parent;
+      if (n.k !== 'gb' || !n.pt || !E || E.k !== 'src' || !E.pt || !E.src || E.src.k === 'ev') return;
+      var gap = 2, needX = ew / 2 + gbPx / 2 + gap, needY = eh / 2 + gbPx / 2 + gap;
+      var dx = n.pt.x - E.pt.x, dy = n.pt.y - E.pt.y;
+      if (Math.abs(dx) >= needX || Math.abs(dy) >= needY) return;   // already clear
+      // keep the direction it already sits in (beside a transverse engine, behind an in-line one);
+      // only a gearbox right on top of the engine is moved towards the wheels it drives
+      if (Math.abs(dx) / needX >= Math.abs(dy) / needY && Math.abs(dx) > 0.5) {
+        n.pt = { x: E.pt.x + (dx > 0 ? needX : -needX), y: n.pt.y };
+      } else if (Math.abs(dy) > needY * 0.25) {
+        n.pt = { x: n.pt.x, y: E.pt.y + (dy > 0 ? needY : -needY) };
+      } else {
+        var ws = n.ws || [];
+        var wy = ws.length ? map(0, ws.reduce(function (sum, w) { return sum + +w.y; }, 0) / ws.length).y : E.pt.y;
+        if (Math.abs(wy - E.pt.y) > needY) n.pt = { x: E.pt.x, y: E.pt.y + (wy > E.pt.y ? needY : -needY) };
+        else n.pt = { x: E.pt.x - needX, y: E.pt.y };
+      }
+    });
+
+    // chassis spine, front axle to rear axle: faint like an undriven axle; the real
+    // driveshafts are drawn over it, so only the stretch with no shaft stays faded
     if (axles.length > 1) {
       var a0 = map(centreX, axles[0].y), a1 = map(centreX, axles[axles.length - 1].y);
-      ctx.strokeStyle = DRIVETRAIN.spine;
-      ctx.lineWidth = clamp(0.14 * s, 2, 7);
+      ctx.strokeStyle = DRIVETRAIN.axleIdle;
+      ctx.lineWidth = clamp(0.035 * s, 1, 2.2);
       ctx.beginPath(); ctx.moveTo(a0.x, a0.y); ctx.lineTo(a1.x, a1.y); ctx.stroke();
     }
 
-    // axles: a thin base line, then each driven half-shaft tinted by the torque going to that wheel
+    // axle lines; lighter and a hair thinner where nothing drives the wheels
     axles.forEach(function (a) {
-      if (a.wheels.length >= 2) {
-        var l = map(a.minX, a.y), r = map(a.maxX, a.y);
-        ctx.strokeStyle = DRIVETRAIN.axle;
-        ctx.lineWidth = clamp(0.05 * s, 1.5, 3);
-        ctx.beginPath(); ctx.moveTo(l.x, l.y); ctx.lineTo(r.x, r.y); ctx.stroke();
+      if (a.wheels.length < 2) return;
+      var driven = a.wheels.some(function (w) { return !!+w.d; });
+      var l = map(a.minX, a.y), r = map(a.maxX, a.y);
+      ctx.strokeStyle = driven ? DRIVETRAIN.axle : DRIVETRAIN.axleIdle;
+      ctx.lineWidth = driven ? clamp(0.05 * s, 1.5, 3) : clamp(0.035 * s, 1, 2.2);
+      ctx.beginPath(); ctx.moveTo(l.x, l.y); ctx.lineTo(r.x, r.y); ctx.stroke();
+    });
+
+    // every link of the drive graph, tinted by the torque going to the wheels below it;
+    // dashed where it's disconnected (e.g. a part-time 4WD in 2WD)
+    nodes.forEach(function (n) {
+      var P = n.parent;
+      if (!P || !n.pt || !P.pt) return;
+      var ws = n.ws || [];
+      var torque = ws.length ? ws.reduce(function (sum, w) { return sum + (+w.dr || 0); }, 0) / ws.length : 0;
+      var from = P.pt;
+      var to = (n.k === 'wheel' && P.k === 'diff' && P.axle) ? { x: n.pt.x, y: P.pt.y } : n.pt;
+      ctx.save();
+      if (n.dead) {
+        ctx.setLineDash([3, 3]);
+        ctx.strokeStyle = DRIVETRAIN.axle; ctx.lineWidth = Math.max(1.5, drivenWidth * 0.7);
+      } else {
+        ctx.strokeStyle = torqueColour(torque * 0.7); ctx.lineWidth = drivenWidth;
       }
-      var driven = a.wheels.filter(function (w) { return !!+w.d; });
-      if (!driven.length) return;
-      var hubX = driven.length > 1
-        ? driven.reduce(function (sum, w) { return sum + +w.x; }, 0) / driven.length : a.cx;
-      var hub = map(hubX, a.y);
-      driven.forEach(function (w) {
-        var end = map(+w.x, a.y);
-        ctx.strokeStyle = torqueColour((+w.dr || 0) * 0.7);
-        ctx.lineWidth = drivenWidth;
-        ctx.beginPath(); ctx.moveTo(hub.x, hub.y); ctx.lineTo(end.x, end.y); ctx.stroke();
-      });
+      ctx.beginPath(); ctx.moveTo(from.x, from.y); ctx.lineTo(to.x, to.y); ctx.stroke();
+      ctx.restore();
     });
 
-    // driveshafts from each power source to what it drives
-    var shafts = [], diffs = [];
-    body.sources.forEach(function (src) {
-      var ids = toArray(src.w), sx = sourceX(src);
-      axles.forEach(function (a) {
-        var mine = a.wheels.filter(function (w) { return ids.indexOf(w.i) !== -1; });
-        if (!mine.length) return;
-        var torque = mine.reduce(function (sum, w) { return sum + (+w.dr || 0); }, 0) / mine.length;
-        var tx = mine.length > 1 ? mine.reduce(function (sum, w) { return sum + +w.x; }, 0) / mine.length : +mine[0].x;
-        var ty = mine.length > 1 ? a.y : +mine[0].y;
-        shafts.push({ from: map(sx, +src.y), to: map(tx, ty), torque: torque });
-        if (mine.length > 1) diffs.push(map(tx, ty));
-      });
-    });
-    shafts.forEach(function (sh) {
-      ctx.strokeStyle = torqueColour(sh.torque * 0.7);
-      ctx.lineWidth = drivenWidth;
-      ctx.beginPath(); ctx.moveTo(sh.from.x, sh.from.y); ctx.lineTo(sh.to.x, sh.to.y); ctx.stroke();
-    });
-    diffs.forEach(function (p) {
-      var d = clamp(DIFF * s, 5, 12);
-      ctx.fillStyle = DRIVETRAIN.diff;
-      ctx.fillRect(p.x - d / 2, p.y - d / 2, d, d);
-    });
-
-    // engines and motors, with the traction-control dot underneath when TC is intervening
-    body.sources.forEach(function (src) {
+    // Engines, then gearboxes, then differentials on top (a transaxle's diff is inside the gearbox, and an
+    // engine sitting over its driven axle mustn't hide the lock state), then electric motors.
+    function drawSource(src, ev) {
       var p = map(sourceX(src), +src.y), bottom;
+      ctx.save();
       ctx.setLineDash(+src.e ? [3, 2] : []);
-      if (src.k === 'ev') {
+      if (ev) {
         var r = clamp(MOTOR_R * s, 5, 12);
         ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
         ctx.fillStyle = DRIVETRAIN.engineEdge; ctx.fill();
@@ -325,7 +501,6 @@
         ctx.fillStyle = DRIVETRAIN.motor; ctx.fill();
         bottom = p.y + r;
       } else {
-        var ew = clamp(ENGINE_W * s, 12, 34), eh = clamp(ENGINE_H * s, 9, 26);
         roundRect(ctx, p.x - ew / 2, p.y - eh / 2, ew, eh, Math.min(4, eh * 0.2));
         ctx.fillStyle = DRIVETRAIN.engine; ctx.fill();
         ctx.strokeStyle = DRIVETRAIN.engineEdge; ctx.lineWidth = 1.5; ctx.stroke();
@@ -336,21 +511,36 @@
           ctx.beginPath(); ctx.moveTo(p.x - ew * 0.32, yy); ctx.lineTo(p.x + ew * 0.32, yy); ctx.stroke();
         }
         bottom = p.y + eh / 2;
+        // a gearbox right behind the engine takes that spot; the TC dot goes under it
+        nodes.forEach(function (n) {
+          if (n.k !== 'gb' || !n.parent || n.parent.src !== src || !n.pt) return;
+          var gp = n.pt;
+          if (gp.y > p.y && Math.abs(gp.x - p.x) < ew / 2) bottom = Math.max(bottom, gp.y + gbPx / 2);
+        });
       }
-      ctx.setLineDash([]);
-      if (+body.tc) {
+      ctx.restore();
+      tcDots.push({ x: p.x, y: bottom });
+    }
+    body.sources.forEach(function (src) { if (src.k !== 'ev') drawSource(src, false); });
+    nodes.forEach(function (n) { if (n.k === 'gb' && n.pt) drawGearbox(ctx, n.pt, gbPx); });
+    nodes.forEach(function (n) { if (n.k === 'diff' && n.pt) drawDiff(ctx, n.pt, diffPx, n.st, n.dead); });
+    body.sources.forEach(function (src) { if (src.k === 'ev') drawSource(src, true); });
+
+    // traction-control dot under each engine / motor, last so nothing covers it
+    if (+body.tc) {
+      tcDots.forEach(function (d0) {
         var dr = clamp(0.09 * s, 2.5, 4.5);
-        var cy = bottom + Math.max(3, dr) + dr + 1;
+        var cy = d0.y + Math.max(3, dr) + dr + 1;
         ctx.save();
         // dark ring so it stays visible on top of a green driveshaft
-        ctx.beginPath(); ctx.arc(p.x, cy, dr + 1.5, 0, Math.PI * 2);
+        ctx.beginPath(); ctx.arc(d0.x, cy, dr + 1.5, 0, Math.PI * 2);
         ctx.fillStyle = 'rgba(10, 12, 16, 0.9)'; ctx.fill();
         ctx.shadowColor = ASSIST_TC; ctx.shadowBlur = dr * 2;
         ctx.fillStyle = ASSIST_TC;
-        ctx.beginPath(); ctx.arc(p.x, cy, dr, 0, Math.PI * 2); ctx.fill();
+        ctx.beginPath(); ctx.arc(d0.x, cy, dr, 0, Math.PI * 2); ctx.fill();
         ctx.restore();
-      }
-    });
+      });
+    }
 
     ctx.restore();
   }
@@ -542,7 +732,7 @@
           var n = clamp(Math.round(+w.nt || 1), 1, 4);
           for (var c = 0; c < n; c++) wheels.push(c === 0 ? w : Object.assign({}, w));
         });
-        return { wheels: wheels, sources: toArray(b.sources), tc: b.tc, inp: b.inp, gf: b.gf, ext: b.ext };
+        return { wheels: wheels, sources: toArray(b.sources), tc: b.tc, inp: b.inp, gf: b.gf, ext: b.ext, dt: b.dt };
       })
       .filter(function (b) { return b.wheels.length > 0; });
     if (!bodies.length) { trail.length = 0; drawEmpty(ctx, W, H); return; }
@@ -622,6 +812,7 @@
     });
   };
 
+  VGSRenderer.synthDrivetrain = synthDrivetrain;   // used by the browser preview
   window.VGSRenderer = VGSRenderer;
 
   // ----- BeamNG app directive (skipped when running in a plain browser) -----

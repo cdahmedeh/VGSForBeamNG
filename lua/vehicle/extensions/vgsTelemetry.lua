@@ -135,8 +135,8 @@ local function nodesCentroid(list, fwd, right)
   return sx / n, sy / n
 end
 
--- Nodes whose group names the engine (combustion engines only).
-local function engineGroupCentroid(fwd, right)
+-- Centroid of the nodes whose group name contains one of `includes` and none of `excludes`.
+local function groupCentroid(fwd, right, includes, excludes)
   if not (v and v.data and v.data.nodes) then return nil end
   local list = {}
   for cid, node in pairs(v.data.nodes) do
@@ -146,7 +146,12 @@ local function engineGroupCentroid(fwd, right)
       if type(groups) == "table" then
         for _, g in pairs(groups) do
           local s = type(g) == "string" and g:lower() or ""
-          if s:find("engine") and not (s:find("bay") or s:find("mount") or s:find("hood") or s:find("cover")) then
+          local hit = false
+          for _, inc in ipairs(includes) do if s:find(inc, 1, true) then hit = true break end end
+          if hit then
+            for _, exc in ipairs(excludes) do if s:find(exc, 1, true) then hit = false break end end
+          end
+          if hit then
             list[#list + 1] = node.cid or cid
             break
           end
@@ -155,6 +160,11 @@ local function engineGroupCentroid(fwd, right)
     end
   end
   return nodesCentroid(list, fwd, right)
+end
+
+-- Nodes whose group names the engine (combustion engines only).
+local function engineGroupCentroid(fwd, right)
+  return groupCentroid(fwd, right, { "engine" }, { "bay", "mount", "hood", "cover" })
 end
 
 local function isPowerSource(d)
@@ -195,6 +205,124 @@ local function sourcePosition(d, fwd, right)
   return nil
 end
 
+-- ===== Simplified drive graph ==============================================
+local unpack = unpack or table.unpack
+-- Engine/motor -> gearbox -> differentials -> wheels, the way BeamNG's Powertrain app reads
+-- the device tree, keeping only what the VGS draws. Clutches, plain shafts and torque
+-- converters are passed through; a dual-tyre "dually" differential is part of the wheel.
+-- Nodes are in pre-order (parents before children); p is the parent's index (0 = root).
+local function devType(d) return type(d.type) == "string" and d.type or "" end
+
+local function isGearbox(d)
+  return devType(d):lower():find("gearbox$") ~= nil
+end
+
+local function diffKind(d)
+  if type(d.visualType) == "string" then return d.visualType end
+  if type(d.diffType) == "string" then return "differential_" .. d.diffType end
+  return devType(d)
+end
+
+local function isDifferential(d)
+  local t = devType(d)
+  return t == "differential" or t == "splitShaft" or diffKind(d):lower():find("^differential") ~= nil
+end
+
+local function isDually(d) return diffKind(d):lower():find("dually") ~= nil end
+
+-- open / lsd / locked, from the current mode first (a lockable diff switches modes),
+-- then from the differential's type, as BeamNG's Powertrain app does
+local function diffState(d)
+  local mode = type(d.mode) == "string" and d.mode:lower() or ""
+  if mode == "locked" then return "locked" end
+  if mode == "open" then return "open" end
+  if mode == "lsd" or mode == "viscous" then return "lsd" end
+  if type(d.visualType) ~= "string" and type(d.diffType) ~= "string" and devType(d) == "differential" then
+    return "open"   -- no type given: BeamNG's default differential is open
+  end
+  local kind = diffKind(d):lower()
+  if kind:find("locked") then return "locked" end
+  if kind:find("open") then return "open" end
+  return "lsd"   -- lsd, viscous, activeLock, torqueVectoring, splitShaft
+end
+
+local function isDisconnected(d)
+  return type(d.mode) == "string" and d.mode:lower() == "disconnected"
+end
+
+local function buildDriveGraph(sources, wheelIdxByName, fwd, right)
+  local nodes, visited = {}, {}
+  local function add(n) nodes[#nodes + 1] = n; return #nodes end
+
+  local function walk(dev, parent, gates, depth, sawGearbox)
+    if depth > 64 or visited[dev] then return end
+    visited[dev] = true
+    local cw = dev.connectedWheel or dev.wheelName
+    if type(cw) == "string" and wheelIdxByName[cw] then
+      local g = gates
+      if dev.mode ~= nil then g = { unpack(gates) }; g[#g + 1] = dev end
+      add({ k = "wheel", w = wheelIdxByName[cw], p = parent, gates = g })
+      return
+    end
+    local here, childGates, sawGb = parent, gates, sawGearbox
+    if not sawGearbox and isGearbox(dev) then
+      here = add({ k = "gb", sub = devType(dev), p = parent, gates = gates, dev = dev, name = dev.name })
+      childGates, sawGb = {}, true
+    elseif isDifferential(dev) and not isDually(dev) then
+      here = add({ k = "diff", p = parent, gates = gates, dev = dev, name = dev.name })
+      childGates = {}
+    elseif dev.mode ~= nil then
+      -- shafts that can be disconnected (part-time 4WD), range boxes, etc.
+      childGates = { unpack(gates) }; childGates[#childGates + 1] = dev
+    end
+    if type(dev.children) == "table" then
+      for _, c in pairs(dev.children) do
+        if type(c) == "table" then walk(c, here, childGates, depth + 1, sawGb) end
+      end
+    end
+  end
+
+  for si, s in ipairs(sources) do
+    if s.dev then
+      visited[s.dev] = true
+      local root = add({ k = "src", si = si, p = 0, gates = {}, name = s.dev.name })
+      if type(s.dev.children) == "table" then
+        for _, c in pairs(s.dev.children) do
+          if type(c) == "table" then walk(c, root, {}, 1, false) end
+        end
+      end
+    end
+  end
+
+  -- Physical positions where the vehicle's structure names them; the app places the rest.
+  local gx, gy = groupCentroid(fwd, right, { "transmission", "gearbox", "transaxle" }, { "mount", "tunnel", "cover", "cooler" })
+  local tx, ty = groupCentroid(fwd, right, { "transfercase", "transfer_case" }, { "mount", "cover" })
+  local gbDone, tcDone = false, false
+  local wheelsUnder = {}
+  for idx = #nodes, 1, -1 do   -- children come after parents, so walk backwards
+    local n = nodes[idx]
+    wheelsUnder[idx] = wheelsUnder[idx] or {}
+    if n.k == "wheel" then wheelsUnder[idx][#wheelsUnder[idx] + 1] = n.w end
+    if n.p > 0 then
+      wheelsUnder[n.p] = wheelsUnder[n.p] or {}
+      for _, w in ipairs(wheelsUnder[idx]) do wheelsUnder[n.p][#wheelsUnder[n.p] + 1] = w end
+    end
+  end
+  for idx, n in ipairs(nodes) do
+    if n.k == "gb" and gx and not gbDone then
+      n.gx, n.gy, gbDone = gx, gy, true
+    elseif n.k == "diff" and tx and not tcDone then
+      local y0, y1 = math.huge, -math.huge
+      for _, w in ipairs(wheelsUnder[idx]) do
+        if layout[w] then y0, y1 = math.min(y0, layout[w].y), math.max(y1, layout[w].y) end
+      end
+      if y1 - y0 > 0.35 then n.gx, n.gy, tcDone = tx, ty, true end   -- spans axles: centre diff
+    end
+  end
+  return nodes
+end
+-- ===========================================================================
+
 local function mapDrivetrain(fwd, right)
   local result = { sources = {}, driven = {} }
   local wheelIdxByName = {}
@@ -234,6 +362,7 @@ local function mapDrivetrain(fwd, right)
           kind = isElectric and "ev" or "ice",
           est = estimated,
           wheels = wheelList,
+          dev = d,
         }
       end
     end
@@ -250,6 +379,9 @@ local function mapDrivetrain(fwd, right)
     if #s.wheels > 0 or (not anyDriving and s.kind == "ice") then kept[#kept + 1] = s end
   end
   result.sources = kept
+  local okG, graph = pcall(buildDriveGraph, kept, wheelIdxByName, fwd, right)
+  result.graph = okG and graph or {}
+  if not okG then log('W', 'vgsTelemetry', 'drive graph failed: ' .. tostring(graph)) end
   return result
 end
 -- ===========================================================================
@@ -412,6 +544,27 @@ local function buildPayload(fwd, right, speed)
   local assists = {}   -- per wheel: { entry, S, abs, esc }
   local tcFromBrakes = false
 
+  -- Live drive graph: each differential's lock state, shafts that are disconnected right now
+  -- (e.g. part-time 4WD in 2WD), and which wheels are actually connected to a power source.
+  local graph = drivetrain and drivetrain.graph or {}
+  local graphOut, liveDriven, live = {}, {}, {}
+  for idx, n in ipairs(graph) do
+    local dc = false
+    for _, g in ipairs(n.gates or {}) do
+      if isDisconnected(g) then dc = true break end
+    end
+    live[idx] = (n.p == 0) or (live[n.p] and not dc) or false
+    if n.k == "wheel" and live[idx] then liveDriven[n.w] = true end
+    graphOut[idx] = {
+      -- si: which entry of `src` this engine is, counted from 0 like the app's arrays
+      k = n.k, p = n.p, w = n.w, si = n.si and (n.si - 1) or nil, sub = n.sub,
+      st = (n.k == "diff" and n.dev) and diffState(n.dev) or nil,   -- open / lsd / locked
+      dc = dc and 1 or nil,                                          -- disconnected from its parent
+      gx = n.gx and round(n.gx, 3) or nil, gy = n.gy and round(n.gy, 3) or nil,   -- physical position
+    }
+  end
+  local hasGraph = #graph > 0
+
   forEachWheel(function(i, w)
     local L, S = layout[i], state[i]
     if not L or not S then return end
@@ -425,7 +578,9 @@ local function buildPayload(fwd, right, speed)
     local broken   = w.isBroken and true or false
     local airborne = broken or fz < MIN_LOAD
     if math.abs(drive) > 1 then everDriven[i] = true end
-    local driven = (drivetrain and drivetrain.driven[i]) or everDriven[i]
+    local driven
+    if hasGraph then driven = liveDriven[i] or false
+    else driven = (drivetrain and drivetrain.driven[i]) or everDriven[i] end
 
     -- Slow-moving load, used to express drive torque as a share of what the tyre can take.
     S.fzAvg = S.fzAvg + (math.max(fz, 0) - S.fzAvg) * clamp(LOAD_SMOOTH_HZ / SEND_HZ, 0, 1)
@@ -573,6 +728,7 @@ local function buildPayload(fwd, right, speed)
     -- x + = pushed right (turning left), y + = pushed forward (braking)
     gf = { x = round(-latAccel / G, 3), y = round(-lonAccel / G, 3) },
     src = sources,
+    dt = hasGraph and graphOut or nil,   -- simplified drive graph (see buildDriveGraph)
     tc = (tcUntil > assistClock) and 1 or 0,   -- traction control intervening
 
     id = obj:getId(),
@@ -659,7 +815,35 @@ local function dumpWheels()
   end)
 end
 
+-- Diagnostic: the drivetrain as the VGS reads it. In the vehicle Lua console:
+--   extensions.load("vgsTelemetry") extensions.vgsTelemetry.dumpDrivetrain()
+local function dumpDrivetrain()
+  local function out(line) log('I', 'vgsTelemetry', line); print(line) end
+  local devices = (powertrain and powertrain.getDevices) and powertrain.getDevices() or {}
+  out("-- powertrain devices --")
+  for name, d in pairs(devices) do
+    if type(d) == "table" then
+      local kids = {}
+      for _, c in pairs(type(d.children) == "table" and d.children or {}) do
+        if type(c) == "table" then kids[#kids + 1] = tostring(c.name) end
+      end
+      out(string.format("%s  type=%s visualType=%s diffType=%s mode=%s wheel=%s -> [%s]",
+        tostring(name), tostring(d.type), tostring(d.visualType), tostring(d.diffType), tostring(d.mode),
+        tostring(d.connectedWheel), table.concat(kids, ", ")))
+    end
+  end
+  out("-- what the VGS draws --")
+  local graph = drivetrain and drivetrain.graph or {}
+  if #graph == 0 then out("(nothing yet: open the app with this vehicle first)") end
+  for idx, n in ipairs(graph) do
+    out(string.format("%d. %s %s parent=%d%s%s%s", idx, n.k, tostring(n.name or (n.w and ("wheel " .. n.w)) or ""),
+      n.p, n.sub and ("  " .. n.sub) or "", n.dev and n.k == "diff" and ("  " .. diffState(n.dev)) or "",
+      n.gx and string.format("  located x=%.2f y=%.2f", n.gx, n.gy) or ""))
+  end
+end
+
 M.dumpWheels        = dumpWheels
+M.dumpDrivetrain    = dumpDrivetrain
 M.onExtensionLoaded = resetState
 M.onReset           = resetState
 M.updateGFX         = updateGFX
