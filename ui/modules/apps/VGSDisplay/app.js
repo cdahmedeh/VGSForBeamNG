@@ -6,10 +6,9 @@
  *                greyish red just past the limit, deeper and more saturated as it slides more
  *   Outline    : torque applied — grey neutral, greener with drive, redder with braking
  *   Rotation   : each wheel's live steering angle
- *   Underneath : axles (fainter where nothing drives them), chassis spine, engine
- *                block or electric motors where they sit, gearbox, driveshafts and
- *                differentials (hollow open, centre block limited-slip, solid locked)
- *                to the wheels each one drives (tinted by the torque flowing)
+ *   Underneath : engine block or electric motors where they sit, gearbox, driveshafts and
+ *                differentials (hollow open, centre block limited-slip, solid locked),
+ *                tinted by the torque flowing; diamonds on shafts that can disconnect
  *   Dot outside a wheel : red ABS / blue ESC acting on that wheel
  *   Dot under the engine : green, traction control intervening
  *   No dots when nothing is intervening
@@ -37,7 +36,6 @@
   };
 
   var DRIVETRAIN = {
-    spine:      'rgba(255, 255, 255, 0.13)',
     axle:       'rgba(255, 255, 255, 0.22)',
     axleIdle:   'rgba(255, 255, 255, 0.12)',   // axle line where nothing drives the wheels
     diffBg:     'rgb(22, 25, 31)',
@@ -247,7 +245,9 @@
 
   // ----- Drive graph --------------------------------------------------------
   // Nodes { k: 'src'|'gb'|'diff'|'wheel', p: parent index (1-based, 0 = none), ... } in
-  // parent-first order. The vehicle sends it (body.dt); for older data, or the preview,
+  // parent-first order (see buildDriveGraph in vgsTelemetry.lua). The shaft from a node's
+  // parent can be disconnectable, cp: [{ t: 'dog', o: 1 when disconnected }], with dc = 1
+  // while it's disconnected. The vehicle sends it (body.dt); for older data, or the preview,
   // it's built here: a gearbox behind each engine, a differential on each axle a source
   // drives two or more wheels of, and a centre differential when it drives several axles.
   function synthDrivetrain(wheels, sources) {
@@ -310,7 +310,7 @@
     });
     nodes.forEach(function (n) {
       var P = n.parent;
-      n.dead = !!(+n.dc || (P && P.dead));   // disconnected here or further up
+      n.dead = !!(+n.dc || (P && P.dead));   // disconnected here or further up the line
       if (n.k === 'src') {
         var s = body.sources[+n.si];
         if (!s) return;
@@ -362,6 +362,30 @@
     return nodes;
   }
 
+  // combustion engine: block with cylinder-head ribs (outline dashed by the caller when its
+  // position is estimated)
+  function drawEngine(ctx, p, ew, eh) {
+    roundRect(ctx, p.x - ew / 2, p.y - eh / 2, ew, eh, Math.min(4, eh * 0.2));
+    ctx.fillStyle = DRIVETRAIN.engine; ctx.fill();
+    ctx.strokeStyle = DRIVETRAIN.engineEdge; ctx.lineWidth = 1.5; ctx.stroke();
+    ctx.save();
+    ctx.strokeStyle = 'rgba(0, 0, 0, 0.35)'; ctx.lineWidth = 1; ctx.setLineDash([]);
+    for (var k = 1; k <= 3; k++) {
+      var yy = p.y - eh / 2 + (eh * k) / 4;
+      ctx.beginPath(); ctx.moveTo(p.x - ew * 0.32, yy); ctx.lineTo(p.x + ew * 0.32, yy); ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  // electric motor: ring with a centre dot
+  function drawMotor(ctx, p, r) {
+    ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+    ctx.fillStyle = DRIVETRAIN.engineEdge; ctx.fill();
+    ctx.strokeStyle = DRIVETRAIN.motor; ctx.lineWidth = clamp(r * 0.35, 2, 4); ctx.stroke();
+    ctx.beginPath(); ctx.arc(p.x, p.y, r * 0.35, 0, Math.PI * 2);
+    ctx.fillStyle = DRIVETRAIN.motor; ctx.fill();
+  }
+
   // open: hollow; limited-slip: hollow with a centre block; locked: solid
   function drawDiff(ctx, p, d, st, dead) {
     ctx.save();
@@ -399,7 +423,21 @@
     ctx.restore();
   }
 
-  // Axles, chassis spine, driveshafts, differentials, gearbox and power sources (under the tyres).
+  // disconnectable shaft (4WD engage, locking hub, axle disconnect), drawn across the shaft
+  // at p; (ux, uy) = shaft direction. Solid diamond when connected, hollow when disconnected.
+  function drawDisconnect(ctx, p, ux, uy, open, size) {
+    var nx = -uy, ny = ux, r = size / 2 * 1.05;
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(p.x + ux * r, p.y + uy * r); ctx.lineTo(p.x + nx * r, p.y + ny * r);
+    ctx.lineTo(p.x - ux * r, p.y - uy * r); ctx.lineTo(p.x - nx * r, p.y - ny * r);
+    ctx.closePath();
+    ctx.fillStyle = open ? DRIVETRAIN.diffBg : DRIVETRAIN.diff; ctx.fill();
+    ctx.strokeStyle = DRIVETRAIN.diff; ctx.lineWidth = 1.2; ctx.stroke();
+    ctx.restore();
+  }
+
+  // Driveshafts, half-shafts, differentials, gearbox and power sources (under the tyres).
   // map(x, y) converts vehicle metres to canvas pixels; s = pixels per metre.
   function drawDrivetrain(ctx, body, map, s) {
     var g = body.geo, axles = g.axles;
@@ -422,59 +460,151 @@
     var drivenWidth = clamp(0.09 * s, 2, 4.5);
     var ew = clamp(ENGINE_W * s, 12, 34), eh = clamp(ENGINE_H * s, 9, 26);   // engine block (px)
     var diffPx = clamp(DIFF * s, 6, 12), gbPx = clamp(GB_SIZE * s, 9, 18), tcDots = [];
+    var cpPx = clamp(0.17 * s, 6, 9), motorR = clamp(MOTOR_R * s, 5, 12);
 
-    // Pixel position of every node. The engine block is drawn larger than life so it stays
-    // readable, so a gearbox placed at its real spot (right against the engine) would be hidden
-    // under it: move it just clear of the block.
+    // Pixel position of every node.
     nodes.forEach(function (n) { if (n.x !== undefined) n.pt = map(n.x, n.y); });
-    nodes.forEach(function (n) {
-      var E = n.parent;
-      if (n.k !== 'gb' || !n.pt || !E || E.k !== 'src' || !E.pt || !E.src || E.src.k === 'ev') return;
-      var gap = 2, needX = ew / 2 + gbPx / 2 + gap, needY = eh / 2 + gbPx / 2 + gap;
-      var dx = n.pt.x - E.pt.x, dy = n.pt.y - E.pt.y;
-      if (Math.abs(dx) >= needX || Math.abs(dy) >= needY) return;   // already clear
-      // keep the direction it already sits in (beside a transverse engine, behind an in-line one);
-      // only a gearbox right on top of the engine is moved towards the wheels it drives
-      if (Math.abs(dx) / needX >= Math.abs(dy) / needY && Math.abs(dx) > 0.5) {
-        n.pt = { x: E.pt.x + (dx > 0 ? needX : -needX), y: n.pt.y };
-      } else if (Math.abs(dy) > needY * 0.25) {
-        n.pt = { x: n.pt.x, y: E.pt.y + (dy > 0 ? needY : -needY) };
-      } else {
-        var ws = n.ws || [];
-        var wy = ws.length ? map(0, ws.reduce(function (sum, w) { return sum + +w.y; }, 0) / ws.length).y : E.pt.y;
-        if (Math.abs(wy - E.pt.y) > needY) n.pt = { x: E.pt.x, y: E.pt.y + (wy > E.pt.y ? needY : -needY) };
-        else n.pt = { x: E.pt.x - needX, y: E.pt.y };
-      }
-    });
 
-    // chassis spine, front axle to rear axle: faint like an undriven axle; the real
-    // driveshafts are drawn over it, so only the stretch with no shaft stays faded
-    if (axles.length > 1) {
-      var a0 = map(centreX, axles[0].y), a1 = map(centreX, axles[axles.length - 1].y);
-      ctx.strokeStyle = DRIVETRAIN.axleIdle;
-      ctx.lineWidth = clamp(0.035 * s, 1, 2.2);
-      ctx.beginPath(); ctx.moveTo(a0.x, a0.y); ctx.lineTo(a1.x, a1.y); ctx.stroke();
+    // Spread the parts out so none overlaps another. Glyphs are drawn larger than life so they
+    // stay readable, so at their real spots an engine, its gearbox, a transfer case and the axle
+    // diffs can pile up. Engines, motors, gearboxes and centre diffs are nudged fore and aft
+    // (never sideways, so they stay on the centreline) until they're clear of each other; axle
+    // diffs stay put at the middle of their axle. Everything stays inside the vehicle's outline.
+    (function spread() {
+      var GAP = 3, items = [];
+      nodes.forEach(function (n) {
+        if (!n.pt) return;
+        var it = { n: n, fixed: false };
+        if (n.k === 'src') { if (n.src && n.src.k === 'ev') it.hw = it.hh = motorR; else { it.hw = ew / 2; it.hh = eh / 2; } }
+        else if (n.k === 'gb') it.hw = it.hh = gbPx / 2;
+        else if (n.k === 'diff') { it.hw = it.hh = diffPx / 2; it.fixed = !!n.axle; }
+        else return;
+        items.push(it);
+      });
+      var box = g.box, top = map(g.cx, box.y1).y, bottom = map(g.cx, box.y0).y, midY = (top + bottom) / 2;
+      function isAncestor(a, b) { for (var m = b.parent; m; m = m.parent) if (m === a) return true; return false; }
+      function wheelsY(n) {
+        var ws = n.ws || [];
+        return ws.length ? map(0, ws.reduce(function (sum, w) { return sum + +w.y; }, 0) / ws.length).y : midY;
+      }
+      // which way b should go from a when they sit at the same height: a part further down the
+      // drivetrain goes towards the wheels it drives, anything else towards the middle
+      function awayDir(a, b) {
+        if (isAncestor(a.n, b.n)) return wheelsY(b.n) >= a.n.pt.y ? 1 : -1;
+        if (isAncestor(b.n, a.n)) return wheelsY(a.n) >= b.n.pt.y ? -1 : 1;
+        return b.n.pt.y <= midY ? (a.n.pt.y <= b.n.pt.y ? 1 : -1) : (a.n.pt.y >= b.n.pt.y ? -1 : 1);
+      }
+      function clampY(it) {
+        var lo = top + it.hh + 2, hi = bottom - it.hh - 2;
+        if (lo < hi) it.n.pt.y = clamp(it.n.pt.y, lo, hi);
+      }
+      function overlap(a, b) {
+        return Math.abs(b.n.pt.x - a.n.pt.x) < a.hw + b.hw + GAP - 0.5 &&
+               Math.abs(b.n.pt.y - a.n.pt.y) < a.hh + b.hh + GAP - 0.5;
+      }
+      function relax() {
+        for (var iter = 0; iter < 80; iter++) {
+          var moved = false;
+          for (var i = 0; i < items.length; i++) {
+            for (var j = i + 1; j < items.length; j++) {
+              var a = items[i], b = items[j];
+              if (a.fixed && b.fixed) continue;
+              var dx = b.n.pt.x - a.n.pt.x, dy = b.n.pt.y - a.n.pt.y;
+              if (Math.abs(dx) >= a.hw + b.hw + GAP) continue;
+              var need = a.hh + b.hh + GAP - Math.abs(dy);
+              if (need <= 0.01) continue;
+              var dir = Math.abs(dy) > 0.5 ? (dy > 0 ? 1 : -1) : awayDir(a, b);   // +1: b goes down
+              if (a.fixed) b.n.pt.y += dir * need;
+              else if (b.fixed) a.n.pt.y -= dir * need;
+              else { a.n.pt.y -= dir * need / 2; b.n.pt.y += dir * need / 2; }
+              if (!a.fixed) clampY(a);
+              if (!b.fixed) clampY(b);
+              moved = true;
+            }
+          }
+          if (!moved) break;
+        }
+      }
+      relax();
+      // Parts that still overlap are boxed in, e.g. a rear engine's gearbox squeezed between the
+      // rear diff and an engine already at the back of the outline. The one of the pair nearest
+      // an axle diff moves to that diff's other side, then everything spreads again. Each part
+      // flips at most once, so nothing can flip back and forth.
+      function nearestFixed(it) {
+        var best = null;
+        items.forEach(function (f) {
+          if (!f.fixed || Math.abs(f.n.pt.x - it.n.pt.x) >= f.hw + it.hw + GAP) return;
+          if (!best || Math.abs(f.n.pt.y - it.n.pt.y) < Math.abs(best.n.pt.y - it.n.pt.y)) best = f;
+        });
+        return best;
+      }
+      for (var pass = 0; pass < items.length; pass++) {
+        var flip = null;
+        for (var i = 0; i < items.length && !flip; i++) {
+          for (var j = i + 1; j < items.length && !flip; j++) {
+            var a = items[i], b = items[j];
+            if ((a.fixed && b.fixed) || !overlap(a, b)) continue;
+            [a, b].forEach(function (it) {
+              if (it.fixed || it.flipped) return;
+              var f = nearestFixed(it);
+              if (!f) return;
+              var d = Math.abs(f.n.pt.y - it.n.pt.y);
+              if (!flip || d < flip.d) flip = { it: it, f: f, d: d };
+            });
+          }
+        }
+        if (!flip) break;
+        var side = flip.it.n.pt.y >= flip.f.n.pt.y ? -1 : 1;
+        flip.it.n.pt.y = flip.f.n.pt.y + side * (flip.it.hh + flip.f.hh + GAP);
+        clampY(flip.it);
+        flip.it.flipped = true;
+        relax();
+      }
+    })();
+
+
+    // How far a node's glyph reaches from its centre along direction (ux, uy), in px, so
+    // shafts' disconnect marks go on the visible stretch between two glyphs.
+    function reach(n, ux, uy) {
+      function box(hw, hh) {
+        var ax = Math.abs(ux), ay = Math.abs(uy);
+        return Math.min(ax > 1e-6 ? hw / ax : Infinity, ay > 1e-6 ? hh / ay : Infinity);
+      }
+      if (n.k === 'src') return n.src && n.src.k === 'ev' ? motorR : box(ew / 2, eh / 2);
+      if (n.k === 'gb') return box(gbPx / 2, gbPx / 2);
+      if (n.k === 'diff') return box(diffPx / 2, diffPx / 2);
+      if (n.k === 'wheel') { var w0 = (n.ws || [])[0]; return w0 ? Math.max(w0._wd * s, MIN_TYRE_W) / 2 : 0; }
+      return 0;
     }
 
-    // axle lines; lighter and a hair thinner where nothing drives the wheels
-    axles.forEach(function (a) {
-      if (a.wheels.length < 2) return;
-      var driven = a.wheels.some(function (w) { return !!+w.d; });
-      var l = map(a.minX, a.y), r = map(a.maxX, a.y);
-      ctx.strokeStyle = driven ? DRIVETRAIN.axle : DRIVETRAIN.axleIdle;
-      ctx.lineWidth = driven ? clamp(0.05 * s, 1.5, 3) : clamp(0.035 * s, 1, 2.2);
-      ctx.beginPath(); ctx.moveTo(l.x, l.y); ctx.lineTo(r.x, r.y); ctx.stroke();
+    // Every shaft of the drive graph, half-shafts out to the wheels included: tinted by the
+    // torque going to the wheels below it; grey and dashed when disconnected (or below a
+    // disconnection). Only shafts that can disconnect get a diamond: a locking hub's just inside
+    // its wheel, any other at the first free spot on the shaft counting from the end it feeds,
+    // never on top of another part.
+    var marks = [], taken = [];
+    nodes.forEach(function (n) {
+      if (!n.pt) return;
+      var hw = 0, hh = 0;
+      if (n.k === 'src') { if (n.src && n.src.k === 'ev') hw = hh = motorR; else { hw = ew / 2; hh = eh / 2; } }
+      else if (n.k === 'gb') hw = hh = gbPx / 2;
+      else if (n.k === 'diff') hw = hh = diffPx / 2;
+      if (hw) taken.push({ x: n.pt.x, y: n.pt.y, hw: hw, hh: hh });
     });
-
-    // every link of the drive graph, tinted by the torque going to the wheels below it;
-    // dashed where it's disconnected (e.g. a part-time 4WD in 2WD)
+    function free(p, h) {
+      return !taken.some(function (r) {
+        return Math.abs(p.x - r.x) < r.hw + h + 1 && Math.abs(p.y - r.y) < r.hh + h + 1;
+      });
+    }
     nodes.forEach(function (n) {
       var P = n.parent;
       if (!P || !n.pt || !P.pt) return;
+      var a = P.pt, b = (n.k === 'wheel' && P.k === 'diff' && P.axle) ? { x: n.pt.x, y: P.pt.y } : n.pt;
+      var len = Math.hypot(b.x - a.x, b.y - a.y);
+      if (len < 0.5) return;
+      var ux = (b.x - a.x) / len, uy = (b.y - a.y) / len;
       var ws = n.ws || [];
       var torque = ws.length ? ws.reduce(function (sum, w) { return sum + (+w.dr || 0); }, 0) / ws.length : 0;
-      var from = P.pt;
-      var to = (n.k === 'wheel' && P.k === 'diff' && P.axle) ? { x: n.pt.x, y: P.pt.y } : n.pt;
       ctx.save();
       if (n.dead) {
         ctx.setLineDash([3, 3]);
@@ -482,34 +612,45 @@
       } else {
         ctx.strokeStyle = torqueColour(torque * 0.7); ctx.lineWidth = drivenWidth;
       }
-      ctx.beginPath(); ctx.moveTo(from.x, from.y); ctx.lineTo(to.x, to.y); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
       ctx.restore();
+
+      var v0 = Math.min(reach(P, ux, uy), len), v1 = Math.max(v0, len - reach(n, -ux, -uy));
+      var h = cpPx * 0.65, cursor = v1 - h;
+      // a locking hub's diamond goes right next to its wheel
+      if (n.k === 'wheel') {
+        toArray(n.cp).forEach(function (c) {
+          var p = { x: a.x + ux * (v1 - h - 2), y: a.y + uy * (v1 - h - 2) };
+          taken.push({ x: p.x, y: p.y, hw: h, hh: h });
+          marks.push({ p: p, ux: ux, uy: uy, open: !!+c.o });
+        });
+        return;
+      }
+      toArray(n.cp).forEach(function (c) {
+        var spot = null;
+        for (var d = cursor; d >= v0 + h; d -= 1) {
+          if (free({ x: a.x + ux * d, y: a.y + uy * d }, h)) { spot = d; break; }
+        }
+        if (spot === null) spot = Math.max(v0, v1 - h);   // nowhere free: next to the part it feeds
+        var p = { x: a.x + ux * spot, y: a.y + uy * spot };
+        taken.push({ x: p.x, y: p.y, hw: h, hh: h });
+        marks.push({ p: p, ux: ux, uy: uy, open: !!+c.o });
+        cursor = spot - 2 * h - 1;
+      });
     });
 
     // Engines, then gearboxes, then differentials on top (a transaxle's diff is inside the gearbox, and an
     // engine sitting over its driven axle mustn't hide the lock state), then electric motors.
     function drawSource(src, ev) {
-      var p = map(sourceX(src), +src.y), bottom;
+      var sn = nodes.filter(function (n) { return n.k === 'src' && n.src === src && n.pt; })[0];
+      var p = sn ? sn.pt : map(sourceX(src), +src.y), bottom;
       ctx.save();
       ctx.setLineDash(+src.e ? [3, 2] : []);
       if (ev) {
-        var r = clamp(MOTOR_R * s, 5, 12);
-        ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
-        ctx.fillStyle = DRIVETRAIN.engineEdge; ctx.fill();
-        ctx.strokeStyle = DRIVETRAIN.motor; ctx.lineWidth = clamp(r * 0.35, 2, 4); ctx.stroke();
-        ctx.beginPath(); ctx.arc(p.x, p.y, r * 0.35, 0, Math.PI * 2);
-        ctx.fillStyle = DRIVETRAIN.motor; ctx.fill();
-        bottom = p.y + r;
+        drawMotor(ctx, p, motorR);
+        bottom = p.y + motorR;
       } else {
-        roundRect(ctx, p.x - ew / 2, p.y - eh / 2, ew, eh, Math.min(4, eh * 0.2));
-        ctx.fillStyle = DRIVETRAIN.engine; ctx.fill();
-        ctx.strokeStyle = DRIVETRAIN.engineEdge; ctx.lineWidth = 1.5; ctx.stroke();
-        // cylinder-head ribs
-        ctx.strokeStyle = 'rgba(0, 0, 0, 0.35)'; ctx.lineWidth = 1; ctx.setLineDash([]);
-        for (var k = 1; k <= 3; k++) {
-          var yy = p.y - eh / 2 + (eh * k) / 4;
-          ctx.beginPath(); ctx.moveTo(p.x - ew * 0.32, yy); ctx.lineTo(p.x + ew * 0.32, yy); ctx.stroke();
-        }
+        drawEngine(ctx, p, ew, eh);
         bottom = p.y + eh / 2;
         // a gearbox right behind the engine takes that spot; the TC dot goes under it
         nodes.forEach(function (n) {
@@ -525,6 +666,8 @@
     nodes.forEach(function (n) { if (n.k === 'gb' && n.pt) drawGearbox(ctx, n.pt, gbPx); });
     nodes.forEach(function (n) { if (n.k === 'diff' && n.pt) drawDiff(ctx, n.pt, diffPx, n.st, n.dead); });
     body.sources.forEach(function (src) { if (src.k === 'ev') drawSource(src, true); });
+    // disconnect diamonds last among the parts, so none is ever hidden under one
+    marks.forEach(function (m) { drawDisconnect(ctx, m.p, m.ux, m.uy, m.open, cpPx); });
 
     // traction-control dot under each engine / motor, last so nothing covers it
     if (+body.tc) {
@@ -576,7 +719,8 @@
   // fading ghosts, like a mouse trail, so the dot leaves a path.
   var GF_MAX = 1.5;          // g at the edge of the circle (road cars peak around 1 g)
   var TRAIL_MS = 800;        // how long a ghost takes to fade out completely
-  var GF_COLOUR = [242, 195, 26];
+  var GF_COLOUR = [240, 215, 130];   // soft butter yellow, to sit with the muted drivetrain colours
+  var GF_ALPHA = 0.6;                 // see-through, so the part underneath still shows
 
   function drawGForce(ctx, trail, cx, cy, R, gf) {
     var now = (window.performance && performance.now) ? performance.now() : Date.now();
@@ -586,20 +730,20 @@
     trail.push({ x: gx / GF_MAX, y: -gy / GF_MAX, t: now });
     while (trail.length && now - trail[0].t > TRAIL_MS) trail.shift();
 
-    var dotR = clamp(R * 0.06, 3.5, 9), reach = R - dotR - 2;
+    var dotR = clamp(R * 0.04, 2.5, 6), reach = R - dotR - 2;
     var rgb = GF_COLOUR.join(', ');
     ctx.save();
     for (var k = 0; k < trail.length - 1; k++) {        // ghosts, oldest first
       var life = 1 - (now - trail[k].t) / TRAIL_MS;
-      ctx.fillStyle = 'rgba(' + rgb + ', ' + (0.5 * life * life).toFixed(3) + ')';
+      ctx.fillStyle = 'rgba(' + rgb + ', ' + (0.35 * life * life).toFixed(3) + ')';
       ctx.beginPath();
       ctx.arc(cx + trail[k].x * reach, cy + trail[k].y * reach, dotR * (0.7 + 0.3 * life), 0, Math.PI * 2);
       ctx.fill();
     }
     var head = trail[trail.length - 1];
     ctx.beginPath(); ctx.arc(cx + head.x * reach, cy + head.y * reach, dotR, 0, Math.PI * 2);
-    ctx.fillStyle = 'rgb(' + rgb + ')'; ctx.fill();
-    ctx.strokeStyle = 'rgba(0, 0, 0, 0.45)'; ctx.lineWidth = 1; ctx.stroke();
+    ctx.fillStyle = 'rgba(' + rgb + ', ' + GF_ALPHA + ')'; ctx.fill();
+    ctx.strokeStyle = 'rgba(' + rgb + ', 0.95)'; ctx.lineWidth = 1; ctx.stroke();   // thin solid rim
     ctx.restore();
   }
 
@@ -813,6 +957,12 @@
   };
 
   VGSRenderer.synthDrivetrain = synthDrivetrain;   // used by the browser preview
+  // the drivetrain glyphs, for the preview's legend and the README's legend image
+  VGSRenderer.glyphs = {
+    engine: drawEngine, motor: drawMotor,
+    diff: drawDiff, gearbox: drawGearbox, disconnect: drawDisconnect,
+    colours: DRIVETRAIN, torqueColour: torqueColour
+  };
   window.VGSRenderer = VGSRenderer;
 
   // ----- BeamNG app directive (skipped when running in a plain browser) -----

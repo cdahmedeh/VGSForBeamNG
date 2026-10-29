@@ -175,11 +175,25 @@ local function isPowerSource(d)
   return tl:find("engine$") ~= nil or tl:find("motor$") ~= nil
 end
 
+-- The wheel a powertrain device drives, if any: a wheel-axle shaft names it (connectedWheel),
+-- and newer trees also have a "wheel" device per wheel (spindleRL -> RL).
+local function wheelIndexFor(dev, wheelIdxByName)
+  local cands = { dev.connectedWheel, dev.wheelName }
+  if type(dev.wheel) == "table" then cands[#cands + 1] = dev.wheel.name end
+  if (type(dev.type) == "string" and dev.type == "wheel") and type(dev.name) == "string" then
+    cands[#cands + 1] = dev.name:match("^spindle_?(.+)$") or dev.name:match("^wheel_?(.+)$") or dev.name
+  end
+  for _, c in ipairs(cands) do
+    if type(c) == "string" and wheelIdxByName[c] then return wheelIdxByName[c] end
+  end
+  return nil
+end
+
 local function collectDrivenWheels(device, wheelIdxByName, out, visited, depth)
   if depth > 64 or visited[device] then return end
   visited[device] = true
-  local cw = device.connectedWheel or device.wheelName
-  if type(cw) == "string" and wheelIdxByName[cw] then out[wheelIdxByName[cw]] = true end
+  local wi = wheelIndexFor(device, wheelIdxByName)
+  if wi then out[wi] = true end
   if type(device.children) == "table" then
     for _, child in pairs(device.children) do
       if type(child) == "table" then collectDrivenWheels(child, wheelIdxByName, out, visited, depth + 1) end
@@ -206,11 +220,22 @@ local function sourcePosition(d, fwd, right)
 end
 
 -- ===== Simplified drive graph ==============================================
+-- Engine/motor -> gearbox -> differentials -> wheels, the way BeamNG's PowerTrain debug app
+-- reads the device tree, keeping only what the VGS draws. Nodes are drawn parts; everything
+-- between two nodes is a shaft ("link"), which may be disconnectable. Nodes are in pre-order
+-- (parents first); p = parent index (0 = root).
+--
+--   node "src"    combustionEngine, electricMotor (roots, from mapDrivetrain)
+--   node "gb"     the first gearbox on the way to the wheels (any *Gearbox type)
+--   node "diff"   differential (any type), splitShaft
+--   node "wheel"  a wheel: the shaft that names it, or its "wheel" (spindle) device
+--   on a link:    "dog" = a shaft that can be disconnected (4WD engage, locking hubs, axle
+--                 disconnects): mode connected / disconnected
+--   everything else (clutches, torque converters, plain shafts, torsion reactors, dually
+--   differentials, ...) is passed through. Devices that never reach a wheel (hydraulicPump,
+--   power take-offs) don't appear.
 local unpack = unpack or table.unpack
--- Engine/motor -> gearbox -> differentials -> wheels, the way BeamNG's Powertrain app reads
--- the device tree, keeping only what the VGS draws. Clutches, plain shafts and torque
--- converters are passed through; a dual-tyre "dually" differential is part of the wheel.
--- Nodes are in pre-order (parents before children); p is the parent's index (0 = root).
+
 local function devType(d) return type(d.type) == "string" and d.type or "" end
 
 local function isGearbox(d)
@@ -246,53 +271,111 @@ local function diffState(d)
   return "lsd"   -- lsd, viscous, activeLock, torqueVectoring, splitShaft
 end
 
+-- the differential's own type, for the README / dump (not the lock state)
+local function diffTypeName(d)
+  return (diffKind(d):lower():gsub("^differential_?", ""))
+end
+
 local function isDisconnected(d)
   return type(d.mode) == "string" and d.mode:lower() == "disconnected"
+end
+
+-- A shaft that can really be disconnected (part-time 4WD, locking hubs, axle disconnects).
+-- Every shaft reports mode "connected", so that alone isn't enough: the shaft must say it
+-- can disconnect (canDisconnect, or a list of modes that includes "disconnected"), or be
+-- disconnected right now.
+local function modeListHasDisconnect(list)
+  if type(list) ~= "table" then return false end
+  for k, m in pairs(list) do
+    if (type(m) == "string" and m:lower() == "disconnected") or (type(k) == "string" and k:lower() == "disconnected") then
+      return true
+    end
+  end
+  return false
+end
+
+local function canDisconnect(dev)
+  if isDisconnected(dev) then return true end
+  if dev.canDisconnect == true or dev.canDisconnect == 1 then return true end
+  local jd = type(dev.jbeamData) == "table" and dev.jbeamData or {}
+  if jd.canDisconnect == true or jd.canDisconnect == 1 then return true end
+  return modeListHasDisconnect(dev.availableModes) or modeListHasDisconnect(dev.modes)
+      or modeListHasDisconnect(jd.availableModes) or modeListHasDisconnect(jd.modes)
+end
+
+local function couplingKind(dev)
+  if type(dev.mode) == "string" and canDisconnect(dev) then return "dog" end
+  return nil
+end
+
+local function childList(dev)
+  local list = {}
+  if type(dev.children) == "table" then
+    for _, c in pairs(dev.children) do if type(c) == "table" then list[#list + 1] = c end end
+  end
+  return list
 end
 
 local function buildDriveGraph(sources, wheelIdxByName, fwd, right)
   local nodes, visited = {}, {}
   local function add(n) nodes[#nodes + 1] = n; return #nodes end
 
-  local function walk(dev, parent, gates, depth, sawGearbox)
+  -- link = { cps = { {kind, dev}, ... }, path = { devices between the parent node and here } }
+  local function extend(link, dev)
+    local nl = { cps = { unpack(link.cps) }, path = { unpack(link.path) } }
+    nl.path[#nl.path + 1] = dev
+    local ck = couplingKind(dev)
+    if ck then nl.cps[#nl.cps + 1] = { kind = ck, dev = dev } end
+    return nl
+  end
+  local function newLink() return { cps = {}, path = {} } end
+
+  local function walk(dev, parent, link, depth, sawGearbox)
     if depth > 64 or visited[dev] then return end
     visited[dev] = true
-    local cw = dev.connectedWheel or dev.wheelName
-    if type(cw) == "string" and wheelIdxByName[cw] then
-      local g = gates
-      if dev.mode ~= nil then g = { unpack(gates) }; g[#g + 1] = dev end
-      add({ k = "wheel", w = wheelIdxByName[cw], p = parent, gates = g })
+    local wi = wheelIndexFor(dev, wheelIdxByName)
+    if wi then
+      local l = extend(link, dev)
+      add({ k = "wheel", w = wi, p = parent, cps = l.cps, path = l.path, name = dev.name })
       return
     end
-    local here, childGates, sawGb = parent, gates, sawGearbox
+    local kids = childList(dev)
+    local here, childLink, sawGb = parent, nil, sawGearbox
     if not sawGearbox and isGearbox(dev) then
-      here = add({ k = "gb", sub = devType(dev), p = parent, gates = gates, dev = dev, name = dev.name })
-      childGates, sawGb = {}, true
+      here = add({ k = "gb", sub = devType(dev), p = parent, cps = link.cps, path = link.path, dev = dev, name = dev.name })
+      childLink, sawGb = newLink(), true
     elseif isDifferential(dev) and not isDually(dev) then
-      here = add({ k = "diff", p = parent, gates = gates, dev = dev, name = dev.name })
-      childGates = {}
-    elseif dev.mode ~= nil then
-      -- shafts that can be disconnected (part-time 4WD), range boxes, etc.
-      childGates = { unpack(gates) }; childGates[#childGates + 1] = dev
+      here = add({ k = "diff", p = parent, cps = link.cps, path = link.path, dev = dev, name = dev.name })
+      childLink = newLink()
+    else
+      childLink = extend(link, dev)   -- shafts, clutches, torsion reactors, dually diffs, ...
     end
-    if type(dev.children) == "table" then
-      for _, c in pairs(dev.children) do
-        if type(c) == "table" then walk(c, here, childGates, depth + 1, sawGb) end
-      end
-    end
+    for _, c in ipairs(kids) do walk(c, here, childLink, depth + 1, sawGb) end
   end
 
   for si, s in ipairs(sources) do
     if s.dev then
       visited[s.dev] = true
-      local root = add({ k = "src", si = si, p = 0, gates = {}, name = s.dev.name })
-      if type(s.dev.children) == "table" then
-        for _, c in pairs(s.dev.children) do
-          if type(c) == "table" then walk(c, root, {}, 1, false) end
-        end
-      end
+      local root = add({ k = "src", si = si, p = 0, cps = {}, path = {}, name = s.dev.name, dev = s.dev })
+      for _, c in ipairs(childList(s.dev)) do walk(c, root, newLink(), 1, false) end
     end
   end
+
+  -- prune branches that never reach a wheel (hydraulic pumps, power take-offs)
+  local reaches = {}
+  for idx = #nodes, 1, -1 do
+    local n = nodes[idx]
+    if n.k == "wheel" or n.k == "src" then reaches[idx] = reaches[idx] or (n.k == "wheel") end
+    if reaches[idx] and n.p > 0 then reaches[n.p] = true end
+  end
+  local keep, newIndex = {}, {}
+  for idx, n in ipairs(nodes) do
+    if n.k == "src" or reaches[idx] then
+      keep[#keep + 1] = n; newIndex[idx] = #keep
+      n.p = n.p > 0 and (newIndex[n.p] or 0) or 0
+    end
+  end
+  nodes = keep
 
   -- Physical positions where the vehicle's structure names them; the app places the rest.
   local gx, gy = groupCentroid(fwd, right, { "transmission", "gearbox", "transaxle" }, { "mount", "tunnel", "cover", "cooler" })
@@ -321,6 +404,7 @@ local function buildDriveGraph(sources, wheelIdxByName, fwd, right)
   end
   return nodes
 end
+
 -- ===========================================================================
 
 local function mapDrivetrain(fwd, right)
@@ -545,13 +629,16 @@ local function buildPayload(fwd, right, speed)
   local tcFromBrakes = false
 
   -- Live drive graph: each differential's lock state, shafts that are disconnected right now
-  -- (e.g. part-time 4WD in 2WD), and which wheels are actually connected to a power source.
+  -- (e.g. part-time 4WD in 2WD, unlocked hubs), and which wheels are actually connected to
+  -- a power source.
   local graph = drivetrain and drivetrain.graph or {}
   local graphOut, liveDriven, live = {}, {}, {}
   for idx, n in ipairs(graph) do
-    local dc = false
-    for _, g in ipairs(n.gates or {}) do
-      if isDisconnected(g) then dc = true break end
+    local dc, cps = false, {}
+    for _, c in ipairs(n.cps or {}) do
+      local open = isDisconnected(c.dev)
+      if open then dc = true end
+      cps[#cps + 1] = { t = c.kind, o = open and 1 or nil }
     end
     live[idx] = (n.p == 0) or (live[n.p] and not dc) or false
     if n.k == "wheel" and live[idx] then liveDriven[n.w] = true end
@@ -559,7 +646,9 @@ local function buildPayload(fwd, right, speed)
       -- si: which entry of `src` this engine is, counted from 0 like the app's arrays
       k = n.k, p = n.p, w = n.w, si = n.si and (n.si - 1) or nil, sub = n.sub,
       st = (n.k == "diff" and n.dev) and diffState(n.dev) or nil,   -- open / lsd / locked
-      dc = dc and 1 or nil,                                          -- disconnected from its parent
+      dty = (n.k == "diff" and n.dev) and diffTypeName(n.dev) or nil,
+      cp = (#cps > 0) and cps or nil,   -- disconnectable shaft on the link from the parent
+      dc = dc and 1 or nil,              -- that link is disconnected
       gx = n.gx and round(n.gx, 3) or nil, gy = n.gy and round(n.gy, 3) or nil,   -- physical position
     }
   end
@@ -827,8 +916,8 @@ local function dumpDrivetrain()
       for _, c in pairs(type(d.children) == "table" and d.children or {}) do
         if type(c) == "table" then kids[#kids + 1] = tostring(c.name) end
       end
-      out(string.format("%s  type=%s visualType=%s diffType=%s mode=%s wheel=%s -> [%s]",
-        tostring(name), tostring(d.type), tostring(d.visualType), tostring(d.diffType), tostring(d.mode),
+      out(string.format("%s  type=%s visualType=%s diffType=%s mode=%s canDisconnect=%s wheel=%s -> [%s]",
+        tostring(name), tostring(d.type), tostring(d.visualType), tostring(d.diffType), tostring(d.mode), tostring(canDisconnect(d)),
         tostring(d.connectedWheel), table.concat(kids, ", ")))
     end
   end
@@ -836,8 +925,12 @@ local function dumpDrivetrain()
   local graph = drivetrain and drivetrain.graph or {}
   if #graph == 0 then out("(nothing yet: open the app with this vehicle first)") end
   for idx, n in ipairs(graph) do
-    out(string.format("%d. %s %s parent=%d%s%s%s", idx, n.k, tostring(n.name or (n.w and ("wheel " .. n.w)) or ""),
-      n.p, n.sub and ("  " .. n.sub) or "", n.dev and n.k == "diff" and ("  " .. diffState(n.dev)) or "",
+    local cps = {}
+    for _, c in ipairs(n.cps or {}) do cps[#cps + 1] = c.kind .. "(" .. tostring(c.dev.name) .. ")" end
+    out(string.format("%d. %s %s parent=%d%s%s%s%s", idx, n.k, tostring(n.name or (n.w and ("wheel " .. n.w)) or ""),
+      n.p, n.sub and ("  " .. n.sub) or "",
+      n.dev and n.k == "diff" and ("  " .. diffTypeName(n.dev) .. ", " .. diffState(n.dev)) or "",
+      #cps > 0 and ("  link: " .. table.concat(cps, ", ")) or "",
       n.gx and string.format("  located x=%.2f y=%.2f", n.gx, n.gy) or ""))
   end
 end
