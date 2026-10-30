@@ -18,20 +18,29 @@ local M = {}
 -- is an estimate: the larger of (a) a force-based estimate and (b) contact-patch
 -- slip relative to SLIP_PEAK. Calibrate SLIP_PEAK / SLIP_LIMIT in-game using the
 -- app's numeric readout (click the app).
-local SEND_HZ          = 30    -- updates per second sent to the UI
+local SEND_HZ          = 60    -- updates per second sent to the UI (capped by the game's frame rate)
 local MU_NOMINAL       = 1.0   -- assumed peak friction coefficient (road tyre, dry asphalt)
 local SLIP_PEAK        = 1.5   -- m/s of contact-patch slip treated as 100 % grip used
 local SLIP_LIMIT       = 2.0   -- m/s of slip above which the tyre counts as sliding (red fill)
 local SLIP_RELEASE     = 0.8   -- sliding clears below SLIP_LIMIT * this (avoids flicker)
-local SLIP_FULL        = 8.0   -- m/s of slip shown as the most intense red (full spin / lock-up)
+-- How red a sliding tyre is, from its slip ratio (slip speed / road speed). Real tyres peak at
+-- about 10-15 % slip, stay within a few percent of peak grip out to about 30 %, and fall away
+-- towards a locked or spinning wheel at 100 %. The near-peak band stays pink, so there's time to
+-- ease off (threshold braking, a car just past the limit), then the red deepens towards 100 %.
+local SLIP_RATIO_PINK  = 0.30  -- slip ratio up to which the tyre stays pink (still near peak grip)
+local SLIP_RATIO_FULL  = 1.00  -- slip ratio shown as the deepest red (locked or spinning)
+local PINK_SEVERITY    = 0.2   -- how far towards deep red the colour gets by the end of the pink band
+local RATIO_MIN_SPEED  = 5.0   -- m/s; slip ratio is taken against at least this (avoids /0 at a crawl)
 local MIN_LOAD         = 150   -- N; below this a wheel is treated as off the ground
-local GRIP_SMOOTHING   = 0.4   -- 0..1 per update; higher = snappier, lower = steadier
+local GRIP_SMOOTHING   = 0.4   -- 0..1, share of the gap closed every 1/30 s; higher = snappier, lower = steadier
 local ACCEL_SMOOTH_HZ  = 6     -- low-pass for measured acceleration (grip estimate and G-force dot)
 local LOAD_SMOOTH_HZ   = 0.5   -- low-pass for the wheel load used to scale drive torque
 local STANDSTILL_SPEED = 0.5   -- m/s; a held brake at standstill isn't counted as tyre force
 -- ===========================================================================
 
 local G = 9.81
+-- GRIP_SMOOTHING is set per 1/30 s; this is the same smoothing per update at SEND_HZ
+local gripK = 1 - (1 - GRIP_SMOOTHING) ^ (30 / SEND_HZ)
 
 local active     = false
 local sendTimer  = 0
@@ -654,7 +663,7 @@ local function buildPayload(fwd, right, speed)
       local forceUse = math.sqrt(fx * fx + fy * fy) / (MU_NOMINAL * fz)
       use = math.max(forceUse, slip / SLIP_PEAK)
     end
-    S.grip = S.grip + (use - S.grip) * GRIP_SMOOTHING
+    S.grip = S.grip + (use - S.grip) * gripK
 
     if airborne then
       S.sliding = false
@@ -664,14 +673,19 @@ local function buildPayload(fwd, right, speed)
       S.sliding = false
     end
 
-    -- How far past the limit: 0 just broken loose .. 1 at SLIP_FULL, on a log scale
-    -- (slip grows quickly once a tyre lets go, so linear would jump straight to the top).
+    -- How far past the limit, 0..1, from the slip ratio: stays pink (0..PINK_SEVERITY) through
+    -- the near-peak band, then deepens to full red at a lock-up or full spin.
     local severity = 0
     if S.sliding then
-      local floor = SLIP_LIMIT * SLIP_RELEASE
-      severity = clamp(math.log(math.max(slip, floor) / floor) / math.log(SLIP_FULL / floor), 0, 1)
+      local ratio = slip / math.max(speed, RATIO_MIN_SPEED)
+      if ratio <= SLIP_RATIO_PINK then
+        severity = PINK_SEVERITY * ratio / SLIP_RATIO_PINK
+      else
+        severity = PINK_SEVERITY + (1 - PINK_SEVERITY)
+          * clamp((ratio - SLIP_RATIO_PINK) / (SLIP_RATIO_FULL - SLIP_RATIO_PINK), 0, 1)
+      end
     end
-    S.severity = (S.severity or 0) + (severity - (S.severity or 0)) * GRIP_SMOOTHING
+    S.severity = (S.severity or 0) + (severity - (S.severity or 0)) * gripK
 
     -- Torque application: + drive, - braking (engine braking / regen count as braking)
     local driveFrac, brakeFrac = 0, 0
@@ -779,9 +793,13 @@ local function updateGFX(dt)
     end
   end
 
+  -- keep the leftover time, so a frame that lands a hair early doesn't halve the rate;
+  -- after a long stall, start fresh rather than sending a burst
   sendTimer = sendTimer + dt
-  if sendTimer < 1 / SEND_HZ then return end
-  sendTimer = 0
+  local interval = 1 / SEND_HZ
+  if sendTimer < interval * 0.95 then return end
+  sendTimer = sendTimer - interval
+  if sendTimer > interval or sendTimer < 0 then sendTimer = 0 end
 
   local payload = buildPayload(fwd, right, vel:length())
   obj:queueGameEngineLua(string.format(

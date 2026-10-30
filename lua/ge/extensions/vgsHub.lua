@@ -10,7 +10,7 @@
 
 local M = {}
 
-local SEND_INTERVAL = 1 / 30 -- s (real time) between UI updates
+local SEND_INTERVAL = 1 / 60 -- s (real time) between UI updates (capped by the game's frame rate)
 local STALE_AFTER   = 0.6    -- s (sim time) without data before a vehicle is (re)activated
 local RETRY_EVERY   = 1.0    -- s (sim time) between activation attempts
 local MAX_LINK_DIST = 40     -- m; a "coupled" body further away than this is ignored
@@ -81,9 +81,11 @@ end
 function M.onUpdate(dtReal, dtSim)
   if not enabled then return end
   simClock  = simClock + (dtSim or dtReal or 0)
+  -- keep the leftover time, so a frame that lands a hair early doesn't halve the rate
   sendTimer = sendTimer + (dtReal or 0)
-  if sendTimer < SEND_INTERVAL then return end
-  sendTimer = 0
+  if sendTimer < SEND_INTERVAL * 0.95 then return end
+  sendTimer = sendTimer - SEND_INTERVAL
+  if sendTimer > SEND_INTERVAL or sendTimer < 0 then sendTimer = 0 end
 
   local player = be:getPlayerVehicle(0)
   if not player then

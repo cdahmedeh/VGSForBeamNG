@@ -915,7 +915,8 @@
   VGSRenderer.glyphs = {
     engine: drawEngine, motor: drawMotor,
     diff: drawDiff, gearbox: drawGearbox, disconnect: drawDisconnect,
-    colours: DRIVETRAIN, torqueColour: torqueColour
+    colours: DRIVETRAIN, torqueColour: torqueColour,
+    tyre: drawTyre, slideColour: slideColour, inputArcs: drawInputArcs
   };
   window.VGSRenderer = VGSRenderer;
 
