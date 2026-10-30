@@ -69,6 +69,7 @@
   var TC_DOT_SPACE = 0.25; // room under an engine for the traction-control dot
   var DUAL_GAP = 0.6;  // same-side wheels on one axle closer than this are a dual set
   var DUAL_GAP_M = 0.04;    // gap between tyres of a dual set when spread from one hub (m)
+  var DUAL_SAME_HUB = 0.05; // dual tyres closer than this (m) are treated as reported at one hub point
   var MIN_TYRE_W = 3, MIN_TYRE_L = 6;   // px; only so very small tyres stay visible
 
   function toArray(v) {
@@ -146,7 +147,11 @@
       sorted.forEach(function (w) {
         var side = +w.x < a.cx - 0.01 ? -1 : (+w.x > a.cx + 0.01 ? 1 : 0);
         var cur = sets[sets.length - 1];
-        if (cur && side !== 0 && cur.side === side && +w.x - cur.lastX < DUAL_GAP) {
+        // a dual set: close together, or close enough that the widened tyres would touch
+        // (e.g. a dump truck's duals, each its own wheel pushed apart by wheelOffset)
+        var last = cur && cur.wheels[cur.wheels.length - 1];
+        if (cur && side !== 0 && cur.side === side &&
+            (+w.x - cur.lastX < DUAL_GAP || +w.x - cur.lastX < (last._wd + w._wd) / 2 + DUAL_GAP_M)) {
           cur.wheels.push(w); cur.lastX = +w.x;
         } else {
           sets.push({ side: side, wheels: [w], lastX: +w.x });
@@ -156,11 +161,20 @@
         var k = st.wheels.length, spread = false, j;
         for (j = 1; j < k; j++) {
           var p = st.wheels[j - 1], q = st.wheels[j];
-          if (+q.x - +p.x < (p._wd + q._wd) / 2) spread = true;
+          if (+q.x - +p.x < (p._wd + q._wd) / 2 + DUAL_GAP_M) spread = true;
         }
         st.spread = spread;
         st.cx = st.wheels.reduce(function (s, w) { return s + +w.x; }, 0) / k;
         st.pitch = Math.max.apply(null, st.wheels.map(function (w) { return w._wd; })) + DUAL_GAP_M;
+        // Tyres at separate real positions (e.g. pushed apart by wheelOffset): keep the outer
+        // tyre where it really is and move the inner ones inwards, so the outer edge still lines
+        // up with the other axles as on the real vehicle (a school bus's front wheels sit in
+        // line with the outer dual, a semi tractor's between the two). Tyres reported at one
+        // hub point, or one wheel standing in for a pair, spread evenly around that point.
+        if (spread && st.side !== 0 &&+st.wheels[k - 1].x - +st.wheels[0].x > DUAL_SAME_HUB) {
+          var outer = st.side < 0 ? st.wheels[0] : st.wheels[k - 1];
+          st.cx = +outer.x - st.side * (k - 1) / 2 * st.pitch;
+        }
         st.wheels.forEach(function (w, n) {
           w._slot = n - (k - 1) / 2;            // position within the set: ..., -0.5, +0.5, ...
           w._mx = spread ? st.cx + w._slot * st.pitch : +w.x;   // drawn x, metres
@@ -199,7 +213,15 @@
     var hasExt = !!(ext && +ext.x1 > +ext.x0 && +ext.y1 > +ext.y0);
     var box;
     if (hasExt) {
-      box = { x0: Math.min(+ext.x0, tx0), x1: Math.max(+ext.x1, tx1),
+      // Keep the outline symmetric about the vehicle's centreline (the middle of its axles).
+      // Bits that stick out on one side only (a haul truck's left mirror and railing, a
+      // ladder, an exhaust stack) would otherwise push the wheels off-centre in the box,
+      // so each side is cut back to the narrower one.
+      var mid = axles.reduce(function (s, a) { return s + a.cx; }, 0) / axles.length;
+      var half = Math.min(mid - +ext.x0, +ext.x1 - mid);
+      var ex0 = +ext.x0, ex1 = +ext.x1;
+      if (axles.length && half > 0) { ex0 = mid - half; ex1 = mid + half; }
+      box = { x0: Math.min(ex0, tx0), x1: Math.max(ex1, tx1),
               y0: Math.min(+ext.y0, ty0), y1: Math.max(+ext.y1, ty1) };
     } else {
       var sy0 = ty0, sy1 = ty1;
@@ -718,9 +740,10 @@
   // pushes it right). The circle's edge is GF_MAX. Recent positions are redrawn as
   // fading ghosts, like a mouse trail, so the dot leaves a path.
   var GF_MAX = 1.5;          // g at the edge of the circle (road cars peak around 1 g)
-  var TRAIL_MS = 800;        // how long a ghost takes to fade out completely
+  var TRAIL_MS = 1300;       // how long a ghost takes to fade out completely
   var GF_COLOUR = [240, 215, 130];   // soft butter yellow, to sit with the muted drivetrain colours
-  var GF_ALPHA = 0.6;                 // see-through, so the part underneath still shows
+  var GF_ALPHA = 0.5;                 // see-through, so the part underneath still shows
+  var GF_RIM_ALPHA = 0.65;            // the rim is a little stronger so the dot keeps its shape
 
   function drawGForce(ctx, trail, cx, cy, R, gf) {
     var now = (window.performance && performance.now) ? performance.now() : Date.now();
@@ -730,20 +753,28 @@
     trail.push({ x: gx / GF_MAX, y: -gy / GF_MAX, t: now });
     while (trail.length && now - trail[0].t > TRAIL_MS) trail.shift();
 
-    var dotR = clamp(R * 0.04, 2.5, 6), reach = R - dotR - 2;
+    var dotR = clamp(R * 0.05, 3, 7.5), reach = R - dotR - 2;
     var rgb = GF_COLOUR.join(', ');
+    var head = trail[trail.length - 1];
     ctx.save();
-    for (var k = 0; k < trail.length - 1; k++) {        // ghosts, oldest first
-      var life = 1 - (now - trail[k].t) / TRAIL_MS;
-      ctx.fillStyle = 'rgba(' + rgb + ', ' + (0.35 * life * life).toFixed(3) + ')';
+    // Ghosts, oldest first. A ghost sitting on the dot or on the previous ghost is skipped:
+    // while the dot holds still they would pile up and their opacity would add up until the
+    // dot looked solid.
+    var minStep = dotR * 0.6 / reach, lastX = Infinity, lastY = Infinity;
+    for (var k = 0; k < trail.length - 1; k++) {
+      var tk = trail[k];
+      if (Math.hypot(tk.x - head.x, tk.y - head.y) < dotR / reach) continue;
+      if (Math.hypot(tk.x - lastX, tk.y - lastY) < minStep) continue;
+      lastX = tk.x; lastY = tk.y;
+      var life = 1 - (now - tk.t) / TRAIL_MS;
+      ctx.fillStyle = 'rgba(' + rgb + ', ' + (GF_ALPHA * 0.8 * life * life).toFixed(3) + ')';
       ctx.beginPath();
-      ctx.arc(cx + trail[k].x * reach, cy + trail[k].y * reach, dotR * (0.7 + 0.3 * life), 0, Math.PI * 2);
+      ctx.arc(cx + tk.x * reach, cy + tk.y * reach, dotR * (0.7 + 0.3 * life), 0, Math.PI * 2);
       ctx.fill();
     }
-    var head = trail[trail.length - 1];
     ctx.beginPath(); ctx.arc(cx + head.x * reach, cy + head.y * reach, dotR, 0, Math.PI * 2);
     ctx.fillStyle = 'rgba(' + rgb + ', ' + GF_ALPHA + ')'; ctx.fill();
-    ctx.strokeStyle = 'rgba(' + rgb + ', 0.95)'; ctx.lineWidth = 1; ctx.stroke();   // thin solid rim
+    ctx.strokeStyle = 'rgba(' + rgb + ', ' + GF_RIM_ALPHA + ')'; ctx.lineWidth = 1; ctx.stroke();   // thin rim
     ctx.restore();
   }
 
