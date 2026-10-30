@@ -126,7 +126,7 @@ function M.onUpdate(dtReal, dtSim)
           along = dx * hx + dy * hy
         end
       end
-      if keep then bodies[#bodies + 1] = { id = vid, along = along, wheels = d.w, sources = d.src, tc = d.tc, inp = d.inp, gf = d.gf, ext = d.ext, dt = d.dt } end
+      if keep then bodies[#bodies + 1] = { id = vid, along = along, wheels = d.w, sources = d.src, inp = d.inp, gf = d.gf, ext = d.ext, dt = d.dt } end
     end
   end
   table.sort(bodies, function(a, b) return a.along > b.along end)

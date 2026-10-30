@@ -9,9 +9,6 @@
  *   Underneath : engine block or electric motors where they sit, gearbox, driveshafts and
  *                differentials (hollow open, centre block limited-slip, solid locked),
  *                tinted by the torque flowing; diamonds on shafts that can disconnect
- *   Dot outside a wheel : red ABS / blue ESC acting on that wheel
- *   Dot under the engine : green, traction control intervening
- *   No dots when nothing is intervening
  *   Rim of the circle : driver inputs — steering (blue) from the top, brake (red)
  *                bottom-left, throttle (green) bottom-right; a quarter turn at full
  *   Yellow dot : G-force felt by the driver (edge = 1.5 g), with a fading trail
@@ -47,14 +44,6 @@
     motor:      'rgba(236, 240, 246, 0.88)'
   };
 
-  // Driver-assist dots. Per wheel (wheel.iv): 1 ABS, 3 ESC; hidden when 0.
-  // Traction control acts on the engine, so it's one dot under the engine (body.tc).
-  var ASSIST = {
-    1: { colour: 'rgb(255, 60, 50)',  rank: 1 },
-    3: { colour: 'rgb(60, 150, 255)', rank: 2 }
-  };
-  var ASSIST_TC = 'rgb(70, 225, 95)';
-  function dotRadius(tyreW) { return clamp(tyreW * 0.3, 2.5, 4.5); }
 
   // Drawing sizes in metres (scaled with the vehicle)
   var TYRE_W = 0.23, TYRE_H = 0.8, PAD = 0.28, BODY_GAP = 0.45;
@@ -65,8 +54,6 @@
   var GB_SIZE = 0.34, GB_OFFSET = 0.5, CDIFF_NEAR = 0.75, CDIFF_BACK = 0.4, CDIFF_LEVEL = 0.45;
   var TRANSVERSE_TOL = 0.3;   // engine this close (fore/aft) to a driven axle: mounted sideways
   var AXLE_TOL = 0.3; // wheels within this many metres fore/aft share an axle
-  var DOT_SPACE = 0.3; // room beside the outer wheels for assist dots
-  var TC_DOT_SPACE = 0.25; // room under an engine for the traction-control dot
   var DUAL_GAP = 0.6;  // same-side wheels on one axle closer than this are a dual set
   var DUAL_GAP_M = 0.04;    // gap between tyres of a dual set when spread from one hub (m)
   var DUAL_SAME_HUB = 0.05; // dual tyres closer than this (m) are treated as reported at one hub point
@@ -235,10 +222,10 @@
     // everything that must stay visible, relative to the centre (for stacking and fitting)
     var halfW = boxHalfW, halfH = boxHalfH;
     wheels.forEach(function (w) {
-      halfW = Math.max(halfW, Math.abs(w._mx - cx) + w._wd / 2 + DOT_SPACE);
+      halfW = Math.max(halfW, Math.abs(w._mx - cx) + w._wd / 2);
     });
     sources.forEach(function (s) {
-      halfH = Math.max(halfH, Math.abs(+s.y - cy) + ENGINE_H / 2 + TC_DOT_SPACE);
+      halfH = Math.max(halfH, Math.abs(+s.y - cy) + ENGINE_H / 2);
     });
     return {
       cx: cx, cy: cy, box: box, hasExt: hasExt,
@@ -249,18 +236,17 @@
   }
 
   // Radius (metres, from the body centre) the circle must hold for a lone vehicle:
-  // its body, every tyre at any steering angle, the assist dots and the engine.
+  // its body, every tyre at any steering angle, and the engine.
   function fitRadius(body) {
     var g = body.geo;
     var rM = Math.hypot(g.boxHalfW, g.boxHalfH);
     body.wheels.forEach(function (w) {
       var ox = Math.abs(w._mx - g.cx), oy = +w.y - g.cy;
       rM = Math.max(rM,
-        Math.hypot(ox, oy) + Math.hypot(w._wd, w._len) / 2,
-        Math.hypot(ox + w._wd / 2 + DOT_SPACE, oy));
+        Math.hypot(ox, oy) + Math.hypot(w._wd, w._len) / 2);
     });
     body.sources.forEach(function (s) {
-      rM = Math.max(rM, Math.hypot(s.x - g.cx, s.y - g.cy) + Math.hypot(ENGINE_W, ENGINE_H) / 2 + TC_DOT_SPACE);
+      rM = Math.max(rM, Math.hypot(s.x - g.cx, s.y - g.cy) + Math.hypot(ENGINE_W, ENGINE_H) / 2);
     });
     return rM;
   }
@@ -481,7 +467,7 @@
     var nodes = placeDrivetrain(body, centreX, sourceX);
     var drivenWidth = clamp(0.09 * s, 2, 4.5);
     var ew = clamp(ENGINE_W * s, 12, 34), eh = clamp(ENGINE_H * s, 9, 26);   // engine block (px)
-    var diffPx = clamp(DIFF * s, 6, 12), gbPx = clamp(GB_SIZE * s, 9, 18), tcDots = [];
+    var diffPx = clamp(DIFF * s, 6, 12), gbPx = clamp(GB_SIZE * s, 9, 18);
     var cpPx = clamp(0.17 * s, 6, 9), motorR = clamp(MOTOR_R * s, 5, 12);
 
     // Pixel position of every node.
@@ -665,24 +651,12 @@
     // engine sitting over its driven axle mustn't hide the lock state), then electric motors.
     function drawSource(src, ev) {
       var sn = nodes.filter(function (n) { return n.k === 'src' && n.src === src && n.pt; })[0];
-      var p = sn ? sn.pt : map(sourceX(src), +src.y), bottom;
+      var p = sn ? sn.pt : map(sourceX(src), +src.y);
       ctx.save();
       ctx.setLineDash(+src.e ? [3, 2] : []);
-      if (ev) {
-        drawMotor(ctx, p, motorR);
-        bottom = p.y + motorR;
-      } else {
-        drawEngine(ctx, p, ew, eh);
-        bottom = p.y + eh / 2;
-        // a gearbox right behind the engine takes that spot; the TC dot goes under it
-        nodes.forEach(function (n) {
-          if (n.k !== 'gb' || !n.parent || n.parent.src !== src || !n.pt) return;
-          var gp = n.pt;
-          if (gp.y > p.y && Math.abs(gp.x - p.x) < ew / 2) bottom = Math.max(bottom, gp.y + gbPx / 2);
-        });
-      }
+      if (ev) drawMotor(ctx, p, motorR);
+      else drawEngine(ctx, p, ew, eh);
       ctx.restore();
-      tcDots.push({ x: p.x, y: bottom });
     }
     body.sources.forEach(function (src) { if (src.k !== 'ev') drawSource(src, false); });
     nodes.forEach(function (n) { if (n.k === 'gb' && n.pt) drawGearbox(ctx, n.pt, gbPx); });
@@ -691,21 +665,6 @@
     // disconnect diamonds last among the parts, so none is ever hidden under one
     marks.forEach(function (m) { drawDisconnect(ctx, m.p, m.ux, m.uy, m.open, cpPx); });
 
-    // traction-control dot under each engine / motor, last so nothing covers it
-    if (+body.tc) {
-      tcDots.forEach(function (d0) {
-        var dr = clamp(0.09 * s, 2.5, 4.5);
-        var cy = d0.y + Math.max(3, dr) + dr + 1;
-        ctx.save();
-        // dark ring so it stays visible on top of a green driveshaft
-        ctx.beginPath(); ctx.arc(d0.x, cy, dr + 1.5, 0, Math.PI * 2);
-        ctx.fillStyle = 'rgba(10, 12, 16, 0.9)'; ctx.fill();
-        ctx.shadowColor = ASSIST_TC; ctx.shadowBlur = dr * 2;
-        ctx.fillStyle = ASSIST_TC;
-        ctx.beginPath(); ctx.arc(d0.x, cy, dr, 0, Math.PI * 2); ctx.fill();
-        ctx.restore();
-      });
-    }
 
     ctx.restore();
   }
@@ -791,40 +750,6 @@
     ctx.fillText('waiting for vehicle', W / 2, H / 2 + r * 0.12);
   }
 
-  // One dot per axle side, outboard of the outermost wheel there (so dual wheels share a dot).
-  // wheelPoint(w) gives a wheel's drawn centre in pixels.
-  // dims(w) gives a tyre's drawn size in pixels: { w, h }.
-  function drawAssistDots(ctx, body, wheelPoint, dims) {
-    body.geo.axles.forEach(function (a) {
-      var sides = { left: [], right: [] };
-      a.wheels.forEach(function (w) { (w._set.side < 0 ? sides.left : sides.right).push(w); });
-      ['left', 'right'].forEach(function (side) {
-        var group = sides[side];
-        if (!group.length) return;
-        var best = null;
-        group.forEach(function (w) {
-          var info = ASSIST[+w.iv];
-          if (info && (!best || info.rank > best.rank)) best = info;
-        });
-        if (!best) return;
-        var points = group.map(function (w) { return { w: w, p: wheelPoint(w) }; });
-        var outer = points.reduce(function (o, q) {
-          return (side === 'left' ? q.p.x < o.p.x : q.p.x > o.p.x) ? q : o;
-        }, points[0]);
-        var p = outer.p, d = dims(outer.w);
-        var r = dotRadius(d.w), gap = Math.max(3, r);
-        // clear the tyre even when it's steered
-        var reach = d.w / 2 + Math.abs(Math.sin(+outer.w.s || 0)) * d.h / 2 + gap + r;
-        var dx = side === 'left' ? -reach : reach;
-        ctx.save();
-        ctx.shadowColor = best.colour; ctx.shadowBlur = r * 2;
-        ctx.fillStyle = best.colour;
-        ctx.beginPath(); ctx.arc(p.x + dx, p.y, r, 0, Math.PI * 2); ctx.fill();
-        ctx.restore();
-      });
-    });
-  }
-
   function drawTyre(ctx, x, y, w, h, wh, onLeft, opts) {
     var broken = !!+wh.b, sliding = !!+wh.e;
     var rawGrip = +wh.g || 0, grip = clamp(rawGrip, 0, 1);
@@ -864,8 +789,7 @@
       ctx.fillStyle = STYLE.text;
       ctx.textBaseline = 'middle';
       ctx.textAlign = onLeft ? 'right' : 'left';
-      var r = dotRadius(w);   // leave room for the assist dot (same reach as drawAssistDots)
-      var clear = w / 2 + Math.abs(Math.sin(+wh.s || 0)) * h / 2 + Math.max(3, r) + 2 * r + 4;
+      var clear = w / 2 + Math.abs(Math.sin(+wh.s || 0)) * h / 2 + 6;   // clear the tyre even when steered
       var tx = onLeft ? x - clear : x + clear;
       ctx.fillText(Math.round(rawGrip * 100) + '%', tx, y - fs * 0.6);
       if (wh.sl !== undefined) {
@@ -907,7 +831,7 @@
           var n = clamp(Math.round(+w.nt || 1), 1, 4);
           for (var c = 0; c < n; c++) wheels.push(c === 0 ? w : Object.assign({}, w));
         });
-        return { wheels: wheels, sources: toArray(b.sources), tc: b.tc, inp: b.inp, gf: b.gf, ext: b.ext, dt: b.dt };
+        return { wheels: wheels, sources: toArray(b.sources), inp: b.inp, gf: b.gf, ext: b.ext, dt: b.dt };
       })
       .filter(function (b) { return b.wheels.length > 0; });
     if (!bodies.length) { trail.length = 0; drawEmpty(ctx, W, H); return; }
@@ -956,7 +880,7 @@
     }
 
     // Pass 1: drivetrains. Then the G-force dot (centred on the circle, from the lead vehicle).
-    // Pass 2: tyres and assist dots on top.
+    // Pass 2: tyres on top.
     placements.forEach(function (p) {
       var g = p.body.geo;
       p.map = function (x, y) {   // vehicle metres → canvas pixels, forward = up
@@ -983,7 +907,6 @@
         var pt = wheelPoint(wh), d = dims(wh);
         drawTyre(ctx, pt.x, pt.y, d.w, d.h, wh, wh._set.side < 0, opts);
       });
-      drawAssistDots(ctx, p.body, wheelPoint, dims);
     });
   };
 

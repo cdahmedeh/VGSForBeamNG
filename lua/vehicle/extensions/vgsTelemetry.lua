@@ -6,7 +6,6 @@
 --   * an estimate of how much of the tyre's grip is in use (0..1+)
 --   * whether the tyre is sliding (grip limit exceeded)
 --   * the torque being applied: +1 full drive ... 0 none ... -1 full braking
---   * whether ABS or ESC is acting on it (and, for the whole vehicle, traction control)
 -- and sends it to the vgsHub game-engine extension, which forwards it to the UI.
 --
 -- Loaded on demand by vgsHub. Nothing is computed until setActive(true).
@@ -30,10 +29,6 @@ local GRIP_SMOOTHING   = 0.4   -- 0..1 per update; higher = snappier, lower = st
 local ACCEL_SMOOTH_HZ  = 6     -- low-pass for measured acceleration (grip estimate and G-force dot)
 local LOAD_SMOOTH_HZ   = 0.5   -- low-pass for the wheel load used to scale drive torque
 local STANDSTILL_SPEED = 0.5   -- m/s; a held brake at standstill isn't counted as tyre force
--- Driver-assist indicators (ABS / TC / ESC)
-local ASSIST_HOLD         = 0.3  -- s a dot stays lit after the last detection (ABS pulses fast)
-local ASSIST_MIN_SPEED    = 1.0  -- m/s; ignore system braking below this (hill hold, auto-hold)
-local ASSIST_BRAKE_MARGIN = 60   -- Nm of brake torque beyond what the pedals ask for = system braking
 -- ===========================================================================
 
 local G = 9.81
@@ -48,18 +43,6 @@ local coupled    = {}    -- [objId] = number of couplers attached to that vehicl
 local lastVel    = nil
 local latAccel   = 0
 local lonAccel   = 0
-local assistClock = 0
-local tcUntil = 0
-
--- per-wheel assist codes (2 was per-wheel TC; TC is now reported for the whole vehicle)
-local IV_NONE, IV_ABS, IV_ESC = 0, 1, 3
-
--- electrics flags may be booleans or 0/1 numbers; nil means "this vehicle doesn't report it"
-local function flag(value)
-  if type(value) == "boolean" then return value end
-  if type(value) == "number" then return value > 0.5 end
-  return nil
-end
 
 local function clamp(v, lo, hi)
   if v < lo then return lo elseif v > hi then return hi end
@@ -598,7 +581,6 @@ end
 
 local function resetState()
   drivetrain, everDriven, nodeCidByName = nil, {}, nil
-  assistClock, tcUntil = 0, 0
   layout, state = nil, {}
   layoutWait, sendTimer = 0, 0
   lastVel, latAccel, lonAccel = nil, 0, 0
@@ -615,18 +597,6 @@ local function buildPayload(fwd, right, speed)
   local throttle = ev.throttle or 0
   local wheelsOut = {}
 
-  -- Driver assists. ABS is reported per wheel. TC acts on the engine, so it's one
-  -- vehicle-level flag. ESC is shown on the wheels it brakes, found from brake torque
-  -- the pedals didn't ask for.
-  local brakeIn = clamp(ev.brake or 0, 0, 1)
-  local parkIn  = clamp(ev.parkingbrake or ev.parkingbrake_input or 0, 0, 1)
-  local absOn, tcsOn, escOn = flag(ev.absActive), flag(ev.tcsActive), flag(ev.escActive)
-  if flag(ev.abs) == true then absOn = true end   -- BeamNG's Pedals app reads ABS activity from 'abs'
-  local systemFlagsKnown = tcsOn ~= nil or escOn ~= nil
-  -- ESC must be fitted (hasESC) and intervening right now (escActive); unknown counts as no.
-  local escIntervening = flag(ev.hasESC) == true and escOn == true
-  local assists = {}   -- per wheel: { entry, S, abs, esc }
-  local tcFromBrakes = false
 
   -- Live drive graph: each differential's lock state, shafts that are disconnected right now
   -- (e.g. part-time 4WD in 2WD, unlocked hubs), and which wheels are actually connected to
@@ -720,30 +690,6 @@ local function buildPayload(fwd, right, speed)
     if steer >  math.pi / 2 then steer = steer - math.pi end
     if steer < -math.pi / 2 then steer = steer + math.pi end
 
-    -- Assist detection ------------------------------------------------------
-    local expected = brakeIn * brakeMax + parkIn * (w.parkingTorque or 0)
-    local abs = false
-    if w.absActive ~= nil then
-      abs = w.absActive == true or w.absActive == 1
-    elseif absOn then
-      -- no per-wheel flag: ABS is releasing this wheel's brake below what was requested
-      local requested = w.desiredBrakingTorque or expected
-      abs = brakeIn > 0.05 and requested > ASSIST_BRAKE_MARGIN and brake < requested * 0.85
-    end
-    -- Brake torque the pedals didn't ask for comes from TC or ESC. A spinning driven wheel
-    -- under power is TC's job (shown at the engine, not per wheel). ESC is only ever shown
-    -- when the car reports it's fitted with ESC and ESC is actively intervening.
-    local esc = false
-    local systemBrake = speed > ASSIST_MIN_SPEED and brake > expected * 1.1 + ASSIST_BRAKE_MARGIN
-    if systemBrake then
-      local spinningUnderPower = driven and throttle > 0.05 and slip > SLIP_PEAK * 0.3
-      if escIntervening and not (tcsOn and spinningUnderPower) then
-        esc = true
-      elseif tcsOn or (not systemFlagsKnown and spinningUnderPower) then
-        tcFromBrakes = true
-      end
-    end
-
     local entry = {
       i  = i,                      -- wheel id (matches src.w)
       d  = driven and 1 or 0,      -- connected to a power source
@@ -761,31 +707,9 @@ local function buildPayload(fwd, right, speed)
       b  = broken and 1 or 0,
       sl = round(slip, 2),         -- raw contact slip (m/s), for calibration
       fz = math.floor(fz),         -- wheel load (N), for calibration
-      iv = IV_NONE,                -- assist acting on this wheel (filled in below)
     }
     wheelsOut[#wheelsOut + 1] = entry
-    assists[#assists + 1] = { entry = entry, S = S, abs = abs, esc = esc }
   end)
-
-  -- ESC steers the car by braking individual wheels. If every wheel shows the same extra
-  -- braking, it isn't stability control (some other system, or a pedal/torque mismatch).
-  local escCount = 0
-  for _, a in ipairs(assists) do if a.esc then escCount = escCount + 1 end end
-  if escCount > 0 and escCount == #assists then
-    for _, a in ipairs(assists) do a.esc = false end
-  end
-
-  -- Per wheel: ABS and ESC, each held briefly so pulsing stays visible; ESC wins over ABS.
-  for _, a in ipairs(assists) do
-    local S = a.S
-    if a.abs then S.absUntil = assistClock + ASSIST_HOLD end
-    if a.esc then S.escUntil = assistClock + ASSIST_HOLD end
-    if (S.escUntil or 0) > assistClock then a.entry.iv = IV_ESC
-    elseif (S.absUntil or 0) > assistClock then a.entry.iv = IV_ABS end
-  end
-
-  -- Vehicle level: traction control (cuts engine torque, and may brake spinning wheels).
-  if tcsOn or tcFromBrakes then tcUntil = assistClock + ASSIST_HOLD end
 
   local sources = {}
   for _, s in ipairs(drivetrain and drivetrain.sources or {}) do
@@ -818,7 +742,6 @@ local function buildPayload(fwd, right, speed)
     gf = { x = round(-latAccel / G, 3), y = round(-lonAccel / G, 3) },
     src = sources,
     dt = hasGraph and graphOut or nil,   -- simplified drive graph (see buildDriveGraph)
-    tc = (tcUntil > assistClock) and 1 or 0,   -- traction control intervening
 
     id = obj:getId(),
     px = round(pos.x, 2), py = round(pos.y, 2),
@@ -832,7 +755,6 @@ local function updateGFX(dt)
   if not active or not dt or dt <= 0 then return end
 
   local fwd, right = basis()
-  assistClock = assistClock + dt
 
   -- Lateral acceleration from the change in velocity, projected on the vehicle's right axis.
   local vel = obj:getVelocity()
