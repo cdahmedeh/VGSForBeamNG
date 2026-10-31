@@ -153,6 +153,23 @@ function M.setEnabled(on)
   end
 end
 
+-- Diagnostics, runnable from the normal game-engine Lua console (the default "GE - Lua"
+-- context). Each one is passed on to the vehicle you're driving, whose output appears in the
+-- same console:
+--   extensions.vgsHub.dumpAssists()       driver-assist values, once
+--   extensions.vgsHub.watchAssists(true)  every assist value change while you drive (false stops)
+--   extensions.vgsHub.dumpWheels()        wheel positions, sizes and dual detection
+--   extensions.vgsHub.dumpDrivetrain()    the powertrain devices and what the VGS draws
+local function toPlayerVehicle(call)
+  local veh = be:getPlayerVehicle(0)
+  if not veh then log('W', 'vgsHub', 'no player vehicle'); return end
+  veh:queueLuaCommand('extensions.load("vgsTelemetry") if extensions.vgsTelemetry then extensions.vgsTelemetry.' .. call .. ' end')
+end
+function M.dumpAssists() toPlayerVehicle('dumpAssists()') end
+function M.watchAssists(on) toPlayerVehicle('watchAssists(' .. tostring(on ~= false) .. ')') end
+function M.dumpWheels() toPlayerVehicle('dumpWheels()') end
+function M.dumpDrivetrain() toPlayerVehicle('dumpDrivetrain()') end
+
 -- Game-engine coupler hooks (objId1 and objId2 are the two vehicles involved).
 function M.onCouplerAttached(objId1, objId2) addLink(objId1, objId2) end
 function M.onCouplerDetached(objId1, objId2) removeLink(objId1, objId2) end

@@ -53,6 +53,8 @@ local BAL_FULL         = 0.21  -- rad (~12 deg) of difference shown as the full 
 local BAL_SLIP_START   = 0.08  -- rad (~4.5 deg): the more-slipping axle must pass this to colour at all
 local BAL_SLIP_FULL    = 0.14  -- rad (~8 deg, around a road tyre's peak): full colour from here
 local BAL_MIN_YAW      = 0.15  -- rad/s of rotation before the balance is shown at full strength
+-- Driver assists (ABS, ESC, TCS), only on vehicles that report having them
+local ESC_BRAKE_MARGIN = 50    -- Nm of brake request beyond the pedals' share that counts as ESC braking
 -- ===========================================================================
 
 local G = 9.81
@@ -70,6 +72,7 @@ local lastVel    = nil
 local latAccel   = 0
 local lonAccel   = 0
 local lastFwd    = nil
+local assistControllers = nil   -- the driving-dynamics assist parts, when the vehicle has them
 local lastRight  = nil
 local yawRate    = 0     -- rad/s, + = turning left
 local travelAng  = 0     -- rad, + = front axle moving to the left of where the car points; kept
@@ -103,6 +106,11 @@ local function basis()
   local up    = obj:getDirectionVectorUp():normalized()
   local right = fwd:cross(up):normalized()
   return fwd, right
+end
+
+-- An electrics flag: true / false, or a number above one half
+local function truthy(v)
+  return v == true or (type(v) == "number" and v > 0.5)
 end
 
 -- A pedal value as Simple Pedals shows it: whole percent, with 0 only for exactly 0 and 100
@@ -656,6 +664,15 @@ local function captureLayout(fwd, right, steeringCentred)
     if x0 < x1 and y0 < y1 then bodyExtent = { x0 = x0, x1 = x1, y0 = y0, y1 = y1 } end
   end
 
+  -- BeamNG's newer driving-dynamics assists, when the vehicle has them (named as in its jbeam)
+  assistControllers = {}
+  if controller and controller.getController then
+    for key, name in pairs({ tc = "tractionControl", yc = "yawControl", brake = "brakeControl", motor = "motorTorqueControl" }) do
+      local okC, c = pcall(controller.getController, name)
+      if okC and type(c) == "table" and (c.isActing ~= nil or c.isActingAsYC ~= nil) then assistControllers[key] = c end
+    end
+  end
+
   local ok, dt = pcall(mapDrivetrain, fwd, right)
   drivetrain = ok and dt or { sources = {}, driven = {} }
   if not ok then log('W', 'vgsTelemetry', 'drivetrain map failed: ' .. tostring(dt)) end
@@ -709,6 +726,42 @@ local function buildPayload(fwd, right, speed)
   local hasGraph = #graph > 0
 
   local frontSteerSum, frontSteerN, rearSteerSum, rearSteerN = 0, 0, 0, 0
+
+  -- Driver assists, read straight from what the vehicle reports, and only when it reports
+  -- having that assist. Two systems are covered:
+  --  * the classic ESC script: the electrics flags absActive / tcsActive / escActive;
+  --  * BeamNG's newer driving-dynamics electronics (the Vivace and others): separate
+  --    supervisors that say exactly what they're doing. tractionControl.isActing and
+  --    yawControl.isActing (ESC); and the parts that carry it out, motorTorqueControl (cuts
+  --    engine power) and brakeControl (brakes wheels), each with isActingAsTC / isActingAsYC /
+  --    isActingAsABS. On these cars ESC often works by cutting power, e.g. holding a car on
+  --    full lock and full throttle on ice, with tcsActive staying false.
+  -- What's shown:
+  --  * ABS (needs hasABS): the brake arc pulses while ABS works, and each wheel's own absActive
+  --    flag puts a red dot by it. Only while the brake is applied.
+  --  * Power being cut, by traction control or by ESC (needs hasTCS / hasESC): the throttle
+  --    arc pulses.
+  --  * ESC braking (needs hasESC): a blue dot by each wheel braked harder than the pedals ask.
+  -- Nothing is held or averaged: each update shows that moment.
+  local function present(hasKey, activeKey)
+    if ev[hasKey] ~= nil then return truthy(ev[hasKey]) end
+    return ev[activeKey] ~= nil
+  end
+  local function acting(c, key) return c ~= nil and c[key] == true end
+  local dd = assistControllers or {}
+  local hasABS = truthy(ev.hasABS)
+  local hasTCS = present("hasTCS", "tcsActive") or dd.tc ~= nil
+  local hasESC = present("hasESC", "escActive") or dd.yc ~= nil
+  local brakeIn = clamp(tonumber(ev.brake) or 0, 0, 1)
+  local parkIn  = clamp(tonumber(ev.parkingbrake) or 0, 0, 1)
+  local brakeOn = brakeIn > 0
+  local absOn = hasABS and brakeOn and (truthy(ev.abs) or acting(dd.brake, "isActingAsABS"))
+  local tcsOn = hasTCS and (truthy(ev.tcsActive) or acting(dd.tc, "isActing"))
+  local escOn = hasESC and (truthy(ev.escActive) or acting(dd.yc, "isActing"))
+  -- power cut by an assist: traction control, or ESC working through the engine
+  local powerCut = tcsOn or (hasESC and acting(dd.motor, "isActingAsYC"))
+  -- ESC braking wheels: the classic script, or the driving-dynamics brake part doing it for ESC
+  local escBraking = escOn and (dd.brake == nil or acting(dd.brake, "isActingAsYC"))
   forEachWheel(function(i, w)
     local L, S = layout[i], state[i]
     if not L or not S then return end
@@ -786,6 +839,19 @@ local function buildPayload(fwd, right, speed)
       rearSteerSum, rearSteerN = rearSteerSum + steer, rearSteerN + 1
     end
 
+    -- assist acting on this wheel right now: 1 = ABS, 3 = ESC braking it
+    local iv = nil
+    if escBraking then
+      -- brake asked for (or applied) beyond the pedal and handbrake's share of this wheel
+      local expected = brakeIn * brakeMax + parkIn * (w.parkingTorque or 0)
+      local request = math.max(math.abs(w.desiredBrakingTorque or 0), math.abs(w.brakingTorque or 0))
+      if request > expected * 1.15 + ESC_BRAKE_MARGIN then iv = 3 end
+    end
+    if not iv and hasABS and brakeOn and (w.absActive == true or w.absActive == 1) then
+      iv = 1
+      absOn = true
+    end
+
     local entry = {
       i  = i,                      -- wheel id (matches src.w)
       d  = driven and 1 or 0,      -- connected to a power source
@@ -803,6 +869,7 @@ local function buildPayload(fwd, right, speed)
       b  = broken and 1 or 0,
       sl = round(slip, 2),         -- raw contact slip (m/s), for calibration
       fz = math.floor(fz),         -- wheel load (N), for calibration
+      iv = iv,                     -- assist on this wheel: 1 = ABS, 3 = ESC
     }
     wheelsOut[#wheelsOut + 1] = entry
   end)
@@ -831,6 +898,8 @@ local function buildPayload(fwd, right, speed)
     b = pedalLevel(ev.brake),
     c = pedalLevel(ev.clutch),         -- 1 = pedal fully down
     p = pedalLevel(ev.parkingbrake),   -- handbrake
+    abs = absOn and 1 or nil,          -- ABS working: the brake arc pulses
+    tcs = powerCut and 1 or nil,       -- an assist cutting power (TCS or ESC): the throttle arc pulses
   }
 
   -- Direction of travel, on the steering arc's scale: the front axle's travel angle as a share
@@ -902,7 +971,93 @@ local function buildPayload(fwd, right, speed)
   }
 end
 
+-- Diagnostic: the driver-assist values this vehicle reports. In the vehicle Lua console:
+--   extensions.load("vgsTelemetry") extensions.vgsTelemetry.dumpAssists()
+-- prints them once; watchAssists(true) prints every change while you drive (false to stop).
+local ASSIST_KEY = { "abs", "tcs", "esc", "traction", "yaw", "stabil", "throttlefactor", "intervention" }
+local watchingAssists, lastAssistValues = false, {}
+local function assistElectrics()
+  local out = {}
+  for k, val in pairs(electrics.values or {}) do
+    local lk = type(k) == "string" and k:lower() or ""
+    for _, pat in ipairs(ASSIST_KEY) do
+      if lk:find(pat, 1, true) and type(val) ~= "table" then out[k] = val; break end
+    end
+  end
+  return out
+end
+local function dumpAssists()
+  local function out(line) log('I', 'vgsTelemetry', line); print(line) end
+  local vals, keys = assistElectrics(), {}
+  for k in pairs(vals) do keys[#keys + 1] = k end
+  table.sort(keys)
+  out("electrics: " .. (#keys == 0 and "(no assist-related values)" or ""))
+  for _, k in ipairs(keys) do out(string.format("  %-24s %s", k, tostring(vals[k]))) end
+  -- every field of each wheel to do with ABS, brakes or slip, whatever it's called
+  forEachWheel(function(i, w)
+    local parts = {}
+    pcall(function()
+      for k, val in pairs(w) do
+        local lk = type(k) == "string" and k:lower() or ""
+        if (lk:find("abs", 1, true) or lk:find("brake", 1, true) or lk:find("slip", 1, true)) and type(val) ~= "table" and type(val) ~= "function" then
+          parts[#parts + 1] = k .. "=" .. tostring(val)
+        end
+      end
+    end)
+    table.sort(parts)
+    out(string.format("  wheel %s: %s", tostring(w.name), table.concat(parts, "  ")))
+  end)
+  -- the assist controllers, and what each one offers (functions and plain values)
+  if controller and controller.getController then
+    for _, name in ipairs({ "tractionControl", "yawControl", "absControl", "esc", "brakeControl", "motorTorqueControl", "CMU" }) do
+      local ok, c = pcall(controller.getController, name)
+      if ok and type(c) == "table" then
+        local fns, vals2 = {}, {}
+        for k, val in pairs(c) do
+          if type(val) == "function" then fns[#fns + 1] = tostring(k)
+          elseif type(val) ~= "table" then vals2[#vals2 + 1] = tostring(k) .. "=" .. tostring(val) end
+        end
+        table.sort(fns); table.sort(vals2)
+        out(string.format("  controller %s: functions %s", name, table.concat(fns, ", ")))
+        if #vals2 > 0 then out(string.format("  controller %s: values %s", name, table.concat(vals2, ", "))) end
+      else
+        out(string.format("  controller %-18s -", name))
+      end
+    end
+  end
+end
+local function watchAssists(on)
+  watchingAssists = on ~= false
+  lastAssistValues = {}
+end
+
 local function updateGFX(dt)
+  if watchingAssists then
+    local function changed(key, val)
+      if lastAssistValues[key] ~= val then
+        local line = string.format("[vgs assists] %s = %s", key, tostring(val))
+        log('I', 'vgsTelemetry', line); print(line)
+        lastAssistValues[key] = val
+      end
+    end
+    for k, val in pairs(assistElectrics()) do changed(k, val) end
+    -- what the driving-dynamics assist parts say they're doing
+    for key, c in pairs(assistControllers or {}) do
+      for _, f in ipairs({ "isActing", "isActingAsTC", "isActingAsYC", "isActingAsABS" }) do
+        if c[f] ~= nil then changed("controller " .. key .. " " .. f, c[f]) end
+      end
+    end
+    -- each wheel's ABS-related fields, whatever they're called
+    forEachWheel(function(i, w)
+      pcall(function()
+        for k, val in pairs(w) do
+          if type(k) == "string" and k:lower():find("abs", 1, true) and type(val) ~= "table" and type(val) ~= "function" then
+            changed("wheel " .. tostring(w.name) .. " " .. k, val)
+          end
+        end
+      end)
+    end)
+  end
   if not active or not dt or dt <= 0 then return end
 
   local fwd, right = basis()
@@ -1037,6 +1192,8 @@ end
 
 M.dumpWheels        = dumpWheels
 M.dumpDrivetrain    = dumpDrivetrain
+M.dumpAssists       = dumpAssists
+M.watchAssists      = watchAssists
 M.onExtensionLoaded = resetState
 M.onReset           = resetState
 M.updateGFX         = updateGFX

@@ -58,6 +58,14 @@
   var DUAL_GAP_M = 0.04;    // gap between tyres of a dual set when spread from one hub (m)
   var DUAL_SAME_HUB = 0.05; // dual tyres closer than this (m) are treated as reported at one hub point
   var MIN_TYRE_W = 3, MIN_TYRE_L = 6;   // px; only so very small tyres stay visible
+  // Assist dots beside the wheels (wheel.iv): 1 = ABS acting on it, 3 = ESC braking it.
+  // Small and slightly see-through, so they stay subtle; one per corner (a dual set shares one).
+  var ASSIST = {
+    1: { colour: 'rgba(255, 85, 75, 0.9)',  rank: 1 },
+    3: { colour: 'rgba(95, 165, 255, 0.9)', rank: 2 }
+  };
+  function dotRadius(tyreW) { return clamp(tyreW * 0.22, 1.8, 3.2); }
+  var DOT_SPACE = 0.22;   // room beside the outer wheels for the assist dots (m)
 
   function toArray(v) {
     if (!v) return [];
@@ -224,7 +232,7 @@
     // everything that must stay visible, relative to the centre (for stacking and fitting)
     var halfW = boxHalfW, halfH = boxHalfH;
     wheels.forEach(function (w) {
-      halfW = Math.max(halfW, Math.abs(w._mx - cx) + w._wd / 2);
+      halfW = Math.max(halfW, Math.abs(w._mx - cx) + w._wd / 2 + DOT_SPACE);
     });
     sources.forEach(function (s) {
       halfH = Math.max(halfH, Math.abs(+s.y - cy) + ENGINE_H / 2);
@@ -245,7 +253,8 @@
     body.wheels.forEach(function (w) {
       var ox = Math.abs(w._mx - g.cx), oy = +w.y - g.cy;
       rM = Math.max(rM,
-        Math.hypot(ox, oy) + Math.hypot(w._wd, w._len) / 2);
+        Math.hypot(ox, oy) + Math.hypot(w._wd, w._len) / 2,
+        Math.hypot(ox + w._wd / 2 + DOT_SPACE, oy));
     });
     body.sources.forEach(function (s) {
       rM = Math.max(rM, Math.hypot(s.x - g.cx, s.y - g.cy) + Math.hypot(ENGINE_W, ENGINE_H) / 2);
@@ -710,9 +719,17 @@
     steer:     'rgb(45, 115, 205)',
     brake:     'rgb(205, 45, 40)',
     throttle:  'rgb(60, 180, 75)',
+    brakePulse:    'rgb(240, 80, 70)',     // the brake arc pulses a little brighter while ABS works
+    throttlePulse: 'rgb(30, 110, 45)',     // the throttle arc dips a little darker while TCS cuts power
     clutch:    'rgb(225, 229, 236)',   // over the throttle, on the outer half of the rim
     handbrake: 'rgb(135, 22, 58)'      // dark crimson / wine, over the brake, on the outer half of the rim
   };
+  var PULSE_HZ = 5;       // how fast the brake / throttle arcs pulse while ABS / TCS work
+  function nowMs() { return (window.performance && performance.now) ? performance.now() : Date.now(); }
+  function mixRgb(a, b, k) {
+    var pa = a.match(/[\d.]+/g).map(Number), pb = b.match(/[\d.]+/g).map(Number);
+    return 'rgb(' + [0, 1, 2].map(function (i) { return Math.round(pa[i] + (pb[i] - pa[i]) * k); }).join(', ') + ')';
+  }
   var TRAVEL_GAP = 1.5;   // px between the steering arc and the travel arc
   function travelWidth(rPx) { return clamp(rPx * 0.032, 2, 4.5); }
   function drawInputArcs(ctx, cx, cy, rPx, inp) {
@@ -742,8 +759,10 @@
     ctx.lineWidth = lw; ctx.lineCap = 'butt';
     if (steer > 0) arc(INPUT.steer, TOP - steer * Q, TOP);        // left: counter-clockwise from the top
     else if (steer < 0) arc(INPUT.steer, TOP, TOP - steer * Q);   // right: clockwise from the top
-    arc(INPUT.brake, BOTTOM, BOTTOM + brk * Q);                    // bottom-left quarter
-    arc(INPUT.throttle, BOTTOM - thr * Q, BOTTOM);                 // bottom-right quarter
+    // ABS working: the brake arc pulses; traction control working: the throttle arc pulses
+    var pulse = 0.5 + 0.5 * Math.sin(nowMs() / 1000 * 2 * Math.PI * PULSE_HZ);
+    arc(+inp.abs ? mixRgb(INPUT.brake, INPUT.brakePulse, pulse) : INPUT.brake, BOTTOM, BOTTOM + brk * Q);
+    arc(+inp.tcs ? mixRgb(INPUT.throttle, INPUT.throttlePulse, pulse) : INPUT.throttle, BOTTOM - thr * Q, BOTTOM);
     // clutch and handbrake: half as wide, along the outer edge, over the throttle and brake
     var clu = clamp(+inp.c || 0, 0, 1), hb = clamp(+inp.p || 0, 0, 1);
     r = rPx - lw / 4; ctx.lineWidth = lw / 2;
@@ -807,6 +826,37 @@
     ctx.fillText('waiting for vehicle', W / 2, H / 2 + r * 0.12);
   }
 
+  // One dot per axle side, outboard of the outermost wheel there (so dual wheels share a dot).
+  // wheelPoint(w) gives a wheel's drawn centre in pixels; dims(w) its drawn size { w, h }.
+  function drawAssistDots(ctx, body, wheelPoint, dims) {
+    body.geo.axles.forEach(function (a) {
+      var sides = { left: [], right: [] };
+      a.wheels.forEach(function (w) { (w._set.side < 0 ? sides.left : sides.right).push(w); });
+      ['left', 'right'].forEach(function (side) {
+        var group = sides[side];
+        if (!group.length) return;
+        var best = null;
+        group.forEach(function (w) {
+          var info = ASSIST[+w.iv];
+          if (info && (!best || info.rank > best.rank)) best = info;
+        });
+        if (!best) return;
+        var points = group.map(function (w) { return { w: w, p: wheelPoint(w) }; });
+        var outer = points.reduce(function (o, q) {
+          return (side === 'left' ? q.p.x < o.p.x : q.p.x > o.p.x) ? q : o;
+        }, points[0]);
+        var p = outer.p, d = dims(outer.w);
+        var r = dotRadius(d.w), gap = Math.max(3, r);
+        // clear the tyre even when it's steered
+        var reach = d.w / 2 + Math.abs(Math.sin(+outer.w.s || 0)) * d.h / 2 + gap + r;
+        ctx.save();
+        ctx.fillStyle = best.colour;
+        ctx.beginPath(); ctx.arc(p.x + (side === 'left' ? -reach : reach), p.y, r, 0, Math.PI * 2); ctx.fill();
+        ctx.restore();
+      });
+    });
+  }
+
   function drawTyre(ctx, x, y, w, h, wh, onLeft, opts) {
     var broken = !!+wh.b, sliding = !!+wh.e;
     var rawGrip = +wh.g || 0, grip = clamp(rawGrip, 0, 1);
@@ -846,7 +896,8 @@
       ctx.fillStyle = STYLE.text;
       ctx.textBaseline = 'middle';
       ctx.textAlign = onLeft ? 'right' : 'left';
-      var clear = w / 2 + Math.abs(Math.sin(+wh.s || 0)) * h / 2 + 6;   // clear the tyre even when steered
+      var r = dotRadius(w);   // leave room for the assist dot (same reach as drawAssistDots)
+      var clear = w / 2 + Math.abs(Math.sin(+wh.s || 0)) * h / 2 + Math.max(3, r) + 2 * r + 4;
       var tx = onLeft ? x - clear : x + clear;
       ctx.fillText(Math.round(rawGrip * 100) + '%', tx, y - fs * 0.6);
       if (wh.sl !== undefined) {
@@ -938,7 +989,7 @@
     }
 
     // Pass 1: drivetrains. Then the G-force dot (centred on the circle, from the lead vehicle).
-    // Pass 2: tyres on top.
+    // Pass 2: tyres and assist dots on top.
     placements.forEach(function (p) {
       var g = p.body.geo;
       p.map = function (x, y) {   // vehicle metres → canvas pixels, forward = up
@@ -965,6 +1016,7 @@
         var pt = wheelPoint(wh), d = dims(wh);
         drawTyre(ctx, pt.x, pt.y, d.w, d.h, wh, wh._set.side < 0, opts);
       });
+      drawAssistDots(ctx, p.body, wheelPoint, dims);
     });
   };
 
