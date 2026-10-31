@@ -46,8 +46,12 @@ local TRAVEL_MAX       = 4     -- longest arc, in quarter turns (4 = the whole c
 local LOCK_DEFAULT     = 0.6   -- rad; road-wheel angle at full lock until it's been measured
 -- Understeer / oversteer balance (the arc's colour): rear slip angle minus front slip angle,
 -- in the direction the car is rotating. + = rear sliding more (oversteer), - = front (understeer).
-local BAL_DEADBAND     = 0.02  -- rad (~1 deg) of difference that still counts as neutral
-local BAL_FULL         = 0.14  -- rad (~8 deg) of difference shown as the full colour
+-- Tuned to stay neutral in normal driving: road tyres run a few degrees of slip in ordinary
+-- corners, and a small front/rear difference is just the car's handling, not a slide.
+local BAL_DEADBAND     = 0.05  -- rad (~3 deg) of difference that still counts as neutral
+local BAL_FULL         = 0.21  -- rad (~12 deg) of difference shown as the full colour
+local BAL_SLIP_START   = 0.08  -- rad (~4.5 deg): the more-slipping axle must pass this to colour at all
+local BAL_SLIP_FULL    = 0.14  -- rad (~8 deg, around a road tyre's peak): full colour from here
 local BAL_MIN_YAW      = 0.15  -- rad/s of rotation before the balance is shown at full strength
 -- ===========================================================================
 
@@ -848,6 +852,11 @@ local function buildPayload(fwd, right, speed)
     local turn = yawRate >= 0 and 1 or -1                  -- + = rotating left
     local diff = (slipR - slipF) * turn                    -- + = rear slipping more
     local mag = clamp((math.abs(diff) - BAL_DEADBAND) / (BAL_FULL - BAL_DEADBAND), 0, 1)
+    mag = mag * mag * (3 - 2 * mag)                        -- ease in: small differences barely tint
+    -- only once the axle that's slipping more is actually working hard (near its grip limit),
+    -- not while both are in the few degrees of slip of ordinary cornering
+    local worst = (diff < 0) and math.abs(slipF) or math.abs(slipR)
+    mag = mag * clamp((worst - BAL_SLIP_START) / (BAL_SLIP_FULL - BAL_SLIP_START), 0, 1)
     target = (diff < 0 and -mag or mag) * clamp(math.abs(yawRate) / BAL_MIN_YAW, 0, 1)
   end
   balance = balance + (target - balance) * clamp(TRAVEL_SMOOTH_HZ / SEND_HZ, 0, 1)

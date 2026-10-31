@@ -676,7 +676,7 @@
   // on the same scale (a quarter turn = full lock), running on round the circle for big slides.
   // When the front tyres grip it lines up with the steering. Its colour shows the balance: light
   // blue when neutral, shading to orange as the front slides more than the rear (understeer) or
-  // magenta as the rear slides more (oversteer), and it thickens as the balance goes further.
+  // magenta as the rear slides more (oversteer). Its width stays the same throughout.
   var TRAVEL_COLOUR = { neutral: [150, 210, 245], under: [255, 150, 45], over: [235, 70, 205] };
   function travelColour(bal) {
     var b = clamp(+bal || 0, -1, 1), to = b < 0 ? TRAVEL_COLOUR.under : TRAVEL_COLOUR.over, k = Math.abs(b);
@@ -704,8 +704,8 @@
     // direction of travel: just inside the steering arc, faded in once the car is moving
     if (inp.tv !== undefined && inp.tv !== null) {
       var tv = clamp(+inp.tv || 0, -4, 4), bal = clamp(+inp.bal || 0, -1, 1);
-      var tw0 = travelWidth(rPx), tw = tw0 * (1 + 0.6 * Math.abs(bal));   // thicker the further off balance
-      var tr = rPx - lw - TRAVEL_GAP - tw / 2;                              // outer edge fixed; grows inwards
+      var tw = travelWidth(rPx);
+      var tr = rPx - lw - TRAVEL_GAP - tw / 2;
       ctx.globalAlpha = clamp(inp.ta === undefined ? 1 : +inp.ta, 0, 1);
       ctx.lineWidth = tw; ctx.lineCap = 'butt'; ctx.strokeStyle = travelColour(bal);
       if (Math.abs(tv) > 0.004) {
@@ -877,7 +877,7 @@
     // clear of the input arcs on its rim.
     var rPx = Math.min(W, H) / 2 - 2, ccx = W / 2, ccy = H / 2;
     // vehicles stay inside the steering arc and the travel arc just inside it
-    var inner = rPx - clamp(rPx * 0.05, 3, 7) - TRAVEL_GAP - travelWidth(rPx) * 1.6 - 2;
+    var inner = rPx - clamp(rPx * 0.05, 3, 7) - TRAVEL_GAP - travelWidth(rPx) - 2;
     ctx.beginPath(); ctx.arc(ccx, ccy, rPx, 0, Math.PI * 2);
     ctx.fillStyle = STYLE.panelFill; ctx.fill();
     ctx.strokeStyle = STYLE.panelStroke; ctx.lineWidth = 1.5; ctx.stroke();
