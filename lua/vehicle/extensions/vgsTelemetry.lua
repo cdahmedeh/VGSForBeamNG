@@ -36,6 +36,19 @@ local GRIP_SMOOTHING   = 0.4   -- 0..1, share of the gap closed every 1/30 s; hi
 local ACCEL_SMOOTH_HZ  = 6     -- low-pass for measured acceleration (grip estimate and G-force dot)
 local LOAD_SMOOTH_HZ   = 0.5   -- low-pass for the wheel load used to scale drive torque
 local STANDSTILL_SPEED = 0.5   -- m/s; a held brake at standstill isn't counted as tyre force
+-- Direction of travel (arc inside the steering arc): which way the front axle is actually
+-- moving, against where the car points, on the same scale as the steering arc. It can run on
+-- past a quarter, all the way round, for big slides and spins.
+local TRAVEL_SMOOTH_HZ = 8     -- low-pass for the direction of travel and the yaw rate it uses
+local TRAVEL_FADE_LO   = 1.0   -- m/s; below this the direction is too noisy to show
+local TRAVEL_FADE_HI   = 2.5   -- m/s; fully shown from here
+local TRAVEL_MAX       = 4     -- longest arc, in quarter turns (4 = the whole circle)
+local LOCK_DEFAULT     = 0.6   -- rad; road-wheel angle at full lock until it's been measured
+-- Understeer / oversteer balance (the arc's colour): rear slip angle minus front slip angle,
+-- in the direction the car is rotating. + = rear sliding more (oversteer), - = front (understeer).
+local BAL_DEADBAND     = 0.02  -- rad (~1 deg) of difference that still counts as neutral
+local BAL_FULL         = 0.14  -- rad (~8 deg) of difference shown as the full colour
+local BAL_MIN_YAW      = 0.15  -- rad/s of rotation before the balance is shown at full strength
 -- ===========================================================================
 
 local G = 9.81
@@ -52,10 +65,27 @@ local coupled    = {}    -- [objId] = number of couplers attached to that vehicl
 local lastVel    = nil
 local latAccel   = 0
 local lonAccel   = 0
+local lastFwd    = nil
+local lastRight  = nil
+local yawRate    = 0     -- rad/s, + = turning left
+local travelAng  = 0     -- rad, + = front axle moving to the left of where the car points; kept
+                         -- continuous past +-180 deg (up to +-270) so a big slide doesn't flip sides
+local rearTravel = 0     -- rad, the same at the rear axle
+local balance    = 0     -- -1 full understeer .. +1 full oversteer (smoothed)
+local rearAxle   = nil   -- { x, y, cut } centre of the rear axle group; wheels behind cut belong to it
+local lockAngle  = LOCK_DEFAULT   -- rad; road-wheel angle at full steering lock (learned)
+local frontAxle  = nil   -- { x, y } centre of the frontmost axle (metres, vehicle frame)
 
 local function clamp(v, lo, hi)
   if v < lo then return lo elseif v > hi then return hi end
   return v
+end
+
+-- angle wrapped to -pi .. pi
+local function wrapAngle(a)
+  a = (a + math.pi) % (2 * math.pi)
+  if a < 0 then a = a + 2 * math.pi end
+  return a - math.pi
 end
 
 local function round(v, digits)
@@ -564,6 +594,28 @@ local function captureLayout(fwd, right, steeringCentred)
     state[i] = { grip = 0, sliding = false, fzAvg = math.max(w.downForceRaw or w.downForce or 0, 0) }
   end)
 
+  -- Centre of the frontmost axle: where the direction of travel is measured, so it lines up
+  -- with the steered wheels when they grip. And the centre of the wheels in the rear half
+  -- (the middle of a tandem), for the understeer / oversteer balance.
+  frontAxle, rearAxle = nil, nil
+  local maxY, minY = -math.huge, math.huge
+  for _, L in pairs(layout) do maxY = math.max(maxY, L.y); minY = math.min(minY, L.y) end
+  if maxY > -math.huge then
+    local sx, sy, n = 0, 0, 0
+    for _, L in pairs(layout) do
+      if L.y > maxY - 0.3 then sx, sy, n = sx + L.x, sy + L.y, n + 1 end
+    end
+    frontAxle = { x = sx / n, y = sy / n }
+    if maxY - minY > 0.5 then
+      local cut = (maxY + minY) / 2
+      sx, sy, n = 0, 0, 0
+      for _, L in pairs(layout) do
+        if L.y < cut then sx, sy, n = sx + L.x, sy + L.y, n + 1 end
+      end
+      if n > 0 then rearAxle = { x = sx / n, y = sy / n, cut = cut } end
+    end
+  end
+
   -- Footprint of the whole vehicle from every node, so a trailer's box is as long as the
   -- trailer, not just the stretch between its wheels.
   bodyExtent = nil
@@ -593,6 +645,8 @@ local function resetState()
   layout, state = nil, {}
   layoutWait, sendTimer = 0, 0
   lastVel, latAccel, lonAccel = nil, 0, 0
+  lastFwd, lastRight, yawRate, travelAng, lockAngle, frontAxle = nil, nil, 0, 0, LOCK_DEFAULT, nil
+  rearTravel, balance, rearAxle = 0, 0, nil
 end
 
 local function coupledList()
@@ -633,6 +687,7 @@ local function buildPayload(fwd, right, speed)
   end
   local hasGraph = #graph > 0
 
+  local frontSteerSum, frontSteerN, rearSteerSum, rearSteerN = 0, 0, 0, 0
   forEachWheel(function(i, w)
     local L, S = layout[i], state[i]
     if not L or not S then return end
@@ -703,6 +758,12 @@ local function buildPayload(fwd, right, speed)
     local steer = axleYaw(w, fwd, right) - L.steerBase
     if steer >  math.pi / 2 then steer = steer - math.pi end
     if steer < -math.pi / 2 then steer = steer + math.pi end
+    if frontAxle and L.y > frontAxle.y - 0.3 and not broken then
+      frontSteerSum, frontSteerN = frontSteerSum + steer, frontSteerN + 1
+    end
+    if rearAxle and L.y < rearAxle.cut and not broken then
+      rearSteerSum, rearSteerN = rearSteerSum + steer, rearSteerN + 1
+    end
 
     local entry = {
       i  = i,                      -- wheel id (matches src.w)
@@ -738,11 +799,55 @@ local function buildPayload(fwd, right, speed)
   -- Inputs for the rim arcs, read the same way as BeamNG's own Steering and Pedals apps:
   -- steering_input is negative to the left (we send + = left), and throttle / brake are the
   -- applied pedal values (brake includes the automatic hold at standstill).
+  local steerIn = clamp(-(ev.steering_input or 0), -1, 1)
   local inputs = {
-    s = round(clamp(-(ev.steering_input or 0), -1, 1), 3),
+    s = round(steerIn, 3),
     t = round(clamp(ev.throttle or ev.throttle_input or 0, 0, 1), 3),
     b = round(clamp(ev.brake or ev.brake_input or 0, 0, 1), 3),
   }
+
+  -- Direction of travel, on the steering arc's scale: the front axle's travel angle as a share
+  -- of the road-wheel angle at full lock. That scale is learned from how far the front wheels
+  -- actually turn for a given steering input.
+  if frontSteerN > 0 and math.abs(steerIn) > 0.15 then
+    local front = math.abs(frontSteerSum / frontSteerN)
+    if front > 0.02 then
+      lockAngle = lockAngle + (clamp(front / math.abs(steerIn), 0.15, 1.4) - lockAngle) * 0.05
+    end
+  end
+
+  -- Understeer / oversteer: each axle's slip angle is where its wheels point minus where that
+  -- axle is actually going. Whichever axle slips more, in the direction the car is rotating,
+  -- sets the balance.
+  --  * A slip angle is folded into +-90 deg: a tyre rolling backwards is rolling, not sliding,
+  --    so an axle going backwards in a spin doesn't flip the sign.
+  --  * The direction comes from the yaw rate, which keeps its sign through a drift or a spin;
+  --    the cornering acceleration can flip at low speed or as the car slides sideways.
+  local function slipAngle(steerAvg, travel)
+    local d = steerAvg - travel
+    return math.atan2(math.sin(d), math.abs(math.cos(d)))
+  end
+  local target = 0
+  if frontAxle and rearAxle and frontSteerN > 0 then
+    local slipF = slipAngle(frontSteerSum / frontSteerN, travelAng)
+    local slipR = slipAngle(rearSteerN > 0 and rearSteerSum / rearSteerN or 0, rearTravel)
+    local turn = yawRate >= 0 and 1 or -1                  -- + = rotating left
+    local diff = (slipR - slipF) * turn                    -- + = rear slipping more
+    local mag = clamp((math.abs(diff) - BAL_DEADBAND) / (BAL_FULL - BAL_DEADBAND), 0, 1)
+    target = (diff < 0 and -mag or mag) * clamp(math.abs(yawRate) / BAL_MIN_YAW, 0, 1)
+  end
+  balance = balance + (target - balance) * clamp(TRAVEL_SMOOTH_HZ / SEND_HZ, 0, 1)
+
+  -- Shown whenever the car is moving, including sliding backwards in a spin, but not when
+  -- reversing on purpose (reverse gear selected and rolling backwards).
+  local vel = obj:getVelocity()
+  local speed2d = math.sqrt(vel:dot(fwd) ^ 2 + vel:dot(right) ^ 2)
+  local reversing = (ev.gearIndex or 0) < 0 and vel:dot(fwd) < 0
+  if speed2d > TRAVEL_FADE_LO and frontAxle and not reversing then
+    inputs.tv = round(clamp(travelAng / lockAngle, -TRAVEL_MAX, TRAVEL_MAX), 3)   -- + = left of the nose
+    inputs.ta = round(clamp((speed2d - TRAVEL_FADE_LO) / (TRAVEL_FADE_HI - TRAVEL_FADE_LO), 0, 1), 2)
+    inputs.bal = round(balance, 3)   -- -1 understeer .. 0 neutral .. +1 oversteer
+  end
 
   local pos = obj:getPosition()
   return {
@@ -779,6 +884,29 @@ local function updateGFX(dt)
     lonAccel = lonAccel + (dv:dot(fwd) / dt - lonAccel) * k
   end
   lastVel = vec3(vel)
+
+  -- Yaw rate from the change in heading (+ = turning left), and from it the direction the
+  -- front axle is moving: the body's velocity plus the rotation's share at the axle.
+  if lastFwd then
+    local d = math.atan2(-fwd:dot(lastRight), fwd:dot(lastFwd)) / dt
+    yawRate = yawRate + (d - yawRate) * clamp(dt * TRAVEL_SMOOTH_HZ, 0, 1)
+  end
+  lastFwd, lastRight = vec3(fwd), vec3(right)
+  -- direction each axle is moving (+ = left of where the car points), all the way round
+  local k = clamp(dt * TRAVEL_SMOOTH_HZ, 0, 1)
+  local function axleTravel(axle, current)
+    local vx = vel:dot(right) - yawRate * axle.y          -- sideways, + = right
+    local vy = vel:dot(fwd) + yawRate * axle.x            -- forwards
+    if vx * vx + vy * vy < 0.25 then return current end   -- barely moving: keep the last value
+    -- step from the current value the short way round, so the angle stays continuous past
+    -- +-180 deg instead of jumping from one side to the other
+    local a = current + wrapAngle(math.atan2(-vx, vy) - current) * k
+    -- a genuine full rotation (past +-270 deg) comes back round to the other side
+    if a > 1.5 * math.pi then a = a - 2 * math.pi elseif a < -1.5 * math.pi then a = a + 2 * math.pi end
+    return a
+  end
+  if frontAxle then travelAng = axleTravel(frontAxle, travelAng) end
+  if rearAxle then rearTravel = axleTravel(rearAxle, rearTravel) end
 
   -- Capture the wheel layout once, ideally with the steering centred.
   if not layout then
