@@ -101,6 +101,14 @@ local function basis()
   return fwd, right
 end
 
+-- A pedal value as Simple Pedals shows it: whole percent, with 0 only for exactly 0 and 100
+-- only for exactly full (smartRound(100, v * 100) in its app.vue), returned as 0..1.
+local function pedalLevel(v)
+  v = (tonumber(v) or 0) * 100
+  local pct = (v >= 100) and 100 or math.floor(v + (1 - 1e-7 - v / 100))
+  return clamp(pct, 0, 100) / 100
+end
+
 local function forEachWheel(fn)
   if not wheels or not wheels.wheels then return end
   for i = 0, tableSizeC(wheels.wheels) - 1 do
@@ -796,14 +804,20 @@ local function buildPayload(fwd, right, speed)
     }
   end
 
-  -- Inputs for the rim arcs, read the same way as BeamNG's own Steering and Pedals apps:
-  -- steering_input is negative to the left (we send + = left), and throttle / brake are the
-  -- applied pedal values (brake includes the automatic hold at standstill).
+  -- Inputs for the rim arcs. Steering is read like BeamNG's Steering app: steering_input,
+  -- negative to the left (we send + = left).
+  -- The pedals are read exactly like BeamNG's Simple Pedals app: the applied electrics values
+  -- throttle, brake, clutch and parkingbrake (brake includes the automatic hold at standstill),
+  -- turned into whole percent with its "smart rounding". Anything not exactly 0 shows at least
+  -- 1 %, and only exactly full shows 100 %, so a controller deadzone or a pedal that doesn't
+  -- quite reach the end is visible.
   local steerIn = clamp(-(ev.steering_input or 0), -1, 1)
   local inputs = {
     s = round(steerIn, 3),
-    t = round(clamp(ev.throttle or ev.throttle_input or 0, 0, 1), 3),
-    b = round(clamp(ev.brake or ev.brake_input or 0, 0, 1), 3),
+    t = pedalLevel(ev.throttle),
+    b = pedalLevel(ev.brake),
+    c = pedalLevel(ev.clutch),         -- 1 = pedal fully down
+    p = pedalLevel(ev.parkingbrake),   -- handbrake
   }
 
   -- Direction of travel, on the steering arc's scale: the front axle's travel angle as a share

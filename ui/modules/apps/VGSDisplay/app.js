@@ -683,9 +683,11 @@
     return 'rgb(' + TRAVEL_COLOUR.neutral.map(function (c, i) { return Math.round(c + (to[i] - c) * k); }).join(', ') + ')';
   }
   var INPUT = {
-    steer:    'rgb(45, 115, 205)',
-    brake:    'rgb(205, 45, 40)',
-    throttle: 'rgb(60, 180, 75)'
+    steer:     'rgb(45, 115, 205)',
+    brake:     'rgb(205, 45, 40)',
+    throttle:  'rgb(60, 180, 75)',
+    clutch:    'rgb(225, 229, 236)',   // over the throttle, on the outer half of the rim
+    handbrake: 'rgb(245, 195, 50)'     // over the brake, on the outer half of the rim
   };
   var TRAVEL_GAP = 1.5;   // px between the steering arc and the travel arc
   function travelWidth(rPx) { return clamp(rPx * 0.032, 2, 4.5); }
@@ -718,6 +720,11 @@
     else if (steer < 0) arc(INPUT.steer, TOP, TOP - steer * Q);   // right: clockwise from the top
     arc(INPUT.brake, BOTTOM, BOTTOM + brk * Q);                    // bottom-left quarter
     arc(INPUT.throttle, BOTTOM - thr * Q, BOTTOM);                 // bottom-right quarter
+    // clutch and handbrake: half as wide, along the outer edge, over the throttle and brake
+    var clu = clamp(+inp.c || 0, 0, 1), hb = clamp(+inp.p || 0, 0, 1);
+    r = rPx - lw / 4; ctx.lineWidth = lw / 2;
+    arc(INPUT.handbrake, BOTTOM, BOTTOM + hb * Q);
+    arc(INPUT.clutch, BOTTOM - clu * Q, BOTTOM);
     ctx.restore();
   }
 
