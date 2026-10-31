@@ -119,8 +119,10 @@
   // Dual tyres that would then touch are spread apart (see findTyreSets).
   function tyreDims(w) {
     var r = +w.rd, wd = +w.wd;
-    w._len = (r > 0.1 && r < 3) ? 2 * r : TYRE_H;
-    w._wd = ((wd > 0.04 && wd < 2) ? wd : TYRE_W) * TYRE_WIDEN;
+    // small wheels are real too (a Pigeon's stabiliser wheels are 8 cm in radius, 2.5 cm wide);
+    // only missing or nonsense sizes fall back to the defaults
+    w._len = (r > 0.02 && r < 3) ? 2 * r : TYRE_H;
+    w._wd = ((wd > 0.005 && wd < 2) ? wd : TYRE_W) * TYRE_WIDEN;
   }
 
   // Within each axle, group wheels on the same side that sit close together (dual tyres).
@@ -608,9 +610,28 @@
       var P = n.parent;
       if (!P || !n.pt || !P.pt) return;
       var a = P.pt, b = (n.k === 'wheel' && P.k === 'diff' && P.axle) ? { x: n.pt.x, y: P.pt.y } : n.pt;
-      var len = Math.hypot(b.x - a.x, b.y - a.y);
+      // Shafts are never drawn diagonally: one that has to go both along and across the
+      // vehicle runs fore/aft from the part feeding it first (along the centreline, for a
+      // centre part), then turns square and runs across to the part it feeds.
+      var pts = [a];
+      if (Math.abs(b.x - a.x) > 0.5 && Math.abs(b.y - a.y) > 0.5) pts.push({ x: a.x, y: b.y });
+      pts.push(b);
+      var segs = [], len = 0;
+      for (var q = 1; q < pts.length; q++) {
+        var sl = Math.hypot(pts[q].x - pts[q - 1].x, pts[q].y - pts[q - 1].y);
+        if (sl < 0.01) continue;
+        segs.push({ a: pts[q - 1], len: sl, ux: (pts[q].x - pts[q - 1].x) / sl, uy: (pts[q].y - pts[q - 1].y) / sl, at: len });
+        len += sl;
+      }
       if (len < 0.5) return;
-      var ux = (b.x - a.x) / len, uy = (b.y - a.y) / len;
+      // point and direction at distance d along the shaft
+      function at(d) {
+        var sg = segs[segs.length - 1];
+        for (var q = 0; q < segs.length; q++) if (d <= segs[q].at + segs[q].len) { sg = segs[q]; break; }
+        var t = d - sg.at;
+        return { x: sg.a.x + sg.ux * t, y: sg.a.y + sg.uy * t, ux: sg.ux, uy: sg.uy };
+      }
+      var first = segs[0], last = segs[segs.length - 1];
       var ws = n.ws || [];
       var torque = ws.length ? ws.reduce(function (sum, w) { return sum + (+w.dr || 0); }, 0) / ws.length : 0;
       ctx.save();
@@ -620,29 +641,32 @@
       } else {
         ctx.strokeStyle = torqueColour(torque * 0.7); ctx.lineWidth = drivenWidth;
       }
-      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+      ctx.lineJoin = 'round';
+      ctx.beginPath(); ctx.moveTo(pts[0].x, pts[0].y);
+      for (var q2 = 1; q2 < pts.length; q2++) ctx.lineTo(pts[q2].x, pts[q2].y);
+      ctx.stroke();
       ctx.restore();
 
-      var v0 = Math.min(reach(P, ux, uy), len), v1 = Math.max(v0, len - reach(n, -ux, -uy));
+      var v0 = Math.min(reach(P, first.ux, first.uy), len), v1 = Math.max(v0, len - reach(n, -last.ux, -last.uy));
       var h = cpPx * 0.65, cursor = v1 - h;
       // a locking hub's diamond goes right next to its wheel
       if (n.k === 'wheel') {
         toArray(n.cp).forEach(function (c) {
-          var p = { x: a.x + ux * (v1 - h - 2), y: a.y + uy * (v1 - h - 2) };
+          var p = at(v1 - h - 2);
           taken.push({ x: p.x, y: p.y, hw: h, hh: h });
-          marks.push({ p: p, ux: ux, uy: uy, open: !!+c.o });
+          marks.push({ p: p, ux: p.ux, uy: p.uy, open: !!+c.o });
         });
         return;
       }
       toArray(n.cp).forEach(function (c) {
         var spot = null;
         for (var d = cursor; d >= v0 + h; d -= 1) {
-          if (free({ x: a.x + ux * d, y: a.y + uy * d }, h)) { spot = d; break; }
+          if (free(at(d), h)) { spot = d; break; }
         }
         if (spot === null) spot = Math.max(v0, v1 - h);   // nowhere free: next to the part it feeds
-        var p = { x: a.x + ux * spot, y: a.y + uy * spot };
+        var p = at(spot);
         taken.push({ x: p.x, y: p.y, hw: h, hh: h });
-        marks.push({ p: p, ux: ux, uy: uy, open: !!+c.o });
+        marks.push({ p: p, ux: p.ux, uy: p.uy, open: !!+c.o });
         cursor = spot - 2 * h - 1;
       });
     });

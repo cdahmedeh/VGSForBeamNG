@@ -560,6 +560,15 @@ local function tyreInfo(i, w)
   local tireWidth = num("tireWidth") or num("hubWidth")
   local offset    = num("wheelOffset") or 0
 
+  -- A wheel with no tyre (hasTire = false), such as the Pigeon's stabiliser wheels: it's just
+  -- the hub, so draw it at the hub's size. The tyre radius and width it reports are left over
+  -- from the vehicle's real tyres and would draw it full size.
+  local hasTire = w.hasTire
+  if hasTire == nil then hasTire = d.hasTire end
+  if hasTire == false or hasTire == 0 then
+    return 1, offset, "hub only, no tyre", num("hubRadius") or radius, num("hubWidth") or tireWidth
+  end
+
   for _, key in ipairs({ "isDual", "dual", "dualWheel", "dualTire", "dualTyre", "isDualWheel" }) do
     local x = w[key]
     if x == nil then x = d[key] end
