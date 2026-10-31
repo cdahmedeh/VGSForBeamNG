@@ -687,7 +687,7 @@
     brake:     'rgb(205, 45, 40)',
     throttle:  'rgb(60, 180, 75)',
     clutch:    'rgb(225, 229, 236)',   // over the throttle, on the outer half of the rim
-    handbrake: 'rgb(245, 195, 50)'     // over the brake, on the outer half of the rim
+    handbrake: 'rgb(135, 22, 58)'      // dark crimson / wine, over the brake, on the outer half of the rim
   };
   var TRAVEL_GAP = 1.5;   // px between the steering arc and the travel arc
   function travelWidth(rPx) { return clamp(rPx * 0.032, 2, 4.5); }
