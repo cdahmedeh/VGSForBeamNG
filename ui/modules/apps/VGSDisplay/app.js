@@ -457,11 +457,13 @@
   }
 
   // Driveshafts, half-shafts, differentials, gearbox and power sources (under the tyres).
-  // map(x, y) converts vehicle metres to canvas pixels; s = pixels per metre.
-  function drawDrivetrain(ctx, body, map, s) {
+  // map(x, y) converts vehicle metres to canvas pixels; s = pixels per metre; tyreBox(w) gives a
+  // wheel's drawn tyre in px ({ x, y, hx, hy }: centre, reach across, reach along), so shafts
+  // can stop at its edge.
+  function drawDrivetrain(ctx, body, map, s, tyreBox) {
     var g = body.geo, axles = g.axles;
     ctx.save();
-    ctx.lineCap = 'round';
+    ctx.lineCap = 'butt';
 
     // Car's centreline. Engines sit on it even if the vehicle data puts them slightly
     // off-centre; only a motor that drives wheels on one side keeps its own lateral position.
@@ -592,7 +594,7 @@
       if (n.k === 'src') return n.src && n.src.k === 'ev' ? motorR : box(ew / 2, eh / 2);
       if (n.k === 'gb') return box(gbPx / 2, gbPx / 2);
       if (n.k === 'diff') return box(diffPx / 2, diffPx / 2);
-      if (n.k === 'wheel') { var w0 = (n.ws || [])[0]; return w0 ? Math.max(w0._wd * s, MIN_TYRE_W) / 2 : 0; }
+      if (n.k === 'wheel') { if (tyreBox) return 0; var wr = (n.ws || [])[0]; return wr ? Math.max(wr._wd * s, MIN_TYRE_W) / 2 : 0; }
       return 0;
     }
 
@@ -625,6 +627,28 @@
       var pts = [a];
       if (Math.abs(b.x - a.x) > 0.5 && Math.abs(b.y - a.y) > 0.5) pts.push({ x: a.x, y: b.y });
       pts.push(b);
+      // A shaft to a wheel stops flush at the tyre's inner edge, not at the middle of the tyre.
+      // Across the vehicle it stops at the inside of the whole set (the inner tyre of a dual);
+      // along it (a centre wheel), at the tyre's end.
+      var w0 = n.k === 'wheel' && tyreBox ? (n.ws || [])[0] : null;
+      if (w0) {
+        var from = pts[pts.length - 2], end = { x: b.x, y: b.y };
+        var boxes = (w0._set ? w0._set.wheels : [w0]).map(tyreBox), own = tyreBox(w0);
+        if (Math.abs(from.y - b.y) <= 0.5) {
+          var toRight = from.x < own.x;
+          end.x = toRight
+            ? Math.min.apply(null, boxes.map(function (t) { return t.x - t.hx; }))
+            : Math.max.apply(null, boxes.map(function (t) { return t.x + t.hx; }));
+          if (toRight ? end.x < from.x : end.x > from.x) end.x = from.x;   // tyre over the part feeding it
+        } else {
+          end.x = own.x;
+          if (pts.length > 2) pts[pts.length - 2].x = own.x;
+          var down = from.y < own.y;
+          end.y = own.y + (down ? -own.hy : own.hy);
+          if (down ? end.y < from.y : end.y > from.y) end.y = from.y;
+        }
+        pts[pts.length - 1] = end;
+      }
       var segs = [], len = 0;
       for (var q = 1; q < pts.length; q++) {
         var sl = Math.hypot(pts[q].x - pts[q - 1].x, pts[q].y - pts[q - 1].y);
@@ -993,21 +1017,15 @@
 
     // Pass 1: drivetrains. Then the G-force dot (centred on the circle, from the lead vehicle).
     // Pass 2: tyres and assist dots on top.
+    var dims = function (wh) {
+      return { w: Math.max(wh._wd * scale, MIN_TYRE_W), h: Math.max(wh._len * scale, MIN_TYRE_L) };
+    };
     placements.forEach(function (p) {
       var g = p.body.geo;
-      p.map = function (x, y) {   // vehicle metres → canvas pixels, forward = up
+      var map = p.map = function (x, y) {   // vehicle metres → canvas pixels, forward = up
         return { x: p.ox + (x - g.cx) * scale, y: p.oy - (y - g.cy) * scale };
       };
-      drawDrivetrain(ctx, p.body, p.map, scale);
-    });
-    if (bodies[0].gf) drawGForce(ctx, trail, ccx, ccy, rPx, bodies[0].gf);
-
-    placements.forEach(function (p) {
-      var map = p.map;
-      var dims = function (wh) {
-        return { w: Math.max(wh._wd * scale, MIN_TYRE_W), h: Math.max(wh._len * scale, MIN_TYRE_L) };
-      };
-      var wheelPoint = function (wh) {
+      p.wheelPoint = function (wh) {
         var st = wh._set;
         if (!st.spread) return map(wh._mx, +wh.y);
         // spread sets: real pitch, but never closer than a hairline when tyres are tiny
@@ -1015,6 +1033,19 @@
         var c = map(st.cx, +wh.y);
         return { x: c.x + wh._slot * Math.max(st.pitch * scale, widest + 1.5), y: c.y };
       };
+      drawDrivetrain(ctx, p.body, map, scale, function (wh) {
+        // hx, hy: how far the (possibly steered) tyre reaches from its centre across and along
+        var pt = p.wheelPoint(wh), d = dims(wh), st = +wh.s || 0;
+        var c = Math.abs(Math.cos(st)), sn = Math.abs(Math.sin(st));
+        return { x: pt.x, y: pt.y,
+                 hx: Math.min(c > 1e-6 ? d.w / 2 / c : Infinity, sn > 1e-6 ? d.h / 2 / sn : Infinity),
+                 hy: Math.min(c > 1e-6 ? d.h / 2 / c : Infinity, sn > 1e-6 ? d.w / 2 / sn : Infinity) };
+      });
+    });
+    if (bodies[0].gf) drawGForce(ctx, trail, ccx, ccy, rPx, bodies[0].gf);
+
+    placements.forEach(function (p) {
+      var wheelPoint = p.wheelPoint;
       p.body.wheels.forEach(function (wh) {
         var pt = wheelPoint(wh), d = dims(wh);
         drawTyre(ctx, pt.x, pt.y, d.w, d.h, wh, wh._set.side < 0, opts);
