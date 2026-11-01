@@ -11,5 +11,6 @@
     "bottom": "140px",
     "right": "20px"
   },
-  "types": ["ui.apps.categories.debug"]
+  "types": ["ui.apps.categories.telemetry"],
+  "category": "Telemetry"
 }

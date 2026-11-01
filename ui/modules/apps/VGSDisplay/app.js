@@ -49,7 +49,7 @@
   var TYRE_W = 0.23, TYRE_H = 0.8, PAD = 0.28, BODY_GAP = 0.45;
   // tyres are drawn this much wider than they really are (same length), so they're easy to see
   var TYRE_WIDEN = 1.5;
-  var ENGINE_W = 0.62, ENGINE_H = 0.48, MOTOR_R = 0.2, DIFF = 0.2;
+  var ENGINE_W = 0.62, ENGINE_H = 0.48, MOTOR_R = 0.085, DIFF = 0.2;
   // gearbox and centre-diff placement when the vehicle doesn't locate them (metres)
   var GB_SIZE = 0.34, GB_OFFSET = 0.5, CDIFF_NEAR = 0.75, CDIFF_BACK = 0.4, CDIFF_LEVEL = 0.45;
   var TRANSVERSE_TOL = 0.3;   // engine this close (fore/aft) to a driven axle: mounted sideways
@@ -400,8 +400,8 @@
   function drawMotor(ctx, p, r) {
     ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
     ctx.fillStyle = DRIVETRAIN.engineEdge; ctx.fill();
-    ctx.strokeStyle = DRIVETRAIN.motor; ctx.lineWidth = clamp(r * 0.35, 2, 4); ctx.stroke();
-    ctx.beginPath(); ctx.arc(p.x, p.y, r * 0.35, 0, Math.PI * 2);
+    ctx.strokeStyle = DRIVETRAIN.motor; ctx.lineWidth = clamp(r * 0.3, 1.2, 2); ctx.stroke();
+    ctx.beginPath(); ctx.arc(p.x, p.y, r * 0.3, 0, Math.PI * 2);
     ctx.fillStyle = DRIVETRAIN.motor; ctx.fill();
   }
 
@@ -481,7 +481,7 @@
     var drivenWidth = clamp(0.09 * s, 2, 4.5);
     var ew = clamp(ENGINE_W * s, 12, 34), eh = clamp(ENGINE_H * s, 9, 26);   // engine block (px)
     var diffPx = clamp(DIFF * s, 6, 12), gbPx = clamp(GB_SIZE * s, 9, 18);
-    var cpPx = clamp(0.17 * s, 6, 9), motorR = clamp(MOTOR_R * s, 5, 12);
+    var cpPx = clamp(0.17 * s, 6, 9), motorR = clamp(MOTOR_R * s, 3, 5.5);
 
     // Pixel position of every node.
     nodes.forEach(function (n) { if (n.x !== undefined) n.pt = map(n.x, n.y); });
