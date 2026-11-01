@@ -732,12 +732,19 @@
   // Direction of travel: a small marker just inside the steering arc, on the same scale (a quarter
   // turn = full lock), where the front axle is actually going. Steering at the marker points the
   // front wheels exactly where they're travelling. It goes on round the circle in big slides.
-  // The marker's colour shows the balance: light blue when neutral, orange as the front slides
-  // more than the rear (understeer), magenta as the rear slides more (oversteer).
-  var TRAVEL_COLOUR = { neutral: [150, 210, 245], under: [255, 150, 45], over: [235, 70, 205] };
+  // The marker's colour shows the balance: light blue when neutral, magenta as the rear slides
+  // more (oversteer). Understeer comes in two stages: up to UNDER_WARN of the scale is the
+  // warning as the front nears its limit, light blue to a light orange; beyond it is understeer
+  // proper, the front past its peak, light orange deepening to full orange.
+  var TRAVEL_COLOUR = { neutral: [150, 210, 245], warn: [250, 200, 140], under: [255, 150, 45], over: [235, 70, 205] };
+  var UNDER_WARN = 0.35;   // must match US_WARN_SHARE in vgsTelemetry.lua
   function travelColour(bal) {
-    var b = clamp(+bal || 0, -1, 1), to = b < 0 ? TRAVEL_COLOUR.under : TRAVEL_COLOUR.over, k = Math.abs(b);
-    return 'rgb(' + TRAVEL_COLOUR.neutral.map(function (c, i) { return Math.round(c + (to[i] - c) * k); }).join(', ') + ')';
+    var b = clamp(+bal || 0, -1, 1), k = Math.abs(b), from = TRAVEL_COLOUR.neutral, to = TRAVEL_COLOUR.over;
+    if (b < 0) {
+      if (k <= UNDER_WARN) { to = TRAVEL_COLOUR.warn; k = k / UNDER_WARN; }
+      else { from = TRAVEL_COLOUR.warn; to = TRAVEL_COLOUR.under; k = (k - UNDER_WARN) / (1 - UNDER_WARN); }
+    }
+    return 'rgb(' + from.map(function (c, i) { return Math.round(c + (to[i] - c) * k); }).join(', ') + ')';
   }
   var INPUT = {
     steer:     'rgb(45, 115, 205)',

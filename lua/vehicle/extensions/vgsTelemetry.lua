@@ -55,18 +55,40 @@ local TRAVEL_FADE_LO   = 0.5   -- m/s; below this the direction is too noisy to 
                                -- rocking at a stop would swing it about)
 local TRAVEL_FADE_HI   = 1.5   -- m/s; fully shown from here (wobble under ~0.3 deg)
 local TRAVEL_MAX       = 4     -- furthest the marker goes, in quarter turns (4 = the whole circle)
-local REAR_GRIP_SLIP   = 0.14  -- rad (~8 deg) of rear slip up to which the rear counts as gripping
-local REAR_SLIDE_SLIP  = 0.35  -- rad (~20 deg) from which it's fully sliding (marker = front vs body)
+-- The marker's and the balance colour's tuning lives in one table: LuaJIT allows a function
+-- at most 60 outside local variables, and the payload builder uses a lot of settings.
+local TUNE = {}
+TUNE.REAR_GRIP_SLIP   = 0.14  -- rad (~8 deg) of rear slip up to which the rear counts as gripping
+TUNE.REAR_SLIDE_SLIP  = 0.35  -- rad (~20 deg) from which it's fully sliding (marker = front vs body)
 local LOCK_DEFAULT     = 0.6   -- rad; road-wheel angle at full lock until it's been measured
 -- Understeer / oversteer balance (the arc's colour): rear slip angle minus front slip angle,
 -- in the direction the car is rotating. + = rear sliding more (oversteer), - = front (understeer).
 -- Tuned to stay neutral in normal driving: road tyres run a few degrees of slip in ordinary
 -- corners, and a small front/rear difference is just the car's handling, not a slide.
-local BAL_DEADBAND     = 0.05  -- rad (~3 deg) of difference that still counts as neutral
-local BAL_FULL         = 0.21  -- rad (~12 deg) of difference shown as the full colour
-local BAL_SLIP_START   = 0.08  -- rad (~4.5 deg): the more-slipping axle must pass this to colour at all
-local BAL_SLIP_FULL    = 0.14  -- rad (~8 deg, around a road tyre's peak): full colour from here
-local BAL_MIN_YAW      = 0.15  -- rad/s of rotation before the balance is shown at full strength
+TUNE.BAL_DEADBAND     = 0.05  -- rad (~3 deg) of difference that still counts as neutral
+TUNE.BAL_FULL         = 0.21  -- rad (~12 deg) of difference shown as the full colour
+TUNE.BAL_SLIP_START   = 0.08  -- rad (~4.5 deg): the more-slipping axle must pass this to colour at all
+TUNE.BAL_SLIP_FULL    = 0.14  -- rad (~8 deg, around a road tyre's peak): full colour from here
+TUNE.BAL_MIN_YAW      = 0.15  -- rad/s of rotation before the balance is shown at full strength
+-- Understeer is shown in two stages (the balance value runs 0 .. -TUNE.US_WARN_SHARE for the first,
+-- on to -1 for the second; the display maps them to light blue -> light orange -> full orange):
+--  1. a warning as the front tyres approach their limit. Two things together: the front slip
+--     angle on its way to a road tyre's peak (about 7 deg), and the front slipping more than the
+--     rear (the car running out of front grip first). In a simulated sweep up to the limit it
+--     stays clear below about 60 % of the front tyres' grip, starts around 75-80 % and reaches
+--     light orange at the limit.
+--  2. understeer proper, once the front is past its peak and clearly sliding more than the rear:
+--     light orange deepens to full orange.
+TUNE.US_WARN_SHARE    = 0.35  -- share of the scale the warning stage uses (must match app.js)
+TUNE.US_SLIP_START    = 0.044 -- rad (~2.5 deg) of front slip where the warning starts
+TUNE.US_SLIP_FULL     = 0.122 -- rad (~7 deg, a road tyre's peak): full
+TUNE.US_LEAD_START    = 0.005 -- rad (~0.3 deg) the front must slip more than the rear to count
+TUNE.US_LEAD_FULL     = 0.035 -- rad (~2 deg) from which it counts fully
+TUNE.US_PAST_START    = 0.122 -- rad (~7 deg) of front slip where understeer proper starts
+TUNE.US_PAST_FULL     = 0.175 -- rad (~10 deg): full orange
+TUNE.US_PAST_LEAD     = 0.035 -- rad (~2 deg) more than the rear where it starts ...
+TUNE.US_PAST_LEAD_FULL = 0.07 -- rad (~4 deg) ... and full
+TUNE.US_MIN_YAW       = 0.10  -- rad/s of rotation before it's shown at full strength
 -- Driver assists (ABS, ESC, TCS), only on vehicles that report having them
 local ESC_BRAKE_MARGIN = 50    -- Nm of brake request beyond the pedals' share that counts as ESC braking
 -- ===========================================================================
@@ -966,13 +988,26 @@ local function buildPayload(fwd, right, speed)
     local slipF = slipAngle(frontSteerSum / frontSteerN, travelAng)
     local turn = yawRate >= 0 and 1 or -1                  -- + = rotating left
     local diff = (slipR - slipF) * turn                    -- + = rear slipping more
-    local mag = clamp((math.abs(diff) - BAL_DEADBAND) / (BAL_FULL - BAL_DEADBAND), 0, 1)
-    mag = mag * mag * (3 - 2 * mag)                        -- ease in: small differences barely tint
-    -- only once the axle that's slipping more is actually working hard (near its grip limit),
-    -- not while both are in the few degrees of slip of ordinary cornering
-    local worst = (diff < 0) and math.abs(slipF) or math.abs(slipR)
-    mag = mag * clamp((worst - BAL_SLIP_START) / (BAL_SLIP_FULL - BAL_SLIP_START), 0, 1)
-    target = (diff < 0 and -mag or mag) * clamp(math.abs(yawRate) / BAL_MIN_YAW, 0, 1)
+    if diff >= 0 then
+      -- oversteer: shown once the rear is clearly sliding more than the front
+      local mag = clamp((diff - TUNE.BAL_DEADBAND) / (TUNE.BAL_FULL - TUNE.BAL_DEADBAND), 0, 1)
+      mag = mag * mag * (3 - 2 * mag)                      -- ease in: small differences barely tint
+      -- only once the rear is actually working hard (near its grip limit), not while both are
+      -- in the few degrees of slip of ordinary cornering
+      mag = mag * clamp((math.abs(slipR) - TUNE.BAL_SLIP_START) / (TUNE.BAL_SLIP_FULL - TUNE.BAL_SLIP_START), 0, 1)
+      target = mag * clamp(math.abs(yawRate) / TUNE.BAL_MIN_YAW, 0, 1)
+    else
+      -- understeer: an early warning as the front approaches its limit (see TUNE.US_SLIP_START)
+      local frontWork = clamp((slipF * turn - TUNE.US_SLIP_START) / (TUNE.US_SLIP_FULL - TUNE.US_SLIP_START), 0, 1)
+      local frontLead = clamp((-diff - TUNE.US_LEAD_START) / (TUNE.US_LEAD_FULL - TUNE.US_LEAD_START), 0, 1)
+      local pastPeak = clamp((slipF * turn - TUNE.US_PAST_START) / (TUNE.US_PAST_FULL - TUNE.US_PAST_START), 0, 1)
+        * clamp((-diff - TUNE.US_PAST_LEAD) / (TUNE.US_PAST_LEAD_FULL - TUNE.US_PAST_LEAD), 0, 1)
+      local severity = TUNE.US_WARN_SHARE * frontWork * frontLead + (1 - TUNE.US_WARN_SHARE) * pastPeak
+      -- not once the rear is sliding (a slide or spin is oversteer, whatever the front does):
+      -- faded out with the rear axle's sideways travel, like the marker's change-over
+      local rs = clamp((math.abs(rearTravel) - TUNE.REAR_GRIP_SLIP) / (TUNE.REAR_SLIDE_SLIP - TUNE.REAR_GRIP_SLIP), 0, 1)
+      target = -severity * clamp(math.abs(yawRate) / TUNE.US_MIN_YAW, 0, 1) * (1 - rs * rs * (3 - 2 * rs))
+    end
   end
   balance = balance + (target - balance) * clamp(TRAVEL_SMOOTH_HZ / SEND_HZ, 0, 1)
 
@@ -986,7 +1021,7 @@ local function buildPayload(fwd, right, speed)
     -- the rear grips, easing over to the front's direction against the body as the rear slides
     local shown = travelAng
     if slipR then
-      local k = clamp((math.abs(slipR) - REAR_GRIP_SLIP) / (REAR_SLIDE_SLIP - REAR_GRIP_SLIP), 0, 1)
+      local k = clamp((math.abs(slipR) - TUNE.REAR_GRIP_SLIP) / (TUNE.REAR_SLIDE_SLIP - TUNE.REAR_GRIP_SLIP), 0, 1)
       shown = travelAng + slipR * (1 - k * k * (3 - 2 * k))
     end
     travelDiag.shown = shown
