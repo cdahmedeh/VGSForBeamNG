@@ -10,17 +10,21 @@
 
 local M = {}
 
-local SEND_INTERVAL = 1 / 60 -- s (real time) between UI updates (capped by the game's frame rate)
+local MANAGE_EVERY  = 1 / 30 -- s (real time) between checks of which vehicles to run telemetry on
+local KEEPALIVE     = 0.5    -- s (real time): resend the last frame this often when nothing new
+                             -- arrives (game paused), so the app doesn't time out and blank
 local STALE_AFTER   = 0.6    -- s (sim time) without data before a vehicle is (re)activated
 local RETRY_EVERY   = 1.0    -- s (sim time) between activation attempts
 local MAX_LINK_DIST = 40     -- m; a "coupled" body further away than this is ignored
 
 local enabled   = false
 local simClock  = 0
-local sendTimer = 0
 local latest    = {} -- [vid] = { d = decoded payload, t = simClock }
 local activated = {} -- [vid] = simClock of the last activation command
 local links     = {} -- [vid] = { [otherVid] = true }, from game-engine coupler hooks
+local playerId  = nil
+local realClock = 0
+local lastSent  = -1
 
 local function getVeh(id)
   local ok, veh = pcall(function() return be:getObjectByID(id) end)
@@ -78,36 +82,16 @@ local function collectChain(pid)
   return chain, seen
 end
 
-function M.onUpdate(dtReal, dtSim)
-  if not enabled then return end
-  simClock  = simClock + (dtSim or dtReal or 0)
-  -- keep the leftover time, so a frame that lands a hair early doesn't halve the rate
-  sendTimer = sendTimer + (dtReal or 0)
-  if sendTimer < SEND_INTERVAL * 0.95 then return end
-  sendTimer = sendTimer - SEND_INTERVAL
-  if sendTimer > SEND_INTERVAL or sendTimer < 0 then sendTimer = 0 end
-
-  local player = be:getPlayerVehicle(0)
-  if not player then
+-- Builds the frame from the latest data of the player's vehicle and everything coupled to it,
+-- ordered front to back along the player vehicle's heading, and sends it to the app.
+local function sendFrame()
+  if not playerId then
     guihooks.trigger('VGSUpdate', { bodies = {} })
+    lastSent = realClock
     return
   end
-  local pid = player:getID()
-  local chain, inChain = collectChain(pid)
-
-  -- Keep telemetry running on exactly the vehicles we display.
-  for _, vid in ipairs(chain) do
-    local rec = latest[vid]
-    local fresh = rec and (simClock - rec.t) < STALE_AFTER
-    if not fresh and (not activated[vid] or simClock - activated[vid] > RETRY_EVERY) then
-      activate(vid)
-    end
-  end
-  for vid in pairs(activated) do
-    if not inChain[vid] then deactivate(vid) end
-  end
-
-  -- Order bodies front-to-back along the player vehicle's heading.
+  local pid = playerId
+  local chain = collectChain(pid)
   local ref = latest[pid] and latest[pid].d
   local hx, hy = 0, 1
   if ref then
@@ -134,6 +118,39 @@ function M.onUpdate(dtReal, dtSim)
   table.sort(bodies, function(a, b) return a.along > b.along end)
 
   guihooks.trigger('VGSUpdate', { bodies = bodies })
+  lastSent = realClock
+end
+
+local manageTimer = 0
+function M.onUpdate(dtReal, dtSim)
+  if not enabled then return end
+  simClock  = simClock + (dtSim or dtReal or 0)
+  realClock = realClock + (dtReal or 0)
+
+  manageTimer = manageTimer + (dtReal or 0)
+  if manageTimer >= MANAGE_EVERY then
+    manageTimer = 0
+    local player = be:getPlayerVehicle(0)
+    playerId = player and player:getID() or nil
+    if playerId then
+      -- keep telemetry running on exactly the vehicles we display
+      local chain, inChain = collectChain(playerId)
+      for _, vid in ipairs(chain) do
+        local rec = latest[vid]
+        local fresh = rec and (simClock - rec.t) < STALE_AFTER
+        if not fresh and (not activated[vid] or simClock - activated[vid] > RETRY_EVERY) then
+          activate(vid)
+        end
+      end
+      for vid in pairs(activated) do
+        if not inChain[vid] then deactivate(vid) end
+      end
+    end
+  end
+
+  -- frames normally go out as the player's data arrives (onVehicleJson); this only covers
+  -- no player vehicle, and the game being paused
+  if realClock - lastSent >= KEEPALIVE then sendFrame() end
 end
 
 -- Called from each vehicle's vgsTelemetry extension.
@@ -141,6 +158,9 @@ function M.onVehicleJson(str)
   local ok, d = pcall(jsonDecode, str)
   if ok and type(d) == "table" and type(d.id) == "number" then
     latest[d.id] = { d = d, t = simClock }
+    -- send as soon as the player's vehicle reports, so every update reaches the app once, with
+    -- no extra delay (coupled bodies' latest data rides along)
+    if enabled and d.id == playerId then sendFrame() end
   end
 end
 
@@ -150,6 +170,8 @@ function M.setEnabled(on)
   enabled = on
   if not on then
     for vid in pairs(activated) do deactivate(vid) end
+  else
+    manageTimer = MANAGE_EVERY   -- find the player's vehicle on the next update
   end
 end
 

@@ -892,7 +892,7 @@
   }
 
   function drawTyre(ctx, x, y, w, h, wh, onLeft, opts) {
-    var broken = !!+wh.b, sliding = !!+wh.e;
+    var broken = !!+wh.b, sliding = !!+wh.e, flat = !broken && !!+wh.fl;   // fl: flat or punctured tyre
     var rawGrip = +wh.g || 0, grip = clamp(rawGrip, 0, 1);
     var lw = clamp(w * 0.16, 1, 3.5);
 
@@ -916,6 +916,7 @@
     ctx.lineWidth = lw;
     ctx.strokeStyle = broken ? STYLE.broken : torqueColour(wh.t);
     if (broken) ctx.setLineDash([3, 3]);
+    else if (flat) ctx.setLineDash([Math.max(2, h * 0.12), Math.max(1.5, h * 0.08)]);   // flat: dashed, still showing grip and torque
     ctx.strokeRect(-w / 2 + lw / 2, -h / 2 + lw / 2, w - lw, h - lw);
     ctx.restore();
 

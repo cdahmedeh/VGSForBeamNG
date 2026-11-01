@@ -344,13 +344,27 @@ end
 
 local function isDually(d) return diffKind(d):lower():find("dually") ~= nil end
 
--- open / lsd / locked, from the current mode first (a lockable diff switches modes),
--- then from the differential's type, as BeamNG's Powertrain app does
+-- open / lsd / locked, from the current mode first (a lockable diff switches modes), as
+-- BeamNG's differential.lua runs it:
+--  * locked and dually (duals ride on a locked diff) -> locked
+--  * open and torqueVectoring (both use the open diff's torque split) -> open
+--  * lsd and viscous -> lsd
+--  * activeLock: a clutch the car's electronics clamp, activeLockCoef 0..1 -> shown live
+-- A split shaft (transfer case) is locked or viscous by its splitType.
+local ACTIVE_LOCKED, ACTIVE_OPEN = 0.95, 0.05
 local function diffState(d)
   local mode = type(d.mode) == "string" and d.mode:lower() or ""
-  if mode == "locked" then return "locked" end
-  if mode == "open" then return "open" end
+  if mode == "locked" or mode == "dually" then return "locked" end
+  if mode == "open" or mode == "torquevectoring" then return "open" end
   if mode == "lsd" or mode == "viscous" then return "lsd" end
+  if mode == "activelock" then
+    local c = tonumber(d.activeLockCoef) or 0
+    if c >= ACTIVE_LOCKED then return "locked" end
+    return c > ACTIVE_OPEN and "lsd" or "open"
+  end
+  if type(d.splitType) == "string" then
+    return d.splitType:lower() == "locked" and "locked" or "lsd"
+  end
   if type(d.visualType) ~= "string" and type(d.diffType) ~= "string" and devType(d) == "differential" then
     return "open"   -- no type given: BeamNG's default differential is open
   end
@@ -365,8 +379,10 @@ local function diffTypeName(d)
   return (diffKind(d):lower():gsub("^differential_?", ""))
 end
 
+-- no drive through it: switched off (mode disconnected, which BeamNG also forces on a
+-- physically disconnected shaft) or broken (shaft.lua and splitShaft.lua pass no torque)
 local function isDisconnected(d)
-  return type(d.mode) == "string" and d.mode:lower() == "disconnected"
+  return d.isBroken == true or (type(d.mode) == "string" and d.mode:lower() == "disconnected")
 end
 
 -- A shaft that can really be disconnected (part-time 4WD, locking hubs, axle disconnects).
@@ -384,7 +400,8 @@ local function modeListHasDisconnect(list)
 end
 
 local function canDisconnect(dev)
-  if isDisconnected(dev) then return true end
+  -- switched off right now (a broken shaft loses drive but isn't a switchable shaft)
+  if type(dev.mode) == "string" and dev.mode:lower() == "disconnected" then return true end
   if dev.canDisconnect == true or dev.canDisconnect == 1 then return true end
   local jd = type(dev.jbeamData) == "table" and dev.jbeamData or {}
   if jd.canDisconnect == true or jd.canDisconnect == 1 then return true end
@@ -769,6 +786,9 @@ local function buildPayload(fwd, right, speed)
       if open then dc = true end
       cps[#cps + 1] = { t = c.kind, o = open and 1 or nil }
     end
+    -- a broken shaft anywhere on the link, or a broken part here, passes no drive either
+    for _, d in ipairs(n.path or {}) do if d.isBroken == true then dc = true end end
+    if n.dev and n.dev.isBroken == true then dc = true end
     live[idx] = (n.p == 0) or (live[n.p] and not dc) or false
     if n.k == "wheel" and live[idx] then liveDriven[n.w] = true end
     graphOut[idx] = {
@@ -813,7 +833,10 @@ local function buildPayload(fwd, right, speed)
   local brakeIn = clamp(tonumber(ev.brake) or 0, 0, 1)
   local parkIn  = clamp(tonumber(ev.parkingbrake) or 0, 0, 1)
   local brakeOn = brakeIn > 0
-  local absOn = hasABS and brakeOn and (truthy(ev.abs) or acting(dd.brake, "isActingAsABS"))
+  -- electrics.abs is the dashboard light's blink; absActive is the real state. The per-wheel
+  -- check below also catches the driving-dynamics ABS, which sets neither (its isActingAsABS
+  -- only reflects the last wheel it processed).
+  local absOn = hasABS and brakeOn and truthy(ev.absActive)
   local tcsOn = hasTCS and (truthy(ev.tcsActive) or acting(dd.tc, "isActing"))
   local escOn = hasESC and (truthy(ev.escActive) or acting(dd.yc, "isActing"))
   -- power cut by an assist: traction control, or ESC working through the engine
@@ -835,7 +858,7 @@ local function buildPayload(fwd, right, speed)
     if math.abs(drive) > 1 then everDriven[i] = true end
     local driven
     if hasGraph then driven = liveDriven[i] or false
-    else driven = (drivetrain and drivetrain.driven[i]) or everDriven[i] end
+    else driven = (drivetrain and drivetrain.driven[i]) or everDriven[i] or w.isPropulsed == true end
 
     -- Slow-moving load, used to express drive torque as a share of what the tyre can take.
     S.fzAvg = S.fzAvg + (math.max(fz, 0) - S.fzAvg) * clamp(LOAD_SMOOTH_HZ / SEND_HZ, 0, 1)
@@ -897,17 +920,28 @@ local function buildPayload(fwd, right, speed)
       rearSteerSum, rearSteerN = rearSteerSum + steer, rearSteerN + 1
     end
 
-    -- assist acting on this wheel right now: 1 = ABS, 3 = ESC braking it
+    -- assist acting on this wheel right now: 1 = ABS, 3 = ESC braking it. Both read BeamNG's
+    -- own brake numbers for the wheel (wheels.lua): desiredMainBrakingTorque is the pedal's
+    -- share after brake split and ABS; desiredBrakingTorque is what the wheel is finally asked
+    -- for, which ESC (classic or driving-dynamics) raises above the pedal's and handbrake's.
     local iv = nil
+    local usage = w.defaultBrakeInputUsageCoef or 1
+    local mainReq = math.abs(w.desiredMainBrakingTorque or 0)
     if escBraking then
-      -- brake asked for (or applied) beyond the pedal and handbrake's share of this wheel
-      local expected = brakeIn * brakeMax + parkIn * (w.parkingTorque or 0)
-      local request = math.max(math.abs(w.desiredBrakingTorque or 0), math.abs(w.brakingTorque or 0))
-      if request > expected * 1.15 + ESC_BRAKE_MARGIN then iv = 3 end
+      local parkReq = (w.parkingTorque or 0) * parkIn * usage
+      local added = math.abs(w.desiredBrakingTorque or 0) - math.max(mainReq, parkReq)
+      if added > math.max(ESC_BRAKE_MARGIN, brakeMax * 0.03) then iv = 3 end
     end
-    if not iv and hasABS and brakeOn and (w.absActive == true or w.absActive == 1) then
-      iv = 1
-      absOn = true
+    if not iv and hasABS and brakeOn then
+      -- the pedal's share without ABS, worked out the way wheels.lua does it
+      local bIn = (tonumber(ev[w.brakeElectricsName or "brake"]) or brakeIn) * usage
+      local split = w.brakeInputSplit or 1
+      local nonABS = brakeMax * (math.min(bIn, split) + math.max(bIn - split, 0) * (w.brakeSplitCoef or 1))
+      local reduced = w.desiredMainBrakingTorque ~= nil and nonABS > ESC_BRAKE_MARGIN and mainReq < nonABS * 0.9
+      if w.absActive == true or w.absActive == 1 or reduced then
+        iv = 1
+        absOn = true
+      end
     end
 
     local entry = {
@@ -925,6 +959,7 @@ local function buildPayload(fwd, right, speed)
       t  = round(torque, 3),       -- -1 full brake .. +1 full drive
       dr = round(driveline, 3),    -- driveline only: + drive, - engine braking / regen
       b  = broken and 1 or 0,
+      fl = (not broken and (w.isTireDeflated or w.isPunctured)) and 1 or nil,   -- flat or punctured tyre
       sl = round(slip, 2),         -- raw contact slip (m/s), for calibration
       fz = math.floor(fz),         -- wheel load (N), for calibration
       iv = iv,                     -- assist on this wheel: 1 = ABS, 3 = ESC
@@ -1335,8 +1370,9 @@ local function dumpDrivetrain()
       for _, c in pairs(type(d.children) == "table" and d.children or {}) do
         if type(c) == "table" then kids[#kids + 1] = tostring(c.name) end
       end
-      out(string.format("%s  type=%s visualType=%s diffType=%s mode=%s canDisconnect=%s wheel=%s -> [%s]",
-        tostring(name), tostring(d.type), tostring(d.visualType), tostring(d.diffType), tostring(d.mode), tostring(canDisconnect(d)),
+      out(string.format("%s  type=%s visualType=%s diffType=%s mode=%s splitType=%s activeLockCoef=%s broken=%s canDisconnect=%s wheel=%s -> [%s]",
+        tostring(name), tostring(d.type), tostring(d.visualType), tostring(d.diffType), tostring(d.mode),
+        tostring(d.splitType), tostring(d.activeLockCoef), tostring(d.isBroken), tostring(canDisconnect(d)),
         tostring(d.connectedWheel), table.concat(kids, ", ")))
     end
   end
