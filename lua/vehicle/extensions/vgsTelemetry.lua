@@ -39,10 +39,11 @@ local STANDSTILL_SPEED = 0.5   -- m/s; a held brake at standstill isn't counted 
 -- Direction of travel (arc inside the steering arc): which way the front axle is actually
 -- moving, against where the car points, on the same scale as the steering arc. It can run on
 -- past a quarter, all the way round, for big slides and spins.
-local TRAVEL_SMOOTH_HZ = 8     -- low-pass for the direction of travel and the yaw rate it uses
-local TRAVEL_FADE_LO   = 1.0   -- m/s; below this the direction is too noisy to show
-local TRAVEL_FADE_HI   = 2.5   -- m/s; fully shown from here
-local TRAVEL_MAX       = 4     -- longest arc, in quarter turns (4 = the whole circle)
+local TRAVEL_SMOOTH_HZ = 6     -- low-pass for the direction of travel
+local YAW_SMOOTH_HZ    = 12    -- light low-pass for the yaw rate it uses
+local TRAVEL_FADE_LO   = 1.5   -- m/s; below this the direction is too noisy to show
+local TRAVEL_FADE_HI   = 4.0   -- m/s; fully shown from here
+local TRAVEL_MAX       = 4     -- furthest the marker goes, in quarter turns (4 = the whole circle)
 local LOCK_DEFAULT     = 0.6   -- rad; road-wheel angle at full lock until it's been measured
 -- Understeer / oversteer balance (the arc's colour): rear slip angle minus front slip angle,
 -- in the direction the car is rotating. + = rear sliding more (oversteer), - = front (understeer).
@@ -75,6 +76,8 @@ local lastFwd    = nil
 local assistControllers = nil   -- the driving-dynamics assist parts, when the vehicle has them
 local lastRight  = nil
 local yawRate    = 0     -- rad/s, + = turning left
+local yawSign    = 1     -- sign that makes the physics yaw rate read + = left (checked as we go)
+local yawCheck   = 0     -- running agreement between the physics yaw rate and the heading's
 local travelAng  = 0     -- rad, + = front axle moving to the left of where the car points; kept
                          -- continuous past +-180 deg (up to +-270) so a big slide doesn't flip sides
 local rearTravel = 0     -- rad, the same at the rear axle
@@ -684,6 +687,7 @@ local function resetState()
   layoutWait, sendTimer = 0, 0
   lastVel, latAccel, lonAccel = nil, 0, 0
   lastFwd, lastRight, yawRate, travelAng, lockAngle, frontAxle = nil, nil, 0, 0, LOCK_DEFAULT, nil
+  yawCheck = 0
   rearTravel, balance, rearAxle = 0, 0, nil
 end
 
@@ -1072,13 +1076,28 @@ local function updateGFX(dt)
   end
   lastVel = vec3(vel)
 
-  -- Yaw rate from the change in heading (+ = turning left), and from it the direction the
-  -- front axle is moving: the body's velocity plus the rotation's share at the axle.
-  if lastFwd then
-    local d = math.atan2(-fwd:dot(lastRight), fwd:dot(lastFwd)) / dt
-    yawRate = yawRate + (d - yawRate) * clamp(dt * TRAVEL_SMOOTH_HZ, 0, 1)
-  end
+  -- Yaw rate (+ = turning left), and from it the direction the front axle is moving: the
+  -- body's velocity plus the rotation's share at the axle. The yaw rate comes from the physics
+  -- (the same value BeamNG's own ESC uses), which is far steadier than the change in heading
+  -- from frame to frame; that change still serves as a check on its sign, and as the fallback.
+  local headYaw = nil
+  if lastFwd then headYaw = math.atan2(-fwd:dot(lastRight), fwd:dot(lastFwd)) / dt end
   lastFwd, lastRight = vec3(fwd), vec3(right)
+  local physYaw = nil
+  if obj.getYawAngularVelocity then
+    local okY, y = pcall(obj.getYawAngularVelocity, obj)
+    if okY and type(y) == "number" and y == y then physYaw = -y end
+  end
+  local rawYaw = headYaw
+  if physYaw then
+    if headYaw then
+      -- if the two keep disagreeing in sign while the car is clearly rotating, flip
+      yawCheck = yawCheck + (yawSign * physYaw * headYaw - yawCheck) * clamp(dt * 0.5, 0, 1)
+      if yawCheck < -0.01 then yawSign, yawCheck = -yawSign, -yawCheck end
+    end
+    rawYaw = yawSign * physYaw
+  end
+  if rawYaw then yawRate = yawRate + (rawYaw - yawRate) * clamp(dt * YAW_SMOOTH_HZ, 0, 1) end
   -- direction each axle is moving (+ = left of where the car points), all the way round
   local k = clamp(dt * TRAVEL_SMOOTH_HZ, 0, 1)
   local function axleTravel(axle, current)

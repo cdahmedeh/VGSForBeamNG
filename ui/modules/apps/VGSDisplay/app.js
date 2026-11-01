@@ -705,11 +705,11 @@
   // Driver inputs on the rim of the circle, a quarter turn each at full input:
   // steering from 12 o'clock towards 9 (left) or 3 (right); brake from 6 towards 9;
   // throttle from 6 towards 3. Nothing is drawn at rest.
-  // Inside the steering arc, a thinner arc shows which way the front axle is actually travelling,
-  // on the same scale (a quarter turn = full lock), running on round the circle for big slides.
-  // When the front tyres grip it lines up with the steering. Its colour shows the balance: light
-  // blue when neutral, shading to orange as the front slides more than the rear (understeer) or
-  // magenta as the rear slides more (oversteer). Its width stays the same throughout.
+  // Direction of travel: a small marker just inside the steering arc, on the same scale (a quarter
+  // turn = full lock), where the front axle is actually going. Steering at the marker points the
+  // front wheels exactly where they're travelling. It goes on round the circle in big slides.
+  // The marker's colour shows the balance: light blue when neutral, orange as the front slides
+  // more than the rear (understeer), magenta as the rear slides more (oversteer).
   var TRAVEL_COLOUR = { neutral: [150, 210, 245], under: [255, 150, 45], over: [235, 70, 205] };
   function travelColour(bal) {
     var b = clamp(+bal || 0, -1, 1), to = b < 0 ? TRAVEL_COLOUR.under : TRAVEL_COLOUR.over, k = Math.abs(b);
@@ -730,8 +730,7 @@
     var pa = a.match(/[\d.]+/g).map(Number), pb = b.match(/[\d.]+/g).map(Number);
     return 'rgb(' + [0, 1, 2].map(function (i) { return Math.round(pa[i] + (pb[i] - pa[i]) * k); }).join(', ') + ')';
   }
-  var TRAVEL_GAP = 1.5;   // px between the steering arc and the travel arc
-  function travelWidth(rPx) { return clamp(rPx * 0.032, 2, 4.5); }
+  function markerSize(rPx) { return clamp(rPx * 0.085, 7, 14); }          // marker height (px)
   function drawInputArcs(ctx, cx, cy, rPx, inp) {
     if (!inp) return;
     var lw = clamp(rPx * 0.05, 3, 7), r = rPx - lw / 2, Q = Math.PI / 2, TOP = -Q, BOTTOM = Q;
@@ -742,20 +741,9 @@
       ctx.strokeStyle = colour; ctx.stroke();
     }
     ctx.save();
-    // direction of travel: just inside the steering arc, faded in once the car is moving
-    if (inp.tv !== undefined && inp.tv !== null) {
-      var tv = clamp(+inp.tv || 0, -4, 4), bal = clamp(+inp.bal || 0, -1, 1);
-      var tw = travelWidth(rPx);
-      var tr = rPx - lw - TRAVEL_GAP - tw / 2;
-      ctx.globalAlpha = clamp(inp.ta === undefined ? 1 : +inp.ta, 0, 1);
-      ctx.lineWidth = tw; ctx.lineCap = 'butt'; ctx.strokeStyle = travelColour(bal);
-      if (Math.abs(tv) > 0.004) {
-        ctx.beginPath();
-        if (tv > 0) ctx.arc(cx, cy, tr, TOP - tv * Q, TOP); else ctx.arc(cx, cy, tr, TOP, TOP - tv * Q);
-        ctx.stroke();
-      }
-      ctx.globalAlpha = 1;
-    }
+    // direction of travel (see above), drawn on top at the end
+    var hasTravel = inp.tv !== undefined && inp.tv !== null;
+    var tv = hasTravel ? clamp(+inp.tv || 0, -4, 4) : 0, alpha = clamp(inp.ta === undefined ? 1 : +inp.ta, 0, 1);
     ctx.lineWidth = lw; ctx.lineCap = 'butt';
     if (steer > 0) arc(INPUT.steer, TOP - steer * Q, TOP);        // left: counter-clockwise from the top
     else if (steer < 0) arc(INPUT.steer, TOP, TOP - steer * Q);   // right: clockwise from the top
@@ -768,6 +756,21 @@
     r = rPx - lw / 4; ctx.lineWidth = lw / 2;
     arc(INPUT.handbrake, BOTTOM, BOTTOM + hb * Q);
     arc(INPUT.clutch, BOTTOM - clu * Q, BOTTOM);
+    // the marker: a small wedge pointing out at the steering arc, where the front is going
+    if (hasTravel && alpha > 0) {
+      var ang = TOP - tv * Q, mh = markerSize(rPx), tip = rPx - lw - 0.5, base = tip - mh, half = mh * 0.5;
+      var ux = Math.cos(ang), uy = Math.sin(ang), px = -uy, py = ux;
+      ctx.globalAlpha = alpha;
+      ctx.beginPath();
+      ctx.moveTo(cx + ux * tip, cy + uy * tip);
+      ctx.lineTo(cx + ux * base + px * half, cy + uy * base + py * half);
+      ctx.lineTo(cx + ux * base - px * half, cy + uy * base - py * half);
+      ctx.closePath();
+      ctx.fillStyle = travelColour(inp.bal);
+      ctx.strokeStyle = 'rgba(10, 12, 16, 0.7)'; ctx.lineWidth = 1; ctx.lineJoin = 'round';
+      ctx.fill(); ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
     ctx.restore();
   }
 
@@ -952,7 +955,7 @@
     // clear of the input arcs on its rim.
     var rPx = Math.min(W, H) / 2 - 2, ccx = W / 2, ccy = H / 2;
     // vehicles stay inside the steering arc and the travel arc just inside it
-    var inner = rPx - clamp(rPx * 0.05, 3, 7) - TRAVEL_GAP - travelWidth(rPx) - 2;
+    var inner = rPx - clamp(rPx * 0.05, 3, 7) - markerSize(rPx) - 2;
     ctx.beginPath(); ctx.arc(ccx, ccy, rPx, 0, Math.PI * 2);
     ctx.fillStyle = STYLE.panelFill; ctx.fill();
     ctx.strokeStyle = STYLE.panelStroke; ctx.lineWidth = 1.5; ctx.stroke();
