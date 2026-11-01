@@ -33,7 +33,12 @@ local PINK_SEVERITY    = 0.2   -- how far towards deep red the colour gets by th
 local RATIO_MIN_SPEED  = 5.0   -- m/s; slip ratio is taken against at least this (avoids /0 at a crawl)
 local MIN_LOAD         = 150   -- N; below this a wheel is treated as off the ground
 local GRIP_SMOOTHING   = 0.4   -- 0..1, share of the gap closed every 1/30 s; higher = snappier, lower = steadier
-local ACCEL_SMOOTH_HZ  = 6     -- low-pass for measured acceleration (grip estimate and G-force dot)
+local ACCEL_SMOOTH_HZ  = 6     -- low-pass for measured acceleration (grip estimate)
+-- G-force dot: the acceleration is the change in velocity over a short window rather than from
+-- one frame to the next, which averages out the body's vibration (frame-to-frame it shows up as
+-- jitter, worst on stiff or flexy vehicles), then it's smoothed a little more.
+local GF_WINDOW        = 0.12  -- s of velocity history the acceleration is measured across
+local GF_SMOOTH_HZ     = 12    -- low-pass on top (higher = snappier, lower = steadier)
 local LOAD_SMOOTH_HZ   = 0.5   -- low-pass for the wheel load used to scale drive torque
 local STANDSTILL_SPEED = 0.5   -- m/s; a held brake at standstill isn't counted as tyre force
 -- Direction of travel (arc inside the steering arc): which way the front axle is actually
@@ -72,6 +77,9 @@ local coupled    = {}    -- [objId] = number of couplers attached to that vehicl
 local lastVel    = nil
 local latAccel   = 0
 local lonAccel   = 0
+local velHist    = {}    -- recent { t, v } samples for the G-force dot
+local histTime   = 0     -- s, running clock for velHist
+local gLat, gLon = 0, 0  -- m/s^2, smoothed acceleration for the G-force dot
 local lastFwd    = nil
 local assistControllers = nil   -- the driving-dynamics assist parts, when the vehicle has them
 local lastRight  = nil
@@ -686,6 +694,7 @@ local function resetState()
   layout, state = nil, {}
   layoutWait, sendTimer = 0, 0
   lastVel, latAccel, lonAccel = nil, 0, 0
+  velHist, histTime, gLat, gLon = {}, 0, 0, 0
   lastFwd, lastRight, yawRate, travelAng, lockAngle, frontAxle = nil, nil, 0, 0, LOCK_DEFAULT, nil
   yawCheck = 0
   rearTravel, balance, rearAxle = 0, 0, nil
@@ -963,7 +972,7 @@ local function buildPayload(fwd, right, speed)
     } or nil,
     -- G-force as felt by the driver (opposite to the acceleration), in g:
     -- x + = pushed right (turning left), y + = pushed forward (braking)
-    gf = { x = round(-latAccel / G, 3), y = round(-lonAccel / G, 3) },
+    gf = { x = round(-gLat / G, 3), y = round(-gLon / G, 3) },
     src = sources,
     dt = hasGraph and graphOut or nil,   -- simplified drive graph (see buildDriveGraph)
 
@@ -1075,6 +1084,20 @@ local function updateGFX(dt)
     lonAccel = lonAccel + (dv:dot(fwd) / dt - lonAccel) * k
   end
   lastVel = vec3(vel)
+
+  -- G-force dot: velocity change across the last GF_WINDOW seconds (the oldest sample kept is
+  -- the last one at or before the start of the window), projected on the current axes
+  histTime = histTime + dt
+  velHist[#velHist + 1] = { t = histTime, v = vec3(vel) }
+  while #velHist > 2 and velHist[2].t <= histTime - GF_WINDOW do table.remove(velHist, 1) end
+  local old = velHist[1]
+  local span = histTime - old.t
+  if span > 1e-3 then
+    local a = (vel - old.v) * (1 / span)
+    local kg = clamp(dt * GF_SMOOTH_HZ, 0, 1)
+    gLat = gLat + (a:dot(right) - gLat) * kg
+    gLon = gLon + (a:dot(fwd) - gLon) * kg
+  end
 
   -- Yaw rate (+ = turning left), and from it the direction the front axle is moving: the
   -- body's velocity plus the rotation's share at the axle. The yaw rate comes from the physics
