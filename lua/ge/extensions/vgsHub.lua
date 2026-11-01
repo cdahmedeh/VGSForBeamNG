@@ -160,6 +160,7 @@ end
 --   extensions.vgsHub.watchAssists(true)  every assist value change while you drive (false stops)
 --   extensions.vgsHub.dumpWheels()        wheel positions, sizes and dual detection
 --   extensions.vgsHub.dumpDrivetrain()    the powertrain devices and what the VGS draws
+--   extensions.vgsHub.dumpTravel(10)      what's behind the direction marker, 4x a second for 10 s
 local function toPlayerVehicle(call)
   local veh = be:getPlayerVehicle(0)
   if not veh then log('W', 'vgsHub', 'no player vehicle'); return end
@@ -169,6 +170,7 @@ function M.dumpAssists() toPlayerVehicle('dumpAssists()') end
 function M.watchAssists(on) toPlayerVehicle('watchAssists(' .. tostring(on ~= false) .. ')') end
 function M.dumpWheels() toPlayerVehicle('dumpWheels()') end
 function M.dumpDrivetrain() toPlayerVehicle('dumpDrivetrain()') end
+function M.dumpTravel(seconds) toPlayerVehicle('dumpTravel(' .. (tonumber(seconds) or 10) .. ')') end
 
 -- Game-engine coupler hooks (objId1 and objId2 are the two vehicles involved).
 function M.onCouplerAttached(objId1, objId2) addLink(objId1, objId2) end

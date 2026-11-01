@@ -41,14 +41,22 @@ local GF_WINDOW        = 0.12  -- s of velocity history the acceleration is meas
 local GF_SMOOTH_HZ     = 12    -- low-pass on top (higher = snappier, lower = steadier)
 local LOAD_SMOOTH_HZ   = 0.5   -- low-pass for the wheel load used to scale drive torque
 local STANDSTILL_SPEED = 0.5   -- m/s; a held brake at standstill isn't counted as tyre force
--- Direction of travel (arc inside the steering arc): which way the front axle is actually
--- moving, against where the car points, on the same scale as the steering arc. It can run on
--- past a quarter, all the way round, for big slides and spins.
-local TRAVEL_SMOOTH_HZ = 6     -- low-pass for the direction of travel
+-- Direction marker, on the same scale as the steering arc. It's the front axle's direction of
+-- travel, measured against the rear axle's while the rear tyres grip: how much the car is
+-- actually turning, as a steering angle. (Against the body it would sit near the middle, or even
+-- on the outside, in fast corners: the rear tyres' few degrees of slip let the whole car crab
+-- slightly nose-in.) As the rear slides past its grip it changes over to the front axle's
+-- direction against the body, the countersteer target in a slide. It can run on past a quarter,
+-- all the way round, for big slides and spins.
+local TRAVEL_SMOOTH_HZ = 15    -- low-pass for the direction of travel (on top of the window)
+local TRAVEL_WINDOW    = 0.06  -- s; each axle's movement is measured across this long a stretch
 local YAW_SMOOTH_HZ    = 12    -- light low-pass for the yaw rate it uses
-local TRAVEL_FADE_LO   = 1.5   -- m/s; below this the direction is too noisy to show
-local TRAVEL_FADE_HI   = 4.0   -- m/s; fully shown from here
+local TRAVEL_FADE_LO   = 0.5   -- m/s; below this the direction is too noisy to show (a car settling or
+                               -- rocking at a stop would swing it about)
+local TRAVEL_FADE_HI   = 1.5   -- m/s; fully shown from here (wobble under ~0.3 deg)
 local TRAVEL_MAX       = 4     -- furthest the marker goes, in quarter turns (4 = the whole circle)
+local REAR_GRIP_SLIP   = 0.14  -- rad (~8 deg) of rear slip up to which the rear counts as gripping
+local REAR_SLIDE_SLIP  = 0.35  -- rad (~20 deg) from which it's fully sliding (marker = front vs body)
 local LOCK_DEFAULT     = 0.6   -- rad; road-wheel angle at full lock until it's been measured
 -- Understeer / oversteer balance (the arc's colour): rear slip angle minus front slip angle,
 -- in the direction the car is rotating. + = rear sliding more (oversteer), - = front (understeer).
@@ -91,6 +99,12 @@ local travelAng  = 0     -- rad, + = front axle moving to the left of where the 
 local rearTravel = 0     -- rad, the same at the rear axle
 local balance    = 0     -- -1 full understeer .. +1 full oversteer (smoothed)
 local rearAxle   = nil   -- { x, y, cut } centre of the rear axle group; wheels behind cut belong to it
+-- each axle also keeps its hub nodes (nodes) and their recent positions (hist), so its direction
+-- of travel comes straight from how the hubs actually move
+local travelDiag = {}    -- latest values behind the direction of travel, for dumpTravel
+local travelWatch = 0    -- s left to print them for
+local travelWatchNext = 0
+local lastFrontSteer = nil   -- rad, average road-wheel angle of the front axle
 local lockAngle  = LOCK_DEFAULT   -- rad; road-wheel angle at full steering lock (learned)
 local frontAxle  = nil   -- { x, y } centre of the frontmost axle (metres, vehicle frame)
 
@@ -630,6 +644,7 @@ local function captureLayout(fwd, right, steeringCentred)
       width = width,
       -- removes static toe so straight-ahead reads as 0
       steerBase = steeringCentred and yaw or 0,
+      n1 = w.node1, n2 = w.node2,   -- hub nodes, for each axle's direction of travel
     }
     state[i] = { grip = 0, sliding = false, fzAvg = math.max(w.downForceRaw or w.downForce or 0, 0) }
   end)
@@ -642,17 +657,25 @@ local function captureLayout(fwd, right, steeringCentred)
   for _, L in pairs(layout) do maxY = math.max(maxY, L.y); minY = math.min(minY, L.y) end
   if maxY > -math.huge then
     local sx, sy, n = 0, 0, 0
+    local nodes = {}
     for _, L in pairs(layout) do
-      if L.y > maxY - 0.3 then sx, sy, n = sx + L.x, sy + L.y, n + 1 end
+      if L.y > maxY - 0.3 then
+        sx, sy, n = sx + L.x, sy + L.y, n + 1
+        nodes[#nodes + 1] = L.n1; nodes[#nodes + 1] = L.n2
+      end
     end
-    frontAxle = { x = sx / n, y = sy / n }
+    frontAxle = { x = sx / n, y = sy / n, nodes = nodes, hist = {} }
     if maxY - minY > 0.5 then
       local cut = (maxY + minY) / 2
       sx, sy, n = 0, 0, 0
+      local rnodes = {}
       for _, L in pairs(layout) do
-        if L.y < cut then sx, sy, n = sx + L.x, sy + L.y, n + 1 end
+        if L.y < cut then
+          sx, sy, n = sx + L.x, sy + L.y, n + 1
+          rnodes[#rnodes + 1] = L.n1; rnodes[#rnodes + 1] = L.n2
+        end
       end
-      if n > 0 then rearAxle = { x = sx / n, y = sy / n, cut = cut } end
+      if n > 0 then rearAxle = { x = sx / n, y = sy / n, cut = cut, nodes = rnodes, hist = {} } end
     end
   end
 
@@ -918,6 +941,7 @@ local function buildPayload(fwd, right, speed)
   -- Direction of travel, on the steering arc's scale: the front axle's travel angle as a share
   -- of the road-wheel angle at full lock. That scale is learned from how far the front wheels
   -- actually turn for a given steering input.
+  lastFrontSteer = frontSteerN > 0 and frontSteerSum / frontSteerN or nil
   if frontSteerN > 0 and math.abs(steerIn) > 0.15 then
     local front = math.abs(frontSteerSum / frontSteerN)
     if front > 0.02 then
@@ -937,9 +961,9 @@ local function buildPayload(fwd, right, speed)
     return math.atan2(math.sin(d), math.abs(math.cos(d)))
   end
   local target = 0
+  local slipR = rearAxle and slipAngle(rearSteerN > 0 and rearSteerSum / rearSteerN or 0, rearTravel) or nil
   if frontAxle and rearAxle and frontSteerN > 0 then
     local slipF = slipAngle(frontSteerSum / frontSteerN, travelAng)
-    local slipR = slipAngle(rearSteerN > 0 and rearSteerSum / rearSteerN or 0, rearTravel)
     local turn = yawRate >= 0 and 1 or -1                  -- + = rotating left
     local diff = (slipR - slipF) * turn                    -- + = rear slipping more
     local mag = clamp((math.abs(diff) - BAL_DEADBAND) / (BAL_FULL - BAL_DEADBAND), 0, 1)
@@ -958,7 +982,15 @@ local function buildPayload(fwd, right, speed)
   local speed2d = math.sqrt(vel:dot(fwd) ^ 2 + vel:dot(right) ^ 2)
   local reversing = (ev.gearIndex or 0) < 0 and vel:dot(fwd) < 0
   if speed2d > TRAVEL_FADE_LO and frontAxle and not reversing then
-    inputs.tv = round(clamp(travelAng / lockAngle, -TRAVEL_MAX, TRAVEL_MAX), 3)   -- + = left of the nose
+    -- the front axle's direction against the rear axle's path (adding the rear slip angle) while
+    -- the rear grips, easing over to the front's direction against the body as the rear slides
+    local shown = travelAng
+    if slipR then
+      local k = clamp((math.abs(slipR) - REAR_GRIP_SLIP) / (REAR_SLIDE_SLIP - REAR_GRIP_SLIP), 0, 1)
+      shown = travelAng + slipR * (1 - k * k * (3 - 2 * k))
+    end
+    travelDiag.shown = shown
+    inputs.tv = round(clamp(shown / lockAngle, -TRAVEL_MAX, TRAVEL_MAX), 3)   -- + = left of the nose
     inputs.ta = round(clamp((speed2d - TRAVEL_FADE_LO) / (TRAVEL_FADE_HI - TRAVEL_FADE_LO), 0, 1), 2)
     inputs.bal = round(balance, 3)   -- -1 understeer .. 0 neutral .. +1 oversteer
   end
@@ -1038,6 +1070,11 @@ local function dumpAssists()
       end
     end
   end
+end
+-- Prints what's behind the direction-of-travel marker four times a second, for a few seconds
+-- (default 10), so you can start it and then drive a corner.
+local function dumpTravel(seconds)
+  travelWatch, travelWatchNext = tonumber(seconds) or 10, 0
 end
 local function watchAssists(on)
   watchingAssists = on ~= false
@@ -1121,12 +1158,45 @@ local function updateGFX(dt)
     rawYaw = yawSign * physYaw
   end
   if rawYaw then yawRate = yawRate + (rawYaw - yawRate) * clamp(dt * YAW_SMOOTH_HZ, 0, 1) end
-  -- direction each axle is moving (+ = left of where the car points), all the way round
+  -- Direction each axle is moving (+ = left of where the car points), all the way round. It's
+  -- measured straight from the axle's hub nodes: how far they've moved over the last
+  -- TRAVEL_WINDOW seconds, against the way the car pointed over that time. Measuring across a
+  -- window rather than frame to frame averages out the hubs' vibration. If the nodes can't be
+  -- read, it falls back to the body's velocity plus the yaw rate's share at the axle.
   local k = clamp(dt * TRAVEL_SMOOTH_HZ, 0, 1)
-  local function axleTravel(axle, current)
-    local vx = vel:dot(right) - yawRate * axle.y          -- sideways, + = right
-    local vy = vel:dot(fwd) + yawRate * axle.x            -- forwards
-    if vx * vx + vy * vy < 0.25 then return current end   -- barely moving: keep the last value
+  local origin = obj:getPosition()
+  local function hubMotion(axle)
+    local nodes = axle.nodes
+    if not nodes or #nodes == 0 then return nil end
+    local okP, p = pcall(function()
+      local sx, sy, sz = 0, 0, 0
+      for _, cid in ipairs(nodes) do
+        local q = obj:getNodePosition(cid)
+        sx, sy, sz = sx + q.x, sy + q.y, sz + q.z
+      end
+      return vec3(origin.x + sx / #nodes, origin.y + sy / #nodes, origin.z + sz / #nodes)
+    end)
+    if not okP or not p then return nil end
+    local h = axle.hist
+    h[#h + 1] = { t = histTime, p = p, fwd = vec3(fwd), right = vec3(right) }
+    while #h > 2 and h[2].t <= histTime - TRAVEL_WINDOW do table.remove(h, 1) end
+    local o = h[1]
+    local span = histTime - o.t
+    if span < TRAVEL_WINDOW * 0.3 then return nil end
+    local v = (p - o.p) * (1 / span)
+    local f, r = fwd + o.fwd, right + o.right            -- the car's heading across the window
+    local fl, rl = f:length(), r:length()
+    if fl < 1e-6 or rl < 1e-6 then return nil end
+    return v:dot(r) / rl, v:dot(f) / fl
+  end
+  local function axleTravel(axle, current, tag)
+    local yx = vel:dot(right) - yawRate * axle.y          -- from the yaw rate: sideways, + = right
+    local yy = vel:dot(fwd) + yawRate * axle.x            -- forwards
+    local vx, vy = hubMotion(axle)
+    travelDiag[tag .. "Yaw"] = math.atan2(-yx, yy)
+    travelDiag[tag .. "Hub"] = vx and math.atan2(-vx, vy) or nil
+    if not vx then vx, vy = yx, yy end
+    if vx * vx + vy * vy < 0.09 then return current end   -- barely moving: keep the last value
     -- step from the current value the short way round, so the angle stays continuous past
     -- +-180 deg instead of jumping from one side to the other
     local a = current + wrapAngle(math.atan2(-vx, vy) - current) * k
@@ -1134,8 +1204,25 @@ local function updateGFX(dt)
     if a > 1.5 * math.pi then a = a - 2 * math.pi elseif a < -1.5 * math.pi then a = a + 2 * math.pi end
     return a
   end
-  if frontAxle then travelAng = axleTravel(frontAxle, travelAng) end
-  if rearAxle then rearTravel = axleTravel(rearAxle, rearTravel) end
+  if frontAxle then travelAng = axleTravel(frontAxle, travelAng, "front") end
+  if rearAxle then rearTravel = axleTravel(rearAxle, rearTravel, "rear") end
+  travelDiag.physYaw, travelDiag.headYaw = physYaw, headYaw
+
+  if travelWatch > 0 then
+    travelWatch = travelWatch - dt
+    travelWatchNext = travelWatchNext - dt
+    if travelWatchNext <= 0 then
+      travelWatchNext = 0.25
+      local function deg(a) return a and string.format("%+6.1f", math.deg(a)) or "   n/a" end
+      local function num(a) return a and string.format("%+5.2f", a) or "  n/a" end
+      local line = string.format(
+        "[vgs travel] %4.1f m/s  steer in %+.2f  front wheels %s deg  lock %4.1f deg | shown %s deg | front going %s deg (hubs %s, yaw %s)  rear %s deg | yaw rate: physics %s (sign %+d), heading %s, used %s rad/s",
+        vel:length(), clamp(-(electrics.values.steering_input or 0), -1, 1), deg(lastFrontSteer), math.deg(lockAngle), deg(travelDiag.shown),
+        deg(travelAng), deg(travelDiag.frontHub), deg(travelDiag.frontYaw), deg(rearTravel),
+        num(travelDiag.physYaw), yawSign, num(travelDiag.headYaw), num(yawRate))
+      log('I', 'vgsTelemetry', line); print(line)
+    end
+  end
 
   -- Capture the wheel layout once, ideally with the steering centred.
   if not layout then
@@ -1236,6 +1323,8 @@ M.dumpWheels        = dumpWheels
 M.dumpDrivetrain    = dumpDrivetrain
 M.dumpAssists       = dumpAssists
 M.watchAssists      = watchAssists
+M.dumpTravel        = dumpTravel
+M.travelState      = function() return travelDiag, lockAngle, travelAng, rearTravel, yawRate end   -- for tests
 M.onExtensionLoaded = resetState
 M.onReset           = resetState
 M.updateGFX         = updateGFX
