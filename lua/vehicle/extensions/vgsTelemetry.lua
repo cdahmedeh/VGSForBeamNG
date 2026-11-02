@@ -60,6 +60,19 @@ local TRAVEL_MAX       = 4     -- furthest the marker goes, in quarter turns (4 
 local TUNE = {}
 TUNE.REAR_GRIP_SLIP   = 0.14  -- rad (~8 deg) of rear slip up to which the rear counts as gripping
 TUNE.REAR_SLIDE_SLIP  = 0.35  -- rad (~20 deg) from which it's fully sliding (marker = front vs body)
+-- While the rear grips, the marker's angle (how much the car is turning, as a steering angle)
+-- is wheelbase x yaw rate / forward speed: exact for a rigid car, and read from the physics yaw
+-- rate rather than by differentiating node positions, so it's free of the hubs' vibration. A
+-- running least-squares fit keeps it calibrated to the hub measurement (TURN_CAL_TAU).
+TUNE.TURN_CAL_TAU     = 5     -- s of history the calibration against the hubs uses
+-- The marker is drawn in steering-input units, like the arc. At speed the wheels turn less per
+-- unit of input than the full-lock ratio says: the steering gives under cornering load, and its
+-- geometry isn't linear. So it's converted with the ratio the wheels actually show right now: a
+-- running least-squares slope of front-wheel angle against steering input. Every frame counts in
+-- proportion to how far you're steering, so the hub nodes' noise averages out, and frames on a
+-- straight (input near zero) carry almost no weight: nothing is divided by a near-zero angle.
+TUNE.RATIO_TAU        = 1.0   -- s of history the slope uses
+TUNE.CENTRE_TAU       = 3     -- s: how fast each wheel's straight-ahead reference settles while driving straight
 local LOCK_DEFAULT     = 0.6   -- rad; road-wheel angle at full lock until it's been measured
 -- Understeer / oversteer balance (the arc's colour): rear slip angle minus front slip angle,
 -- in the direction the car is rotating. + = rear sliding more (oversteer), - = front (understeer).
@@ -128,6 +141,8 @@ local travelWatch = 0    -- s left to print them for
 local travelWatchNext = 0
 local lastFrontSteer = nil   -- rad, average road-wheel angle of the front axle
 local lockAngle  = LOCK_DEFAULT   -- rad; road-wheel angle at full steering lock (learned)
+-- running fits: turn calibration against the hubs (kn, kd -> cal), input-to-wheel slope (rn, rd -> ratio)
+local est = { kn = 0, kd = 0, cal = 1, rn = 0, rd = 0, ratio = nil }
 local frontAxle  = nil   -- { x, y } centre of the frontmost axle (metres, vehicle frame)
 
 local function clamp(v, lo, hi)
@@ -758,6 +773,7 @@ local function resetState()
   lastVel, latAccel, lonAccel = nil, 0, 0
   velHist, histTime, gLat, gLon = {}, 0, 0, 0
   lastFwd, lastRight, yawRate, travelAng, lockAngle, frontAxle = nil, nil, 0, 0, LOCK_DEFAULT, nil
+  est = { kn = 0, kd = 0, cal = 1, rn = 0, rd = 0, ratio = nil }
   yawCheck = 0
   rearTravel, balance, rearAxle = 0, 0, nil
 end
@@ -804,6 +820,7 @@ local function buildPayload(fwd, right, speed)
   local hasGraph = #graph > 0
 
   local frontSteerSum, frontSteerN, rearSteerSum, rearSteerN = 0, 0, 0, 0
+  local centreNow = math.abs(tonumber(ev.steering_input) or 0) < 0.004 and math.abs(yawRate) < 0.03 and speed > 3
 
   -- Driver assists, read straight from what the vehicle reports, and only when it reports
   -- having that assist. Two systems are covered:
@@ -948,7 +965,16 @@ local function buildPayload(fwd, right, speed)
     local torque = clamp(driveFrac, 0, 1) - clamp(brakeFrac, 0, 1)
 
     -- Steering ----------------------------------------------------------------
-    local steer = axleYaw(w, fwd, right) - L.steerBase
+    local rawYaw = axleYaw(w, fwd, right)
+    -- straight-ahead reference: captured with the layout, then kept true whenever you're really
+    -- driving straight (no steering input, the car not rotating, moving), so an off-centre
+    -- capture or a knock to the alignment doesn't leave an offset (TUNE.CENTRE_TAU)
+    if centreNow and not broken then
+      local d = rawYaw - L.steerBase
+      if d > math.pi / 2 then d = d - math.pi elseif d < -math.pi / 2 then d = d + math.pi end
+      L.steerBase = L.steerBase + d * clamp(1 / (SEND_HZ * TUNE.CENTRE_TAU), 0, 1)
+    end
+    local steer = rawYaw - L.steerBase
     if steer >  math.pi / 2 then steer = steer - math.pi end
     if steer < -math.pi / 2 then steer = steer + math.pi end
     if frontAxle and L.y > frontAxle.y - 0.3 and not broken then
@@ -1102,15 +1128,54 @@ local function buildPayload(fwd, right, speed)
   local speed2d = math.sqrt(vel:dot(fwd) ^ 2 + vel:dot(right) ^ 2)
   local reversing = (ev.gearIndex or 0) < 0 and vel:dot(fwd) < 0
   if speed2d > TRAVEL_FADE_LO and frontAxle and not reversing then
-    -- the front axle's direction against the rear axle's path (adding the rear slip angle) while
-    -- the rear grips, easing over to the front's direction against the body as the rear slides
-    local shown = travelAng
-    if slipR then
-      local k = clamp((math.abs(slipR) - TUNE.REAR_GRIP_SLIP) / (TUNE.REAR_SLIDE_SLIP - TUNE.REAR_GRIP_SLIP), 0, 1)
-      shown = travelAng + slipR * (1 - k * k * (3 - 2 * k))
+    -- How much the car is turning, as a steering angle: the front axle's direction against the
+    -- rear axle's path while the rear grips (plus any rear steer), easing over to the front's
+    -- direction against the body as the rear slides (the countersteer target).
+    -- (from the rear's true sliding angle, not folded: an axle sliding backwards in a spin is
+    -- fully sliding, even though as a tyre it counts as rolling)
+    local w = 1
+    if rearAxle then
+      local rsNow = (rearSteerN > 0) and rearSteerSum / rearSteerN or 0
+      local slide = math.abs(wrapAngle(rsNow - rearTravel))
+      local k = clamp((slide - TUNE.REAR_GRIP_SLIP) / (TUNE.REAR_SLIDE_SLIP - TUNE.REAR_GRIP_SLIP), 0, 1)
+      w = 1 - k * k * (3 - 2 * k)
     end
-    travelDiag.shown = shown
-    inputs.tv = round(clamp(shown / lockAngle, -TRAVEL_MAX, TRAVEL_MAX), 3)   -- + = left of the nose
+    local vFwd = vel:dot(fwd)
+    local kinHub = rearAxle and (travelAng - rearTravel) or travelAng
+    local kin = kinHub
+    local dtS = 1 / SEND_HZ
+    if rearAxle and vFwd > 3 then
+      -- rigid car: front minus rear direction = atan(wheelbase x yaw rate / forward speed)
+      local kinYaw = math.atan2((frontAxle.y - rearAxle.y) * yawRate, vFwd)
+      if w > 0.99 and math.abs(kinYaw) > 0.003 then   -- calibrate against the hubs while gripping
+        local f = 1 - dtS / TUNE.TURN_CAL_TAU
+        est.kn = est.kn * f + kinHub * kinYaw
+        est.kd = est.kd * f + kinYaw * kinYaw
+      end
+      est.cal = clamp((est.kn + 0.002) / (est.kd + 0.002), 0.6, 1.4)
+      kin = est.cal * kinYaw
+    end
+    local rs = (rearSteerN > 0) and rearSteerSum / rearSteerN or 0
+    if math.abs(rs) < 0.01 then rs = 0 end   -- unsteered rear axle: ignore the nodes' noise
+    local shown = (1 - w) * travelAng + w * (kin + rs)
+    travelDiag.shown, travelDiag.kinHub, travelDiag.kin = shown, kinHub, kin
+
+    -- In steering-input units: where the arc would be if the wheels pointed exactly where the
+    -- car is turning, so the marker meets the arc whenever front and rear tyres slip equally.
+    -- The input-to-wheel ratio is the running least-squares slope (see TUNE.RATIO_TAU).
+    local fs = lastFrontSteer
+    if fs then
+      local f = 1 - dtS / TUNE.RATIO_TAU
+      est.rn = est.rn * f + fs * steerIn
+      est.rd = est.rd * f + steerIn * steerIn
+    end
+    local eps = 2e-4   -- a little of the full-lock ratio, for when there's been no steering
+    est.ratio = clamp((est.rn + lockAngle * eps) / (est.rd + eps), lockAngle * 0.3, lockAngle * 1.5)
+    inputs.tv = round(clamp(shown / est.ratio, -TRAVEL_MAX, TRAVEL_MAX), 4)   -- + = left of the nose
+    -- the steering a 1 g corner needs at this speed (input units), for the app's scale
+    if rearAxle and vFwd > 3 then
+      inputs.sr = round(((frontAxle.y - rearAxle.y) * G / (vFwd * vFwd) + 0.03) / lockAngle, 4)
+    end
     inputs.ta = round(clamp((speed2d - TRAVEL_FADE_LO) / (TRAVEL_FADE_HI - TRAVEL_FADE_LO), 0, 1), 2)
     inputs.bal = round(balance, 3)   -- -1 understeer .. 0 neutral .. +1 oversteer
   end
@@ -1336,8 +1401,8 @@ local function updateGFX(dt)
       local function deg(a) return a and string.format("%+6.1f", math.deg(a)) or "   n/a" end
       local function num(a) return a and string.format("%+5.2f", a) or "  n/a" end
       local line = string.format(
-        "[vgs travel] %4.1f m/s  steer in %+.2f  front wheels %s deg  lock %4.1f deg | shown %s deg | front going %s deg (hubs %s, yaw %s)  rear %s deg | yaw rate: physics %s (sign %+d), heading %s, used %s rad/s",
-        vel:length(), clamp(-(electrics.values.steering_input or 0), -1, 1), deg(lastFrontSteer), math.deg(lockAngle), deg(travelDiag.shown),
+        "[vgs travel] %4.1f m/s  steer in %+.2f  front wheels %s deg  lock %4.1f deg (input-to-wheel ratio now %4.1f deg, turn cal x%.2f) | shown %s deg | front going %s deg (hubs %s, yaw %s)  rear %s deg | yaw rate: physics %s (sign %+d), heading %s, used %s rad/s",
+        vel:length(), clamp(-(electrics.values.steering_input or 0), -1, 1), deg(lastFrontSteer), math.deg(lockAngle), math.deg(est.ratio or lockAngle), est.cal, deg(travelDiag.shown),
         deg(travelAng), deg(travelDiag.frontHub), deg(travelDiag.frontYaw), deg(rearTravel),
         num(travelDiag.physYaw), yawSign, num(travelDiag.headYaw), num(yawRate))
       log('I', 'vgsTelemetry', line); print(line)

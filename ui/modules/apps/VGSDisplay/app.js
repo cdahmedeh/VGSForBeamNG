@@ -779,6 +779,39 @@
     return 'rgb(' + [0, 1, 2].map(function (i) { return Math.round(pa[i] + (pb[i] - pa[i]) * k); }).join(', ') + ')';
   }
   function markerSize(rPx) { return clamp(rPx * 0.085, 7, 14); }          // marker height (px)
+  // Steering scale for the steering arc and the direction marker: asinh(k x) / asinh(k), the
+  // centre stretched and full lock still at a quarter turn. Both use the same curve, so which is
+  // further round, and whether they line up, are exactly as on a straight scale. Past full lock
+  // (the marker in big slides and spins) it carries on straight, so the marker still goes all
+  // the way round.
+  // The stretch follows speed: the vehicle sends the steering a 1 g corner needs at its current
+  // speed (inp.sr, from its wheelbase), and k is chosen so that much steering fills STEER_TARGET
+  // of the quarter. At highway speed that's a few per cent of the input, so k grows a lot; at
+  // low speed it never drops below STEER_EXPAND (a typical 34 deg lock: 1 deg of road-wheel
+  // angle on 14 deg of rim, half lock on 73). STEER_EXPAND = 0 and STEER_TARGET = 0 give a
+  // straight scale.
+  var STEER_EXPAND = 20, STEER_TARGET = 0.6, STEER_K_MAX = 400;
+  function asinhNorm(x, k) {
+    return Math.log(k * x + Math.sqrt(k * k * x * x + 1)) / Math.log(k + Math.sqrt(k * k + 1));
+  }
+  function steerK(ref) {
+    var k0 = STEER_EXPAND;
+    if (!(STEER_TARGET > 0) || !(ref > 0) || ref >= 1) return k0;
+    if (k0 > 0 && asinhNorm(ref, k0) >= STEER_TARGET) return k0;
+    var lo = Math.log(Math.max(k0, 1)), hi = Math.log(STEER_K_MAX);
+    if (asinhNorm(ref, STEER_K_MAX) <= STEER_TARGET) return STEER_K_MAX;
+    for (var it = 0; it < 30; it++) {   // asinhNorm grows with k: bisect on log k
+      var mid = (lo + hi) / 2;
+      if (asinhNorm(ref, Math.exp(mid)) < STEER_TARGET) lo = mid; else hi = mid;
+    }
+    return Math.exp((lo + hi) / 2);
+  }
+  function steerScale(x, k) {
+    if (k === undefined) k = STEER_EXPAND;
+    var a = Math.abs(x);
+    if (!(k > 0) || a >= 1) return x;
+    return (x < 0 ? -1 : 1) * asinhNorm(a, k);
+  }
   function drawInputArcs(ctx, cx, cy, rPx, inp) {
     if (!inp) return;
     var lw = clamp(rPx * 0.05, 3, 7), r = rPx - lw / 2, Q = Math.PI / 2, TOP = -Q, BOTTOM = Q;
@@ -793,8 +826,10 @@
     var hasTravel = inp.tv !== undefined && inp.tv !== null;
     var tv = hasTravel ? clamp(+inp.tv || 0, -4, 4) : 0, alpha = clamp(inp.ta === undefined ? 1 : +inp.ta, 0, 1);
     ctx.lineWidth = lw; ctx.lineCap = 'butt';
-    if (steer > 0) arc(INPUT.steer, TOP - steer * Q, TOP);        // left: counter-clockwise from the top
-    else if (steer < 0) arc(INPUT.steer, TOP, TOP - steer * Q);   // right: clockwise from the top
+    var sk = steerK(+inp.sr);
+    var steerShown = steerScale(steer, sk);
+    if (steerShown > 0) arc(INPUT.steer, TOP - steerShown * Q, TOP);        // left: counter-clockwise from the top
+    else if (steerShown < 0) arc(INPUT.steer, TOP, TOP - steerShown * Q);   // right: clockwise from the top
     // ABS working: the brake arc pulses; traction control working: the throttle arc pulses
     var pulse = 0.5 + 0.5 * Math.sin(nowMs() / 1000 * 2 * Math.PI * PULSE_HZ);
     arc(+inp.abs ? mixRgb(INPUT.brake, INPUT.brakePulse, pulse) : INPUT.brake, BOTTOM, BOTTOM + brk * Q);
@@ -806,7 +841,7 @@
     arc(INPUT.clutch, BOTTOM - clu * Q, BOTTOM);
     // the marker: a small wedge pointing out at the steering arc, where the front is going
     if (hasTravel && alpha > 0) {
-      var ang = TOP - tv * Q, mh = markerSize(rPx), tip = rPx - lw - 0.5, base = tip - mh, half = mh * 0.5;
+      var ang = TOP - steerScale(tv, sk) * Q, mh = markerSize(rPx), tip = rPx - lw - 0.5, base = tip - mh, half = mh * 0.5;
       var ux = Math.cos(ang), uy = Math.sin(ang), px = -uy, py = ux;
       ctx.globalAlpha = alpha;
       ctx.beginPath();
@@ -1085,7 +1120,7 @@
     engine: drawEngine, motor: drawMotor,
     diff: drawDiff, gearbox: drawGearbox, disconnect: drawDisconnect,
     colours: DRIVETRAIN, torqueColour: torqueColour,
-    tyre: drawTyre, slideColour: slideColour, inputArcs: drawInputArcs, travelColour: travelColour
+    tyre: drawTyre, slideColour: slideColour, inputArcs: drawInputArcs, travelColour: travelColour, steerScale: steerScale, steerK: steerK
   };
   window.VGSRenderer = VGSRenderer;
 
