@@ -843,6 +843,44 @@ local function buildPayload(fwd, right, speed)
   local powerCut = tcsOn or (hasESC and acting(dd.motor, "isActingAsYC"))
   -- ESC braking wheels: the classic script, or the driving-dynamics brake part doing it for ESC
   local escBraking = escOn and (dd.brake == nil or acting(dd.brake, "isActingAsYC"))
+  -- traction control braking wheels. It handles one spinning wheel (say the inside wheel in a
+  -- corner) by braking it, and only cuts engine power once every driven wheel spins, so this is
+  -- often the only thing it's doing. Classic script: its tcsActive flag, while ESC isn't acting
+  -- (with both, it holds its brakes and ESC's take over). Driving-dynamics: the brake part
+  -- acting for traction control, or the traction-control supervisor while that part brakes.
+  local tcBraking = hasTCS and ((dd.brake == nil and tcsOn and not escOn)
+    or (dd.brake ~= nil and (acting(dd.brake, "isActingAsTC") or acting(dd.tc, "isActing"))))
+  local tcBraked = {}   -- [wheel id] = traction control is braking it
+
+  -- Traction control cutting power, per engine or motor. Each one multiplies its throttle by a
+  -- throttle factor (combustionEngine.lua, electricMotor.lua): the electrics value it names
+  -- (electricsThrottleFactorName, normally "throttleFactor") if set, otherwise its own
+  -- device.throttleFactor. Only traction control and ESC ever lower it:
+  --  * the classic ESC script's traction control writes the electrics value, and snaps it back
+  --    to exactly 1 once the cut is under 5 %, so below 1 is a real cut;
+  --  * the driving-dynamics motorTorqueControl sets device.throttleFactor to the lower of its
+  --    traction-control and ESC factors, so a cut only counts as traction control while that
+  --    part (or the traction-control supervisor) says it's acting for traction control.
+  -- Counted only while you're on the throttle (with none, there's no power to cut).
+  -- Where it's shown: classic traction control on the engine; the driving-dynamics kind, which
+  -- works per wheel group, by each wheel it acts on (braked, or driven by a motor it's cutting).
+  local drivingDynamics = dd.tc ~= nil or dd.yc ~= nil or dd.brake ~= nil or dd.motor ~= nil
+  local throttleOn = (tonumber(ev.throttle) or 0) > 0.01
+  local tcCause = dd.motor == nil or acting(dd.motor, "isActingAsTC") or acting(dd.tc, "isActing")
+  local srcCut, cutWheel, anyCut = {}, {}, false   -- anyCut: traction control intervening anywhere (pulses the throttle arc)
+  for si, s in ipairs(drivetrain and drivetrain.sources or {}) do
+    local d = s.dev
+    local factor = 1
+    if type(d) == "table" then
+      factor = tonumber(ev[d.electricsThrottleFactorName or "throttleFactor"]) or tonumber(d.throttleFactor) or 1
+    end
+    local cut = hasTCS and throttleOn and tcCause and factor < 0.999
+    if cut then
+      anyCut = true
+      for _, wi in ipairs(s.wheels or {}) do cutWheel[wi] = true end
+    end
+    srcCut[si] = { factor = factor, cut = cut }
+  end
   forEachWheel(function(i, w)
     local L, S = layout[i], state[i]
     if not L or not S then return end
@@ -927,11 +965,14 @@ local function buildPayload(fwd, right, speed)
     local iv = nil
     local usage = w.defaultBrakeInputUsageCoef or 1
     local mainReq = math.abs(w.desiredMainBrakingTorque or 0)
-    if escBraking then
-      local parkReq = (w.parkingTorque or 0) * parkIn * usage
-      local added = math.abs(w.desiredBrakingTorque or 0) - math.max(mainReq, parkReq)
-      if added > math.max(ESC_BRAKE_MARGIN, brakeMax * 0.03) then iv = 3 end
-    end
+    local parkReq = (w.parkingTorque or 0) * parkIn * usage
+    local added = math.abs(w.desiredBrakingTorque or 0) - math.max(mainReq, parkReq)
+    local assistBrake = added > math.max(ESC_BRAKE_MARGIN, brakeMax * 0.03)
+    if escBraking and assistBrake then iv = 3 end
+    if tcBraking and assistBrake then tcBraked[i] = true end
+    -- driving-dynamics traction control acting on this wheel: braking it, or cutting the power
+    -- of a motor that drives it (ESC's blue dot wins if both act on the same wheel)
+    if not iv and drivingDynamics and (tcBraked[i] or cutWheel[i]) then iv = 2 end
     if not iv and hasABS and brakeOn then
       -- the pedal's share without ABS, worked out the way wheels.lua does it
       local bIn = (tonumber(ev[w.brakeElectricsName or "brake"]) or brakeIn) * usage
@@ -962,18 +1003,27 @@ local function buildPayload(fwd, right, speed)
       fl = (not broken and (w.isTireDeflated or w.isPunctured)) and 1 or nil,   -- flat or punctured tyre
       sl = round(slip, 2),         -- raw contact slip (m/s), for calibration
       fz = math.floor(fz),         -- wheel load (N), for calibration
-      iv = iv,                     -- assist on this wheel: 1 = ABS, 3 = ESC
+      iv = iv,                     -- assist on this wheel: 1 = ABS, 2 = traction control, 3 = ESC
     }
     wheelsOut[#wheelsOut + 1] = entry
   end)
 
   local sources = {}
-  for _, s in ipairs(drivetrain and drivetrain.sources or {}) do
+  for si, s in ipairs(drivetrain and drivetrain.sources or {}) do
+    local c = srcCut[si]
+    -- or braking one of the wheels this one drives
+    local braking = false
+    for _, wi in ipairs(s.wheels or {}) do if tcBraked[wi] then braking = true end end
+    if braking then anyCut = true end
     sources[#sources + 1] = {
       x = round(s.x, 3), y = round(s.y, 3),
       k = s.kind,                  -- "ice" or "ev"
       e = s.est and 1 or 0,        -- position estimated (not found in the vehicle data)
       w = s.wheels,                -- wheel ids this source drives
+      -- classic traction control: a green dot on the engine while it's cutting this one's
+      -- power or braking a wheel it drives (driving-dynamics traction control shows by the wheels)
+      tc = (not drivingDynamics and (c.cut or braking)) and 1 or nil,
+      tf = (c.factor < 0.999) and round(c.factor, 2) or nil,   -- its throttle factor, for the numbers / dumps
     }
   end
 
@@ -992,7 +1042,7 @@ local function buildPayload(fwd, right, speed)
     c = pedalLevel(ev.clutch),         -- 1 = pedal fully down
     p = pedalLevel(ev.parkingbrake),   -- handbrake
     abs = absOn and 1 or nil,          -- ABS working: the brake arc pulses
-    tcs = powerCut and 1 or nil,       -- an assist cutting power (TCS or ESC): the throttle arc pulses
+    tcs = (powerCut or anyCut) and 1 or nil,   -- an assist cutting power (TCS or ESC): the throttle arc pulses
   }
 
   -- Direction of travel, on the steering arc's scale: the front axle's travel angle as a share

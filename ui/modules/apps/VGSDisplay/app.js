@@ -58,13 +58,26 @@
   var DUAL_GAP_M = 0.04;    // gap between tyres of a dual set when spread from one hub (m)
   var DUAL_SAME_HUB = 0.05; // dual tyres closer than this (m) are treated as reported at one hub point
   var MIN_TYRE_W = 3, MIN_TYRE_L = 6;   // px; only so very small tyres stay visible
-  // Assist dots beside the wheels (wheel.iv): 1 = ABS acting on it, 3 = ESC braking it.
-  // Small and slightly see-through, so they stay subtle; one per corner (a dual set shares one).
+  // Assist dots beside the wheels (wheel.iv): 1 = ABS acting on it, 2 = traction control acting
+  // on it (driving-dynamics cars), 3 = ESC braking it. Small and slightly see-through, so they
+  // stay subtle; one per corner (a dual set shares one, the highest rank showing).
   var ASSIST = {
     1: { colour: 'rgba(255, 85, 75, 0.9)',  rank: 1 },
+    2: { colour: 'rgba(80, 220, 120, 0.9)', rank: 1.5 },
     3: { colour: 'rgba(95, 165, 255, 0.9)', rank: 2 }
   };
   function dotRadius(tyreW) { return clamp(tyreW * 0.22, 1.8, 3.2); }
+  // Classic traction control intervening on an engine's or motor's wheels (src.tc): a green dot
+  // at its centre, the same green as the traction-control wheel dots, with a thin dark edge so
+  // it shows on the light block.
+  function drawTcDot(ctx, p, r) {
+    ctx.save();
+    ctx.setLineDash([]);
+    ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+    ctx.fillStyle = ASSIST[2].colour; ctx.fill();
+    ctx.strokeStyle = 'rgba(10, 12, 16, 0.75)'; ctx.lineWidth = 0.8; ctx.stroke();
+    ctx.restore();
+  }
   var DOT_SPACE = 0.22;   // room beside the outer wheels for the assist dots (m)
 
   function toArray(v) {
@@ -706,6 +719,7 @@
 
     // Engines, then gearboxes, then differentials on top (a transaxle's diff is inside the gearbox, and an
     // engine sitting over its driven axle mustn't hide the lock state), then electric motors.
+    var tcDots = [];
     function drawSource(src, ev) {
       var sn = nodes.filter(function (n) { return n.k === 'src' && n.src === src && n.pt; })[0];
       var p = sn ? sn.pt : map(sourceX(src), +src.y);
@@ -714,6 +728,7 @@
       if (ev) drawMotor(ctx, p, motorR);
       else drawEngine(ctx, p, ew, eh);
       ctx.restore();
+      if (+src.tc) tcDots.push({ p: p, r: ev ? clamp(motorR * 0.5, 1.6, 3) : clamp(Math.min(ew, eh) * 0.17, 2, 3.6) });
     }
     body.sources.forEach(function (src) { if (src.k !== 'ev') drawSource(src, false); });
     nodes.forEach(function (n) { if (n.k === 'gb' && n.pt) drawGearbox(ctx, n.pt, gbPx); });
@@ -721,6 +736,8 @@
     body.sources.forEach(function (src) { if (src.k === 'ev') drawSource(src, true); });
     // disconnect diamonds last among the parts, so none is ever hidden under one
     marks.forEach(function (m) { drawDisconnect(ctx, m.p, m.ux, m.uy, m.open, cpPx); });
+    // traction-control dots on top of everything, so no part can hide one
+    tcDots.forEach(function (d) { drawTcDot(ctx, d.p, d.r); });
 
 
     ctx.restore();
