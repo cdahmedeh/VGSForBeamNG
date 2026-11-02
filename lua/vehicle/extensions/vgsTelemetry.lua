@@ -143,7 +143,8 @@ local watch = { travel = 0, travelNext = 0, assists = false, assistValues = {} }
 
 -- What's sent, reused every frame (nothing new is allocated per frame in steady state)
 local wstate = {}       -- [i] = { grip, sliding, severity, fzAvg }
-local out = { w = {}, src = {}, dg = {}, inp = {}, gf = { x = 0, y = 0 }, vd = {} }
+local out = { w = {}, src = {}, dg = {}, inp = {}, gf = { x = 0, y = 0 } }
+local vdOut = {}        -- the numbers-mode vehicle values (sent as out.vd while numbers mode is on)
 local couplerList = {}
 local DETAIL_KEYS = { "sa", "sr", "ws", "fz", "dq", "bq", "tt", "tc", "tp", "bt" }
 
@@ -816,7 +817,8 @@ local function resetState()
   kin.vring = newRing(128)
   est.kn, est.kd, est.cal, est.rn, est.rd, est.ratio, est.lock = 0, 0, 1, 0, 0, nil, LOCK_DEFAULT
   est.balance, est.frontSteer, est.rearSteer, est.slipF, est.slipR, est.shown = 0, nil, 0, nil, nil, nil
-  out.inp, out.vd = {}, {}
+  out.inp, out.vd = {}, nil
+  for k in pairs(vdOut) do vdOut[k] = nil end
   tx.since, tx.sinceStatic, tx.sincePing, tx.staticDue = 0, math.huge, math.huge, true
 end
 
@@ -1298,7 +1300,7 @@ local function fillDetail(fwd, right, ev)
       end
     end
   end
-  local vd = out.vd
+  local vd = vdOut
   local front, rear = lay.front, lay.rear
   vd.v = round(kin.speed, 2)                                 -- ground speed, m/s
   vd.yr = round(yaw, 3)                                      -- yaw rate, rad/s, + = left
@@ -1395,7 +1397,7 @@ local function send(fwd, right, ev)
   end
   p.inp.tcs = (ax.powerCut or ax.anyCut) and 1 or nil        -- an assist cutting power: the throttle arc pulses
   if detail then
-    fillDetail(fwd, right, ev); p.vd = out.vd; tx.detailSent = true
+    fillDetail(fwd, right, ev); p.vd = vdOut; tx.detailSent = true
   else
     p.vd = nil
     if tx.detailSent then   -- numbers mode just switched off: drop the extra values
@@ -1511,7 +1513,7 @@ end
 
 -- ===== Main loop ===========================================================
 
-local function updateGFX(dt)
+local function step(dt)
   if watch.assists then watchAssistsStep() end
   if not active or not dt or dt <= 0 then return end
   clock = clock + dt
@@ -1548,9 +1550,32 @@ local function updateGFX(dt)
   if uiWantsFrame() then send(fwd, right, ev) end
 end
 
+-- BeamNG switches a vehicle off when one of its scripts throws an error, so everything this
+-- extension does runs protected: a problem in the display can only stop the display, never
+-- the car. Errors are logged (at most every 10 s, with where they happened) so they can be
+-- reported and fixed.
+local errLog = { next = 0, count = 0 }
+local function protect(where, fn, ...)
+  local ok, err = pcall(fn, ...)
+  if ok then return true end
+  errLog.count = errLog.count + 1
+  if clock >= errLog.next or errLog.count == 1 then
+    errLog.next = clock + 10
+    log('E', 'vgsTelemetry', string.format('%s failed (%d times so far): %s', where, errLog.count, tostring(err)))
+  end
+  return false
+end
+
+local function updateGFX(dt)
+  if not protect('update', step, dt) and active then
+    -- start afresh next frame: a half-finished update can leave estimates in a bad state
+    pcall(resetState)
+  end
+end
+
 local function setActive(on)
   on = on and true or false
-  if on and not active then resetState() end
+  if on and not active then protect('start', resetState) end
   active = on
 end
 
@@ -1618,19 +1643,19 @@ local function dumpDrivetrain()
   end
 end
 
-M.dumpWheels        = dumpWheels
-M.dumpDrivetrain    = dumpDrivetrain
-M.dumpAssists       = dumpAssists
+M.dumpWheels        = function() protect('dumpWheels', dumpWheels) end
+M.dumpDrivetrain    = function() protect('dumpDrivetrain', dumpDrivetrain) end
+M.dumpAssists       = function() protect('dumpAssists', dumpAssists) end
 M.watchAssists      = function(on) watch.assists = on ~= false; watch.assistValues = {} end
 M.dumpTravel        = function(seconds) watch.travel, watch.travelNext = tonumber(seconds) or 10, 0 end
 M.travelState       = function() return diag, est.lock, kin.travel, kin.rearTravel, kin.yawRate end   -- for tests
-M.onExtensionLoaded = resetState
-M.onReset           = resetState
+M.onExtensionLoaded = function() protect('load', resetState) end
+M.onReset           = function() protect('reset', resetState) end
 M.updateGFX         = updateGFX
 M.setActive         = setActive
 M.setDetail         = setDetail
 M.requestLayout     = requestLayout
-M.onCouplerAttached = onCouplerAttached
-M.onCouplerDetached = onCouplerDetached
+M.onCouplerAttached = function(...) protect('coupler attached', onCouplerAttached, ...) end
+M.onCouplerDetached = function(...) protect('coupler detached', onCouplerDetached, ...) end
 
 return M

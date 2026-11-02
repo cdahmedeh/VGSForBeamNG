@@ -1817,13 +1817,15 @@
         scope.$on('VGSData', function (event, payload) {
           var t = nowMsApp();
           lastData = t;
-          var ask = store.ingest(payload, t);
-          if (ask !== null) lua('if extensions.vgsHub then extensions.vgsHub.requestLayout(' + ask + ') end');
+          try {
+            var ask = store.ingest(payload, t);
+            if (ask !== null) lua('if extensions.vgsHub then extensions.vgsHub.requestLayout(' + ask + ') end');
+          } catch (e) { if (window.console) console.error('VGS Display: bad update', e); }
           schedule();
         });
         scope.$on('VGSChain', function (event, chain) {
           lastChain = nowMsApp();
-          if (store.setChain(chain)) schedule();
+          try { if (store.setChain(chain)) schedule(); } catch (e) { if (window.console) console.error('VGS Display: bad chain message', e); }
         });
         scope.$on('SettingsChanged', function (event, data) { units.set(data && data.values); schedule(); });
 
