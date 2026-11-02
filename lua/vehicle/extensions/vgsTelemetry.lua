@@ -1,98 +1,97 @@
 -- VGS Display : vehicle-side telemetry
 -- ---------------------------------------------------------------------------
--- Measures, for every wheel of this vehicle:
+-- Runs in each displayed vehicle's own Lua. Every graphics frame it updates, for every wheel:
 --   * where it sits on the vehicle (captured once, in the vehicle's own frame)
---   * its live steering (yaw) angle, measured from the hub's axle nodes
---   * an estimate of how much of the tyre's grip is in use (0..1+)
---   * whether the tyre is sliding (grip limit exceeded)
---   * the torque being applied: +1 full drive ... 0 none ... -1 full braking
--- and sends it to the vgsHub game-engine extension, which forwards it to the UI.
+--   * its live steering angle, measured from the hub's axle nodes
+--   * how much of the tyre's grip is in use (0..1+) and whether it's sliding
+--   * the torque on it: +1 full drive ... 0 none ... -1 full braking
+--   * which driver assist (ABS, traction control, ESC) is acting on it
+-- plus the driver's inputs, the G-force, how much the car is actually turning and its
+-- understeer / oversteer balance.
 --
--- Loaded on demand by vgsHub. Nothing is computed until setActive(true).
+-- Whenever the UI is ready for a new frame (the same handshake BeamNG's own gauges use) it
+-- sends the latest values straight to the VGS Display app as the 'VGSData' UI hook. The layout
+-- (wheel positions, tyre sizes, drivetrain) goes in a separate block, only when it changes and
+-- every couple of seconds. The extra numbers for the app's numbers mode are only worked out
+-- while that mode is on.
+--
+-- Loaded and switched on by the vgsHub game-engine extension; idle until setActive(true).
 -- ---------------------------------------------------------------------------
 
 local M = {}
 
 -- ===== Tunables =============================================================
--- BeamNG doesn't expose a direct "friction used" figure per tyre, so grip use
--- is an estimate: the larger of (a) a force-based estimate and (b) contact-patch
--- slip relative to SLIP_PEAK. Calibrate SLIP_PEAK / SLIP_LIMIT in-game using the
--- app's numeric readout (click the app).
-local SEND_HZ          = 60    -- updates per second sent to the UI (capped by the game's frame rate)
+-- Sending
+local MAX_SEND_HZ      = 0     -- 0: one update per UI frame (lowest latency, no queueing); else a cap
+local FALLBACK_HZ      = 60    -- update rate if the game doesn't report when the UI wants a frame
+local KEEPALIVE        = 0.25  -- s: send anyway if the UI hasn't asked for this long
+local STATIC_EVERY     = 2     -- s: the layout is re-sent this often (a reloaded UI picks it up)
+local PING_EVERY       = 0.5   -- s: liveness and couplings, to the game-engine hub
+-- Grip. BeamNG doesn't expose a "friction used" figure per tyre, so grip use is an estimate:
+-- the larger of a force-based estimate and contact-patch slip relative to SLIP_PEAK.
 local MU_NOMINAL       = 1.0   -- assumed peak friction coefficient (road tyre, dry asphalt)
 local SLIP_PEAK        = 1.5   -- m/s of contact-patch slip treated as 100 % grip used
-local SLIP_LIMIT       = 2.0   -- m/s of slip above which the tyre counts as sliding (red fill)
-local SLIP_RELEASE     = 0.8   -- sliding clears below SLIP_LIMIT * this (avoids flicker)
+local SLIP_LIMIT       = 2.0   -- m/s of slip above which the tyre counts as sliding
+local SLIP_RELEASE     = 0.8   -- sliding clears below SLIP_LIMIT * this (no flicker)
 -- How red a sliding tyre is, from its slip ratio (slip speed / road speed). Real tyres peak at
--- about 10-15 % slip, stay within a few percent of peak grip out to about 30 %, and fall away
--- towards a locked or spinning wheel at 100 %. The near-peak band stays pink, so there's time to
--- ease off (threshold braking, a car just past the limit), then the red deepens towards 100 %.
-local SLIP_RATIO_PINK  = 0.30  -- slip ratio up to which the tyre stays pink (still near peak grip)
-local SLIP_RATIO_FULL  = 1.00  -- slip ratio shown as the deepest red (locked or spinning)
+-- about 10-15 % slip and stay within a few percent of peak out to about 30 %, so that band stays
+-- pink; the red deepens from there to a locked or spinning wheel at 100 %.
+local SLIP_RATIO_PINK  = 0.30
+local SLIP_RATIO_FULL  = 1.00
 local PINK_SEVERITY    = 0.2   -- how far towards deep red the colour gets by the end of the pink band
-local RATIO_MIN_SPEED  = 5.0   -- m/s; slip ratio is taken against at least this (avoids /0 at a crawl)
+local RATIO_MIN_SPEED  = 5.0   -- m/s; slip ratio is taken against at least this (no /0 at a crawl)
 local MIN_LOAD         = 150   -- N; below this a wheel is treated as off the ground
-local GRIP_SMOOTHING   = 0.4   -- 0..1, share of the gap closed every 1/30 s; higher = snappier, lower = steadier
-local ACCEL_SMOOTH_HZ  = 6     -- low-pass for measured acceleration (grip estimate)
--- G-force dot: the acceleration is the change in velocity over a short window rather than from
--- one frame to the next, which averages out the body's vibration (frame-to-frame it shows up as
--- jitter, worst on stiff or flexy vehicles), then it's smoothed a little more.
-local GF_WINDOW        = 0.12  -- s of velocity history the acceleration is measured across
-local GF_SMOOTH_HZ     = 12    -- low-pass on top (higher = snappier, lower = steadier)
-local LOAD_SMOOTH_HZ   = 0.5   -- low-pass for the wheel load used to scale drive torque
+local GRIP_SMOOTHING   = 0.4   -- share of the gap closed every 1/30 s (higher = snappier)
+local ACCEL_SMOOTH_HZ  = 6     -- low-pass on the lateral acceleration the grip estimate uses
+local LOAD_SMOOTH_HZ   = 0.5   -- low-pass on the wheel load used to scale drive torque
 local STANDSTILL_SPEED = 0.5   -- m/s; a held brake at standstill isn't counted as tyre force
--- Direction marker, on the same scale as the steering arc. It's the front axle's direction of
--- travel, measured against the rear axle's while the rear tyres grip: how much the car is
--- actually turning, as a steering angle. (Against the body it would sit near the middle, or even
--- on the outside, in fast corners: the rear tyres' few degrees of slip let the whole car crab
--- slightly nose-in.) As the rear slides past its grip it changes over to the front axle's
--- direction against the body, the countersteer target in a slide. It can run on past a quarter,
--- all the way round, for big slides and spins.
-local TRAVEL_SMOOTH_HZ = 15    -- low-pass for the direction of travel (on top of the window)
+-- G-force dot. The acceleration is the least-squares slope of the velocity over GF_WINDOW
+-- (which averages out the body's vibration far better than a difference between two samples),
+-- then a "One Euro" filter: strong smoothing while the force holds steady, so the dot sits
+-- still, opening up as the force changes, so it doesn't trail behind. In a simulated test with
+-- body vibration it's as steady as a plain 0.12 s window with a 12 Hz low-pass, with less than
+-- half the delay (about 50 ms instead of 120).
+local GF_WINDOW        = 0.10  -- s of velocity history in each slope
+local GF_MIN_CUTOFF    = 1.5   -- Hz: smoothing while steady (lower = stiller)
+local GF_BETA          = 4     -- Hz per g/s: how much it opens up as the force changes
+local GF_D_CUTOFF      = 1     -- Hz: smoothing of the rate of change itself
+-- Direction marker: how much the car is actually turning, on the steering arc's scale
+-- (see updateTravel). It can run on past a quarter, all the way round, in slides and spins.
+local TRAVEL_SMOOTH_HZ = 15    -- low-pass on each axle's direction of travel
 local TRAVEL_WINDOW    = 0.06  -- s; each axle's movement is measured across this long a stretch
-local YAW_SMOOTH_HZ    = 12    -- light low-pass for the yaw rate it uses
-local TRAVEL_FADE_LO   = 0.5   -- m/s; below this the direction is too noisy to show (a car settling or
-                               -- rocking at a stop would swing it about)
-local TRAVEL_FADE_HI   = 1.5   -- m/s; fully shown from here (wobble under ~0.3 deg)
+local YAW_SMOOTH_HZ    = 12    -- light low-pass on the yaw rate
+local TRAVEL_FADE_LO   = 0.5   -- m/s; below this the direction is too noisy to show
+local TRAVEL_FADE_HI   = 1.5   -- m/s; fully shown from here
 local TRAVEL_MAX       = 4     -- furthest the marker goes, in quarter turns (4 = the whole circle)
--- The marker's and the balance colour's tuning lives in one table: LuaJIT allows a function
--- at most 60 outside local variables, and the payload builder uses a lot of settings.
-local TUNE = {}
-TUNE.REAR_GRIP_SLIP   = 0.14  -- rad (~8 deg) of rear slip up to which the rear counts as gripping
-TUNE.REAR_SLIDE_SLIP  = 0.35  -- rad (~20 deg) from which it's fully sliding (marker = front vs body)
--- While the rear grips, the marker's angle (how much the car is turning, as a steering angle)
--- is wheelbase x yaw rate / forward speed: exact for a rigid car, and read from the physics yaw
--- rate rather than by differentiating node positions, so it's free of the hubs' vibration. A
--- running least-squares fit keeps it calibrated to the hub measurement (TURN_CAL_TAU).
-TUNE.TURN_CAL_TAU     = 5     -- s of history the calibration against the hubs uses
--- The marker is drawn in steering-input units, like the arc. At speed the wheels turn less per
--- unit of input than the full-lock ratio says: the steering gives under cornering load, and its
--- geometry isn't linear. So it's converted with the ratio the wheels actually show right now: a
--- running least-squares slope of front-wheel angle against steering input. Every frame counts in
--- proportion to how far you're steering, so the hub nodes' noise averages out, and frames on a
--- straight (input near zero) carry almost no weight: nothing is divided by a near-zero angle.
-TUNE.RATIO_TAU        = 1.0   -- s of history the slope uses
-TUNE.CENTRE_TAU       = 3     -- s: how fast each wheel's straight-ahead reference settles while driving straight
 local LOCK_DEFAULT     = 0.6   -- rad; road-wheel angle at full lock until it's been measured
--- Understeer / oversteer balance (the arc's colour): rear slip angle minus front slip angle,
--- in the direction the car is rotating. + = rear sliding more (oversteer), - = front (understeer).
--- Tuned to stay neutral in normal driving: road tyres run a few degrees of slip in ordinary
--- corners, and a small front/rear difference is just the car's handling, not a slide.
+local CENTRE_INPUT     = 0.004 -- steering input below which the steering counts as centred (~0.1 deg of road wheel)
+local ESC_BRAKE_MARGIN = 50    -- Nm of brake request beyond the pedals' share that counts as assist braking
+-- Marker and balance-colour tuning. In a table because LuaJIT allows a function at most 60
+-- outside local variables.
+local TUNE = {}
+TUNE.REAR_GRIP_SLIP   = 0.14  -- rad (~8 deg) of rear slide up to which the rear counts as gripping
+TUNE.REAR_SLIDE_SLIP  = 0.35  -- rad (~20 deg) from which it's fully sliding (marker = front vs body)
+-- While the rear grips, the marker is wheelbase x yaw rate / forward speed: exact for a rigid
+-- car, and read from the physics yaw rate, so free of the hubs' vibration. A running
+-- least-squares fit keeps it calibrated to the hub measurement.
+TUNE.TURN_CAL_TAU     = 5     -- s of history in that calibration
+-- The marker is drawn in steering-input units with the ratio the front wheels show right now: a
+-- running least-squares slope of front-wheel angle against input, each frame weighted by how far
+-- you're steering, so straights (input near zero) add no noise.
+TUNE.RATIO_TAU        = 1.0   -- s of history in that slope
+TUNE.CENTRE_TAU       = 3     -- s for each wheel's straight-ahead reference to settle while driving straight
+-- Understeer / oversteer (the marker's colour): rear slip angle minus front, in the direction
+-- the car is rotating. + = rear sliding more (oversteer), - = front (understeer).
 TUNE.BAL_DEADBAND     = 0.05  -- rad (~3 deg) of difference that still counts as neutral
 TUNE.BAL_FULL         = 0.21  -- rad (~12 deg) of difference shown as the full colour
-TUNE.BAL_SLIP_START   = 0.08  -- rad (~4.5 deg): the more-slipping axle must pass this to colour at all
+TUNE.BAL_SLIP_START   = 0.08  -- rad (~4.5 deg): the rear must pass this to colour at all
 TUNE.BAL_SLIP_FULL    = 0.14  -- rad (~8 deg, around a road tyre's peak): full colour from here
-TUNE.BAL_MIN_YAW      = 0.15  -- rad/s of rotation before the balance is shown at full strength
--- Understeer is shown in two stages (the balance value runs 0 .. -TUNE.US_WARN_SHARE for the first,
--- on to -1 for the second; the display maps them to light blue -> light orange -> full orange):
---  1. a warning as the front tyres approach their limit. Two things together: the front slip
---     angle on its way to a road tyre's peak (about 7 deg), and the front slipping more than the
---     rear (the car running out of front grip first). In a simulated sweep up to the limit it
---     stays clear below about 60 % of the front tyres' grip, starts around 75-80 % and reaches
---     light orange at the limit.
---  2. understeer proper, once the front is past its peak and clearly sliding more than the rear:
---     light orange deepens to full orange.
-TUNE.US_WARN_SHARE    = 0.35  -- share of the scale the warning stage uses (must match app.js)
+TUNE.BAL_MIN_YAW      = 0.15  -- rad/s of rotation before it's shown at full strength
+-- Understeer comes in two stages (0 .. -US_WARN_SHARE, then on to -1):
+--  1. a warning as the front tyres approach their limit: front slip on its way to a road tyre's
+--     peak, together with the front slipping more than the rear;
+--  2. understeer proper, once the front is past its peak and clearly sliding more than the rear.
+TUNE.US_WARN_SHARE    = 0.35  -- must match UNDER_WARN in app.js
 TUNE.US_SLIP_START    = 0.044 -- rad (~2.5 deg) of front slip where the warning starts
 TUNE.US_SLIP_FULL     = 0.122 -- rad (~7 deg, a road tyre's peak): full
 TUNE.US_LEAD_START    = 0.005 -- rad (~0.3 deg) the front must slip more than the rear to count
@@ -102,56 +101,58 @@ TUNE.US_PAST_FULL     = 0.175 -- rad (~10 deg): full orange
 TUNE.US_PAST_LEAD     = 0.035 -- rad (~2 deg) more than the rear where it starts ...
 TUNE.US_PAST_LEAD_FULL = 0.07 -- rad (~4 deg) ... and full
 TUNE.US_MIN_YAW       = 0.10  -- rad/s of rotation before it's shown at full strength
--- Driver assists (ABS, ESC, TCS), only on vehicles that report having them
-local ESC_BRAKE_MARGIN = 50    -- Nm of brake request beyond the pedals' share that counts as ESC braking
 -- ===========================================================================
 
 local G = 9.81
--- GRIP_SMOOTHING is set per 1/30 s; this is the same smoothing per update at SEND_HZ
-local gripK = 1 - (1 - GRIP_SMOOTHING) ^ (30 / SEND_HZ)
+local PROTOCOL = 2   -- payload version, checked by the app
 
-local active     = false
-local sendTimer  = 0
-local layout     = nil   -- [i] = { x, y, steerBase }   (metres, vehicle frame)
-local layoutWait = 0
-local bodyExtent = nil  -- { x0, x1, y0, y1 }: the whole vehicle's footprint (metres, vehicle frame)
-local state      = {}    -- [i] = { grip, sliding, fzAvg }
-local coupled    = {}    -- [objId] = number of couplers attached to that vehicle
-local lastVel    = nil
-local latAccel   = 0
-local lonAccel   = 0
-local velHist    = {}    -- recent { t, v } samples for the G-force dot
-local histTime   = 0     -- s, running clock for velHist
-local gLat, gLon = 0, 0  -- m/s^2, smoothed acceleration for the G-force dot
-local lastFwd    = nil
-local assistControllers = nil   -- the driving-dynamics assist parts, when the vehicle has them
-local lastRight  = nil
-local yawRate    = 0     -- rad/s, + = turning left
-local yawSign    = 1     -- sign that makes the physics yaw rate read + = left (checked as we go)
-local yawCheck   = 0     -- running agreement between the physics yaw rate and the heading's
-local travelAng  = 0     -- rad, + = front axle moving to the left of where the car points; kept
-                         -- continuous past +-180 deg (up to +-270) so a big slide doesn't flip sides
-local rearTravel = 0     -- rad, the same at the rear axle
-local balance    = 0     -- -1 full understeer .. +1 full oversteer (smoothed)
-local rearAxle   = nil   -- { x, y, cut } centre of the rear axle group; wheels behind cut belong to it
--- each axle also keeps its hub nodes (nodes) and their recent positions (hist), so its direction
--- of travel comes straight from how the hubs actually move
-local travelDiag = {}    -- latest values behind the direction of travel, for dumpTravel
-local travelWatch = 0    -- s left to print them for
-local travelWatchNext = 0
-local lastFrontSteer = nil   -- rad, average road-wheel angle of the front axle
-local lockAngle  = LOCK_DEFAULT   -- rad; road-wheel angle at full steering lock (learned)
--- running fits: turn calibration against the hubs (kn, kd -> cal), input-to-wheel slope (rn, rd -> ratio)
-local est = { kn = 0, kd = 0, cal = 1, rn = 0, rd = 0, ratio = nil }
-local frontAxle  = nil   -- { x, y } centre of the frontmost axle (metres, vehicle frame)
+local active, detail = false, false
+local clock = 0               -- s, running sim clock while active
+-- sending: time since the last update / layout / hub ping, layout version, layout due
+local tx = { since = 0, sinceStatic = math.huge, sincePing = math.huge, lv = 0, staticDue = true,
+             uiFlag = nil, keyFrames = 0 }
+
+-- Layout, captured once (see captureLayout)
+local lay = {
+  wheels = nil,      -- [i] = { x, y, tyres, radius, width, steerBase, n1, n2, wheelID, pgroup }
+  wait = 0,          -- s waited for the steering to centre before capturing anyway
+  front = nil,       -- front axle { x, y, nodes, ring }
+  rear = nil,        -- rear axle group { x, y, cut, nodes, ring }
+  ext = nil,         -- whole-vehicle footprint { x0, x1, y0, y1 }
+  drivetrain = nil,  -- { sources, driven, graph }
+  assists = nil,     -- driving-dynamics assist controllers, when the vehicle has them
+  static = nil,      -- the layout block sent to the app
+  mass = nil, cgx = nil, cgy = nil,
+}
+local everDriven = {}   -- [i] = true once a wheel has had drive torque (fallback for odd trees)
+local nodeCidByName = nil
+local coupled = {}      -- [objId] = number of couplers attached to that vehicle
+
+-- Kinematics, updated every frame
+local kin = {
+  latAccel = 0, gx = 0, gy = 0, gdx = 0, gdy = 0, gInit = false,
+  yawRate = 0, yawSign = 1, yawCheck = 0, lastFwd = nil, lastRight = nil,
+  travel = 0, rearTravel = 0,   -- rad, + = axle moving left of where the car points; continuous to +-270
+  vring = nil, physYaw = nil, headYaw = nil, vel = nil, speed = 0,
+}
+-- Running estimates for the marker and the balance colour
+local est = { kn = 0, kd = 0, cal = 1, rn = 0, rd = 0, ratio = nil, lock = LOCK_DEFAULT,
+              balance = 0, frontSteer = nil, rearSteer = 0, slipF = nil, slipR = nil, shown = nil }
+local diag = {}         -- values behind the marker, for dumpTravel
+local watch = { travel = 0, travelNext = 0, assists = false, assistValues = {} }
+
+-- What's sent, reused every frame (nothing new is allocated per frame in steady state)
+local wstate = {}       -- [i] = { grip, sliding, severity, fzAvg }
+local out = { w = {}, src = {}, dg = {}, inp = {}, gf = { x = 0, y = 0 }, vd = {} }
+local couplerList = {}
+local DETAIL_KEYS = { "sa", "sr", "ws", "fz", "dq", "bq", "tt", "tc", "tp", "bt" }
 
 local function clamp(v, lo, hi)
   if v < lo then return lo elseif v > hi then return hi end
   return v
 end
 
--- angle wrapped to -pi .. pi
-local function wrapAngle(a)
+local function wrapAngle(a)   -- to -pi .. pi
   a = (a + math.pi) % (2 * math.pi)
   if a < 0 then a = a + 2 * math.pi end
   return a - math.pi
@@ -162,7 +163,40 @@ local function round(v, digits)
   return math.floor(v * m + 0.5) / m
 end
 
--- Vehicle forward and right unit vectors in world space.
+local function smoothstep(k) k = clamp(k, 0, 1) return k * k * (3 - 2 * k) end
+
+-- an electrics flag: true / false, or a number above one half
+local function truthy(v) return v == true or (type(v) == "number" and v > 0.5) end
+
+-- A pedal value as BeamNG's Simple Pedals app shows it: whole percent, 0 only for exactly 0
+-- and 100 only for exactly full (its smartRound), returned as 0..1.
+local function pedalLevel(v)
+  v = (tonumber(v) or 0) * 100
+  local pct = (v >= 100) and 100 or math.floor(v + (1 - 1e-7 - v / 100))
+  return clamp(pct, 0, 100) / 100
+end
+
+-- Fixed-size history of samples (tables reused in place, so no garbage per frame)
+local function newRing(n)
+  local r = { n = n, head = 0, count = 0, s = {} }
+  for k = 1, n do r.s[k] = {} end
+  return r
+end
+local function ringNext(r)
+  r.head = r.head % r.n + 1
+  if r.count < r.n then r.count = r.count + 1 end
+  return r.s[r.head]
+end
+-- the newest sample at or before time t0, or the oldest one kept
+local function ringFind(r, t0)
+  local idx = r.head
+  for _ = 1, r.count - 1 do
+    if r.s[idx].t <= t0 then return r.s[idx] end
+    idx = (idx - 2) % r.n + 1
+  end
+  return r.s[idx]
+end
+
 local function basis()
   local fwd   = obj:getDirectionVector():normalized()
   local up    = obj:getDirectionVectorUp():normalized()
@@ -170,47 +204,33 @@ local function basis()
   return fwd, right
 end
 
--- An electrics flag: true / false, or a number above one half
-local function truthy(v)
-  return v == true or (type(v) == "number" and v > 0.5)
-end
-
--- A pedal value as Simple Pedals shows it: whole percent, with 0 only for exactly 0 and 100
--- only for exactly full (smartRound(100, v * 100) in its app.vue), returned as 0..1.
-local function pedalLevel(v)
-  v = (tonumber(v) or 0) * 100
-  local pct = (v >= 100) and 100 or math.floor(v + (1 - 1e-7 - v / 100))
-  return clamp(pct, 0, 100) / 100
+local function wheelCount()
+  if not wheels or not wheels.wheels then return 0 end
+  return tableSizeC(wheels.wheels)
 end
 
 local function forEachWheel(fn)
-  if not wheels or not wheels.wheels then return end
-  for i = 0, tableSizeC(wheels.wheels) - 1 do
+  for i = 0, wheelCount() - 1 do
     local w = wheels.wheels[i]
     if w and w.node1 and w.node2 then fn(i, w) end
   end
 end
 
--- Yaw of a wheel's axle in the vehicle's horizontal plane (radians, + = turned left),
--- plus the hub midpoint relative to the vehicle's reference node.
+-- Yaw of a wheel's axle in the vehicle's horizontal plane (radians, + = turned left), plus the
+-- hub midpoint relative to the vehicle's reference node.
 local function axleYaw(w, fwd, right)
   local p1 = obj:getNodePosition(w.node1)
   local p2 = obj:getNodePosition(w.node2)
   local axle = p2 - p1
   local f, r = axle:dot(fwd), axle:dot(right)
-  if r < 0 then f, r = -f, -r end -- node order differs between left and right wheels
-  return math.atan2(f, r), (p1 + p2) * 0.5
+  if r < 0 then f, r = -f, -r end   -- node order differs between left and right wheels
+  return math.atan2(f, r), p1, p2
 end
 
 -- ===== Drivetrain map ======================================================
--- Finds every power source (combustion engine, electric motor), where it sits,
--- and which wheels it drives, by walking the powertrain device tree.
--- Device field names vary between BeamNG versions, so every lookup is defensive
--- and falls back to something sensible.
-
-local drivetrain = nil   -- { sources = { {x, y, kind, est, wheels = {i,...}} }, driven = {[i]=true} }
-local everDriven = {}    -- [i] = true once a wheel has received drive torque (live fallback)
-local nodeCidByName = nil
+-- Every power source (combustion engine, electric motor, including modded ones), where it sits
+-- and which wheels it drives, from the powertrain device tree. Field names vary between
+-- versions and mods, so every lookup is defensive.
 
 local function resolveNode(n)
   if type(n) == "number" then return n end
@@ -224,14 +244,13 @@ local function resolveNode(n)
   return nodeCidByName[n]
 end
 
--- Centroid (vehicle frame) of a list of node ids or names; nil if none resolve.
 local function nodesCentroid(list, fwd, right)
   if type(list) ~= "table" then return nil end
   local sx, sy, n = 0, 0, 0
   for _, ref in pairs(list) do
     local cid = resolveNode(ref)
     if cid then
-      local ok, p = pcall(function() return obj:getNodePosition(cid) end)
+      local ok, p = pcall(obj.getNodePosition, obj, cid)
       if ok and p then sx, sy, n = sx + p:dot(right), sy + p:dot(fwd), n + 1 end
     end
   end
@@ -239,7 +258,7 @@ local function nodesCentroid(list, fwd, right)
   return sx / n, sy / n
 end
 
--- Centroid of the nodes whose group name contains one of `includes` and none of `excludes`.
+-- centroid of the nodes whose group name contains one of `includes` and none of `excludes`
 local function groupCentroid(fwd, right, includes, excludes)
   if not (v and v.data and v.data.nodes) then return nil end
   local list = {}
@@ -255,10 +274,7 @@ local function groupCentroid(fwd, right, includes, excludes)
           if hit then
             for _, exc in ipairs(excludes) do if s:find(exc, 1, true) then hit = false break end end
           end
-          if hit then
-            list[#list + 1] = node.cid or cid
-            break
-          end
+          if hit then list[#list + 1] = node.cid or cid; break end
         end
       end
     end
@@ -266,14 +282,10 @@ local function groupCentroid(fwd, right, includes, excludes)
   return nodesCentroid(list, fwd, right)
 end
 
--- Nodes whose group names the engine (combustion engines only).
-local function engineGroupCentroid(fwd, right)
-  return groupCentroid(fwd, right, { "engine" }, { "bay", "mount", "hood", "cover" })
-end
+local function devType(d) return type(d.type) == "string" and d.type or "" end
 
 local function isPowerSource(d)
-  local t = type(d.type) == "string" and d.type or ""
-  local tl = t:lower()
+  local tl = devType(d):lower()
   if tl:find("starter") then return false end
   if type(d.deviceCategories) == "table" and d.deviceCategories.engine then return true end
   return tl:find("engine$") ~= nil or tl:find("motor$") ~= nil
@@ -284,7 +296,7 @@ end
 local function wheelIndexFor(dev, wheelIdxByName)
   local cands = { dev.connectedWheel, dev.wheelName }
   if type(dev.wheel) == "table" then cands[#cands + 1] = dev.wheel.name end
-  if (type(dev.type) == "string" and dev.type == "wheel") and type(dev.name) == "string" then
+  if devType(dev) == "wheel" and type(dev.name) == "string" then
     cands[#cands + 1] = dev.name:match("^spindle_?(.+)$") or dev.name:match("^wheel_?(.+)$") or dev.name
   end
   for _, c in ipairs(cands) do
@@ -293,14 +305,14 @@ local function wheelIndexFor(dev, wheelIdxByName)
   return nil
 end
 
-local function collectDrivenWheels(device, wheelIdxByName, out, visited, depth)
+local function collectDrivenWheels(device, wheelIdxByName, outSet, visited, depth)
   if depth > 64 or visited[device] then return end
   visited[device] = true
   local wi = wheelIndexFor(device, wheelIdxByName)
-  if wi then out[wi] = true end
+  if wi then outSet[wi] = true end
   if type(device.children) == "table" then
     for _, child in pairs(device.children) do
-      if type(child) == "table" then collectDrivenWheels(child, wheelIdxByName, out, visited, depth + 1) end
+      if type(child) == "table" then collectDrivenWheels(child, wheelIdxByName, outSet, visited, depth + 1) end
     end
   end
 end
@@ -325,26 +337,20 @@ end
 
 -- ===== Simplified drive graph ==============================================
 -- Engine/motor -> gearbox -> differentials -> wheels, the way BeamNG's PowerTrain debug app
--- reads the device tree, keeping only what the VGS draws. Nodes are drawn parts; everything
--- between two nodes is a shaft ("link"), which may be disconnectable. Nodes are in pre-order
--- (parents first); p = parent index (0 = root).
---
---   node "src"    combustionEngine, electricMotor (roots, from mapDrivetrain)
---   node "gb"     the first gearbox on the way to the wheels (any *Gearbox type)
---   node "diff"   differential (any type), splitShaft
---   node "wheel"  a wheel: the shaft that names it, or its "wheel" (spindle) device
---   on a link:    "dog" = a shaft that can be disconnected (4WD engage, locking hubs, axle
---                 disconnects): mode connected / disconnected
---   everything else (clutches, torque converters, plain shafts, torsion reactors, dually
---   differentials, ...) is passed through. Devices that never reach a wheel (hydraulicPump,
---   power take-offs) don't appear.
+-- reads the device tree, keeping only what the VGS draws. Nodes are in pre-order (parents
+-- first); p = parent index (0 = root). Everything between two nodes is a shaft ("link").
+--   "src"    combustion engine / electric motor (roots; or inline, for a motor partway down
+--            another source's driveline, as in some hybrids)
+--   "gb"     the first gearbox on the way to the wheels (any *Gearbox type)
+--   "diff"   differential (any type) or split shaft
+--   "wheel"  a wheel: the shaft that names it, or its "wheel" (spindle) device
+--   on a link: "dog" = a shaft that can be disconnected (4WD engage, locking hubs, axle
+--   disconnects). Everything else (clutches, torque converters, plain shafts, dually diffs, ...)
+--   is passed through. Devices that never reach a wheel (hydraulic pumps, power take-offs)
+--   are dropped.
 local unpack = unpack or table.unpack
 
-local function devType(d) return type(d.type) == "string" and d.type or "" end
-
-local function isGearbox(d)
-  return devType(d):lower():find("gearbox$") ~= nil
-end
+local function isGearbox(d) return devType(d):lower():find("gearbox$") ~= nil end
 
 local function diffKind(d)
   if type(d.visualType) == "string" then return d.visualType end
@@ -367,6 +373,7 @@ local function isDually(d) return diffKind(d):lower():find("dually") ~= nil end
 --  * activeLock: a clutch the car's electronics clamp, activeLockCoef 0..1 -> shown live
 -- A split shaft (transfer case) is locked or viscous by its splitType.
 local ACTIVE_LOCKED, ACTIVE_OPEN = 0.95, 0.05
+local DIFF_CODE = { open = 1, lsd = 2, locked = 3 }
 local function diffState(d)
   local mode = type(d.mode) == "string" and d.mode:lower() or ""
   if mode == "locked" or mode == "dually" then return "locked" end
@@ -386,23 +393,18 @@ local function diffState(d)
   local kind = diffKind(d):lower()
   if kind:find("locked") then return "locked" end
   if kind:find("open") then return "open" end
-  return "lsd"   -- lsd, viscous, activeLock, torqueVectoring, splitShaft
+  return "lsd"
 end
 
--- the differential's own type, for the README / dump (not the lock state)
-local function diffTypeName(d)
-  return (diffKind(d):lower():gsub("^differential_?", ""))
-end
+local function diffTypeName(d) return (diffKind(d):lower():gsub("^differential_?", "")) end
 
--- no drive through it: switched off (mode disconnected, which BeamNG also forces on a
--- physically disconnected shaft) or broken (shaft.lua and splitShaft.lua pass no torque)
+-- no drive through it: switched off (mode disconnected) or broken (no torque passes)
 local function isDisconnected(d)
   return d.isBroken == true or (type(d.mode) == "string" and d.mode:lower() == "disconnected")
 end
 
--- A shaft that can really be disconnected (part-time 4WD, locking hubs, axle disconnects).
--- Every shaft reports mode "connected", so that alone isn't enough: the shaft must say it
--- can disconnect (canDisconnect, or a list of modes that includes "disconnected"), or be
+-- A shaft that can really be disconnected. Every shaft reports mode "connected", so it must
+-- also say it can disconnect (canDisconnect, or a mode list with "disconnected"), or be
 -- disconnected right now.
 local function modeListHasDisconnect(list)
   if type(list) ~= "table" then return false end
@@ -415,18 +417,12 @@ local function modeListHasDisconnect(list)
 end
 
 local function canDisconnect(dev)
-  -- switched off right now (a broken shaft loses drive but isn't a switchable shaft)
   if type(dev.mode) == "string" and dev.mode:lower() == "disconnected" then return true end
   if dev.canDisconnect == true or dev.canDisconnect == 1 then return true end
   local jd = type(dev.jbeamData) == "table" and dev.jbeamData or {}
   if jd.canDisconnect == true or jd.canDisconnect == 1 then return true end
   return modeListHasDisconnect(dev.availableModes) or modeListHasDisconnect(dev.modes)
       or modeListHasDisconnect(jd.availableModes) or modeListHasDisconnect(jd.modes)
-end
-
-local function couplingKind(dev)
-  if type(dev.mode) == "string" and canDisconnect(dev) then return "dog" end
-  return nil
 end
 
 local function childList(dev)
@@ -438,15 +434,13 @@ local function childList(dev)
 end
 
 local function buildDriveGraph(sources, wheelIdxByName, fwd, right)
-  local nodes, visited = {}, {}
+  local nodes, visited, srcIndex = {}, {}, {}
+  for si, s in ipairs(sources) do if s.dev then srcIndex[s.dev] = si end end
   local function add(n) nodes[#nodes + 1] = n; return #nodes end
-
-  -- link = { cps = { {kind, dev}, ... }, path = { devices between the parent node and here } }
   local function extend(link, dev)
     local nl = { cps = { unpack(link.cps) }, path = { unpack(link.path) } }
     nl.path[#nl.path + 1] = dev
-    local ck = couplingKind(dev)
-    if ck then nl.cps[#nl.cps + 1] = { kind = ck, dev = dev } end
+    if type(dev.mode) == "string" and canDisconnect(dev) then nl.cps[#nl.cps + 1] = { kind = "dog", dev = dev } end
     return nl
   end
   local function newLink() return { cps = {}, path = {} } end
@@ -460,50 +454,73 @@ local function buildDriveGraph(sources, wheelIdxByName, fwd, right)
       add({ k = "wheel", w = wi, p = parent, cps = l.cps, path = l.path, name = dev.name })
       return
     end
-    local kids = childList(dev)
     local here, childLink, sawGb = parent, nil, sawGearbox
-    if not sawGearbox and isGearbox(dev) then
+    if srcIndex[dev] then
+      -- a motor partway down another source's driveline: drawn as its own source, fed by it
+      here = add({ k = "src", si = srcIndex[dev], p = parent, cps = link.cps, path = link.path, dev = dev, name = dev.name })
+      childLink, sawGb = newLink(), false
+    elseif not sawGearbox and isGearbox(dev) then
       here = add({ k = "gb", sub = devType(dev), p = parent, cps = link.cps, path = link.path, dev = dev, name = dev.name })
       childLink, sawGb = newLink(), true
     elseif isDifferential(dev) and not isDually(dev) then
       here = add({ k = "diff", p = parent, cps = link.cps, path = link.path, dev = dev, name = dev.name })
       childLink = newLink()
     else
-      childLink = extend(link, dev)   -- shafts, clutches, torsion reactors, dually diffs, ...
+      childLink = extend(link, dev)
     end
-    for _, c in ipairs(kids) do walk(c, here, childLink, depth + 1, sawGb) end
+    for _, c in ipairs(childList(dev)) do walk(c, here, childLink, depth + 1, sawGb) end
   end
 
-  for si, s in ipairs(sources) do
-    if s.dev then
+  -- true roots first, so a motor fed by another source is reached from it rather than drawn
+  -- as a separate, unconnected root
+  local order = {}
+  for si, s in ipairs(sources) do if s.dev then order[#order + 1] = si end end
+  table.sort(order, function(a, b)
+    local pa = type(sources[a].dev.parent) == "table" and 1 or 0
+    local pb = type(sources[b].dev.parent) == "table" and 1 or 0
+    if pa ~= pb then return pa < pb end
+    return a < b
+  end)
+  for _, si in ipairs(order) do
+    local s = sources[si]
+    if not visited[s.dev] then
       visited[s.dev] = true
       local root = add({ k = "src", si = si, p = 0, cps = {}, path = {}, name = s.dev.name, dev = s.dev })
       for _, c in ipairs(childList(s.dev)) do walk(c, root, newLink(), 1, false) end
     end
   end
 
-  -- prune branches that never reach a wheel (hydraulic pumps, power take-offs)
+  -- prune branches that never reach a wheel
   local reaches = {}
   for idx = #nodes, 1, -1 do
     local n = nodes[idx]
-    if n.k == "wheel" or n.k == "src" then reaches[idx] = reaches[idx] or (n.k == "wheel") end
+    if n.k == "wheel" then reaches[idx] = true end
     if reaches[idx] and n.p > 0 then reaches[n.p] = true end
   end
   local keep, newIndex = {}, {}
   for idx, n in ipairs(nodes) do
-    if n.k == "src" or reaches[idx] then
+    if (n.k == "src" and n.p == 0) or reaches[idx] then
       keep[#keep + 1] = n; newIndex[idx] = #keep
       n.p = n.p > 0 and (newIndex[n.p] or 0) or 0
     end
   end
   nodes = keep
 
-  -- Physical positions where the vehicle's structure names them; the app places the rest.
+  -- the first gearbox under each source, for traction control acting on it (some hybrids)
+  for _, n in ipairs(nodes) do
+    if n.k == "gb" then
+      local m = nodes[n.p]
+      while m and m.k ~= "src" do m = nodes[m.p] end
+      if m and sources[m.si] and not sources[m.si].gbDev then sources[m.si].gbDev = n.dev end
+    end
+  end
+
+  -- physical positions where the vehicle's structure names them; the app places the rest
   local gx, gy = groupCentroid(fwd, right, { "transmission", "gearbox", "transaxle" }, { "mount", "tunnel", "cover", "cooler" })
   local tx, ty = groupCentroid(fwd, right, { "transfercase", "transfer_case" }, { "mount", "cover" })
   local gbDone, tcDone = false, false
   local wheelsUnder = {}
-  for idx = #nodes, 1, -1 do   -- children come after parents, so walk backwards
+  for idx = #nodes, 1, -1 do
     local n = nodes[idx]
     wheelsUnder[idx] = wheelsUnder[idx] or {}
     if n.k == "wheel" then wheelsUnder[idx][#wheelsUnder[idx] + 1] = n.w end
@@ -518,7 +535,7 @@ local function buildDriveGraph(sources, wheelIdxByName, fwd, right)
     elseif n.k == "diff" and tx and not tcDone then
       local y0, y1 = math.huge, -math.huge
       for _, w in ipairs(wheelsUnder[idx]) do
-        if layout[w] then y0, y1 = math.min(y0, layout[w].y), math.max(y1, layout[w].y) end
+        if lay.wheels[w] then y0, y1 = math.min(y0, lay.wheels[w].y), math.max(y1, lay.wheels[w].y) end
       end
       if y1 - y0 > 0.35 then n.gx, n.gy, tcDone = tx, ty, true end   -- spans axles: centre diff
     end
@@ -526,16 +543,12 @@ local function buildDriveGraph(sources, wheelIdxByName, fwd, right)
   return nodes
 end
 
--- ===========================================================================
-
 local function mapDrivetrain(fwd, right)
   local result = { sources = {}, driven = {} }
   local wheelIdxByName = {}
   forEachWheel(function(i, w) if w.name then wheelIdxByName[w.name] = i end end)
-
   local devices = (powertrain and powertrain.getDevices) and powertrain.getDevices() or {}
   local usedEngineGroup = false
-
   for _, d in pairs(devices) do
     if type(d) == "table" and isPowerSource(d) then
       local drivenSet = {}
@@ -543,40 +556,28 @@ local function mapDrivetrain(fwd, right)
       local wheelList = {}
       for i in pairs(drivenSet) do wheelList[#wheelList + 1] = i; result.driven[i] = true end
       table.sort(wheelList)
-
-      local isElectric = (type(d.type) == "string" and d.type:lower():find("electric")) and true or false
+      local isElectric = devType(d):lower():find("electric") ~= nil
       local x, y = sourcePosition(d, fwd, right)
       local estimated = false
       if not x and not isElectric and not usedEngineGroup then
-        x, y = engineGroupCentroid(fwd, right)
+        x, y = groupCentroid(fwd, right, { "engine" }, { "bay", "mount", "hood", "cover" })
         usedEngineGroup = x ~= nil
       end
-      if not x then
-        -- last resort: centre of the wheels it drives
+      if not x then   -- last resort: centre of the wheels it drives
         estimated = true
         local sx, sy, n = 0, 0, 0
         for _, i in ipairs(wheelList) do
-          if layout[i] then sx, sy, n = sx + layout[i].x, sy + layout[i].y, n + 1 end
+          if lay.wheels[i] then sx, sy, n = sx + lay.wheels[i].x, sy + lay.wheels[i].y, n + 1 end
         end
         if n > 0 then x, y = sx / n, sy / n end
       end
-
       if x then
-        result.sources[#result.sources + 1] = {
-          x = x, y = y,
-          kind = isElectric and "ev" or "ice",
-          est = estimated,
-          wheels = wheelList,
-          dev = d,
-        }
+        result.sources[#result.sources + 1] = { x = x, y = y, kind = isElectric and "ev" or "ice", est = estimated, wheels = wheelList, dev = d }
       end
     end
   end
-
-  -- Only show power sources that drive wheels. Trailers and equipment can carry motors for
-  -- hydraulics, winches or landing gear that would otherwise appear as stray motor symbols.
-  -- Exception: if nothing was found driving wheels (unusual powertrain layout), keep the
-  -- combustion engines so a car never loses its engine block.
+  -- Only sources that drive wheels: trailers and equipment can carry motors for hydraulics,
+  -- winches or landing gear. If nothing drives wheels (odd layout), keep the combustion engines.
   local anyDriving = false
   for _, s in ipairs(result.sources) do if #s.wheels > 0 then anyDriving = true end end
   local kept = {}
@@ -589,15 +590,13 @@ local function mapDrivetrain(fwd, right)
   if not okG then log('W', 'vgsTelemetry', 'drive graph failed: ' .. tostring(graph)) end
   return result
 end
--- ===========================================================================
 
 -- ===== Tyres per wheel =====================================================
--- A dual pair can reach us as two wheels (handled by the UI), or as ONE wheel whose
--- tyre is physically a single wide tyre with dual-tyre visuals. For the second case
--- we look for, in order: an explicit dual flag, a tyre mesh named "dual" on this
+-- A dual pair can reach us as two wheels (the app lays them out), or as ONE wheel standing in
+-- for both. For the second case: an explicit dual flag, a tyre mesh named "dual" on this
 -- wheel's node groups, or a truck-sized tyre much wider than it is tall.
-local DUAL_WIDTH_RATIO = 1.0   -- tyre width / radius above which a big wheel counts as a dual pair
-local DUAL_MIN_RADIUS  = 0.42  -- m; only truck/bus-sized wheels qualify by width
+local DUAL_WIDTH_RATIO = 1.0
+local DUAL_MIN_RADIUS  = 0.42
 
 local function wheelJbeam(i, w)
   local list = v and v.data and v.data.wheels
@@ -626,8 +625,7 @@ local function hasDualFlexbody(groups)
   if type(flexbodies) ~= "table" or not next(groups) then return false end
   for _, fb in pairs(flexbodies) do
     if type(fb) == "table" and type(fb.mesh) == "string" and fb.mesh:lower():find("dual") then
-      local fbGroups = groupSet(fb.group, fb["[group]"])
-      for name in pairs(fbGroups) do
+      for name in pairs(groupSet(fb.group, fb["[group]"])) do
         if groups[name] then return true end
       end
     end
@@ -635,7 +633,7 @@ local function hasDualFlexbody(groups)
   return false
 end
 
--- returns tyre count, wheelOffset (m), reason, radius, tyre width
+-- tyre count, wheelOffset (m), reason, radius, width
 local function tyreInfo(i, w)
   local d = wheelJbeam(i, w) or {}
   local function num(key)
@@ -646,16 +644,12 @@ local function tyreInfo(i, w)
   local radius    = num("radius")
   local tireWidth = num("tireWidth") or num("hubWidth")
   local offset    = num("wheelOffset") or 0
-
-  -- A wheel with no tyre (hasTire = false), such as the Pigeon's stabiliser wheels: it's just
-  -- the hub, so draw it at the hub's size. The tyre radius and width it reports are left over
-  -- from the vehicle's real tyres and would draw it full size.
+  -- a wheel with no tyre (the Pigeon's stabiliser wheels): draw it at the hub's size
   local hasTire = w.hasTire
   if hasTire == nil then hasTire = d.hasTire end
   if hasTire == false or hasTire == 0 then
     return 1, offset, "hub only, no tyre", num("hubRadius") or radius, num("hubWidth") or tireWidth
   end
-
   for _, key in ipairs({ "isDual", "dual", "dualWheel", "dualTire", "dualTyre", "isDualWheel" }) do
     local x = w[key]
     if x == nil then x = d[key] end
@@ -670,560 +664,780 @@ local function tyreInfo(i, w)
   return 1, offset, nil, radius, tireWidth
 end
 
+-- the layout block the app draws from (sent with the frames; see send)
+local function buildStatic(graph)
+  local st = { w = {}, src = {}, dt = {} }
+  for i = 0, wheelCount() - 1 do
+    local L, w = lay.wheels[i], wheels.wheels[i]
+    if L then
+      st.w[#st.w + 1] = {
+        i = i, n = w.name,
+        nt = L.tyres or 1,                              -- tyres this wheel stands for (2 = dual pair)
+        rd = L.radius and round(L.radius, 3) or nil,    -- tyre radius (m)
+        wd = L.width and round(L.width, 3) or nil,      -- width of each tyre (m)
+        x = round(L.x, 3), y = round(L.y, 3),           -- metres right / forward of the reference node
+      }
+    end
+  end
+  for _, s in ipairs(lay.drivetrain.sources) do
+    st.src[#st.src + 1] = { x = round(s.x, 3), y = round(s.y, 3), k = s.kind, e = s.est and 1 or 0, w = s.wheels }
+  end
+  for _, n in ipairs(graph) do
+    local cps = {}
+    for _, c in ipairs(n.cps or {}) do cps[#cps + 1] = { t = c.kind } end
+    st.dt[#st.dt + 1] = {
+      k = n.k, p = n.p, w = n.w, si = n.si and (n.si - 1) or nil, sub = n.sub,
+      dty = (n.k == "diff" and n.dev) and diffTypeName(n.dev) or nil,
+      cp = (#cps > 0) and cps or nil,
+      gx = n.gx and round(n.gx, 3) or nil, gy = n.gy and round(n.gy, 3) or nil,
+    }
+  end
+  if lay.ext then
+    st.ext = { x0 = round(lay.ext.x0, 2), x1 = round(lay.ext.x1, 2), y0 = round(lay.ext.y0, 2), y1 = round(lay.ext.y1, 2) }
+  end
+  if lay.cgy then st.cg = { x = round(lay.cgx, 3), y = round(lay.cgy, 3) } end
+  if lay.mass then st.m = math.floor(lay.mass + 0.5) end
+  if #st.w == 0 then st.w = nil end
+  return st
+end
+
 local function captureLayout(fwd, right, steeringCentred)
-  layout, state = {}, {}
+  lay.wheels, wstate = {}, {}
   forEachWheel(function(i, w)
-    local yaw, mid = axleYaw(w, fwd, right)
+    local yaw, p1, p2 = axleYaw(w, fwd, right)
+    local mid = (p1 + p2) * 0.5
     local okT, tyres, offset, _, radius, width = pcall(tyreInfo, i, w)
     if not okT then tyres, offset, radius, width = 1, 0, nil, nil end
-    local axle = obj:getNodePosition(w.node2) - obj:getNodePosition(w.node1)
+    local axle = p2 - p1
     local axleLen = axle:length()
     local x = mid:dot(right)
-    if offset ~= 0 and axleLen > 1e-3 then
-      -- wheelOffset shifts the tyre along the axle (node1 -> node2) from the axle-node midpoint
-      x = x + offset * axle:dot(right) / axleLen
-    end
-    -- real tyre size: diameter from the radius, width from the tyre (BeamNG's own default
-    -- for a missing width is the distance between the axle nodes)
+    if offset ~= 0 and axleLen > 1e-3 then x = x + offset * axle:dot(right) / axleLen end
     radius = radius or ((type(w.radius) == "number" and w.radius > 0.05) and w.radius or nil)
     width = width or ((axleLen > 0.02) and axleLen or nil)
-    if width and tyres > 1 and radius and width > radius * 0.9 then
-      width = width / tyres * 0.92   -- one wide tyre standing in for a dual pair: split it
-    end
-    layout[i] = {
-      x = x,
-      y = mid:dot(fwd),
-      tyres = tyres,
-      radius = radius,
-      width = width,
-      -- removes static toe so straight-ahead reads as 0
-      steerBase = steeringCentred and yaw or 0,
-      n1 = w.node1, n2 = w.node2,   -- hub nodes, for each axle's direction of travel
+    if width and tyres > 1 and radius and width > radius * 0.9 then width = width / tyres * 0.92 end
+    local pg = nil
+    if w.pressureGroup and v and v.data and type(v.data.pressureGroups) == "table" then pg = v.data.pressureGroups[w.pressureGroup] end
+    lay.wheels[i] = {
+      x = x, y = mid:dot(fwd), tyres = tyres, radius = radius, width = width,
+      steerBase = steeringCentred and yaw or 0,   -- removes static toe so straight-ahead reads 0
+      centred = steeringCentred,                  -- false: snap steerBase the first time the steering is centred
+      n1 = w.node1, n2 = w.node2, wheelID = w.wheelID, pgroup = pg,
     }
-    state[i] = { grip = 0, sliding = false, fzAvg = math.max(w.downForceRaw or w.downForce or 0, 0) }
+    wstate[i] = { grip = 0, sliding = false, severity = 0, fzAvg = math.max(w.downForceRaw or w.downForce or 0, 0) }
   end)
 
-  -- Centre of the frontmost axle: where the direction of travel is measured, so it lines up
-  -- with the steered wheels when they grip. And the centre of the wheels in the rear half
-  -- (the middle of a tandem), for the understeer / oversteer balance.
-  frontAxle, rearAxle = nil, nil
+  -- The frontmost axle (where the marker is measured) and the wheels in the rear half (the
+  -- middle of a tandem), for the balance. Each keeps its hub nodes and their recent positions.
+  lay.front, lay.rear = nil, nil
   local maxY, minY = -math.huge, math.huge
-  for _, L in pairs(layout) do maxY = math.max(maxY, L.y); minY = math.min(minY, L.y) end
+  for _, L in pairs(lay.wheels) do maxY = math.max(maxY, L.y); minY = math.min(minY, L.y) end
   if maxY > -math.huge then
-    local sx, sy, n = 0, 0, 0
-    local nodes = {}
-    for _, L in pairs(layout) do
+    local sx, sy, n, nodes = 0, 0, 0, {}
+    for _, L in pairs(lay.wheels) do
       if L.y > maxY - 0.3 then
         sx, sy, n = sx + L.x, sy + L.y, n + 1
         nodes[#nodes + 1] = L.n1; nodes[#nodes + 1] = L.n2
       end
     end
-    frontAxle = { x = sx / n, y = sy / n, nodes = nodes, hist = {} }
+    lay.front = { x = sx / n, y = sy / n, nodes = nodes, ring = newRing(64) }
     if maxY - minY > 0.5 then
       local cut = (maxY + minY) / 2
-      sx, sy, n = 0, 0, 0
-      local rnodes = {}
-      for _, L in pairs(layout) do
+      sx, sy, n, nodes = 0, 0, 0, {}
+      for _, L in pairs(lay.wheels) do
         if L.y < cut then
           sx, sy, n = sx + L.x, sy + L.y, n + 1
-          rnodes[#rnodes + 1] = L.n1; rnodes[#rnodes + 1] = L.n2
+          nodes[#nodes + 1] = L.n1; nodes[#nodes + 1] = L.n2
         end
       end
-      if n > 0 then rearAxle = { x = sx / n, y = sy / n, cut = cut, nodes = rnodes, hist = {} } end
+      if n > 0 then lay.rear = { x = sx / n, y = sy / n, cut = cut, nodes = nodes, ring = newRing(64) } end
     end
   end
 
-  -- Footprint of the whole vehicle from every node, so a trailer's box is as long as the
-  -- trailer, not just the stretch between its wheels.
-  bodyExtent = nil
+  -- footprint of the whole vehicle, its mass and centre of gravity
+  lay.ext, lay.mass, lay.cgx, lay.cgy = nil, nil, nil, nil
   if v and v.data and type(v.data.nodes) == "table" then
-    local x0, x1, y0, y1 = math.huge, -math.huge, math.huge, -math.huge
+    local x0, x1, y0, y1, mass = math.huge, -math.huge, math.huge, -math.huge, 0
     for cid, node in pairs(v.data.nodes) do
       local id = type(node) == "table" and (node.cid or cid) or nil
       if type(id) == "number" then
-        local okP, p = pcall(function() return obj:getNodePosition(id) end)
+        local okP, p = pcall(obj.getNodePosition, obj, id)
         if okP and p then
           local x, y = p:dot(right), p:dot(fwd)
           x0, x1 = math.min(x0, x), math.max(x1, x)
           y0, y1 = math.min(y0, y), math.max(y1, y)
         end
+        if obj.getNodeMass then
+          local okM, m = pcall(obj.getNodeMass, obj, id)
+          if okM and type(m) == "number" then mass = mass + m end
+        end
       end
     end
-    if x0 < x1 and y0 < y1 then bodyExtent = { x0 = x0, x1 = x1, y0 = y0, y1 = y1 } end
+    if x0 < x1 and y0 < y1 then lay.ext = { x0 = x0, x1 = x1, y0 = y0, y1 = y1 } end
+    if mass > 1 then lay.mass = mass end
+  end
+  if obj.calcCenterOfGravity then
+    local okC, cg = pcall(obj.calcCenterOfGravity, obj)
+    if okC and type(cg) ~= "number" and cg then
+      local rel = cg - obj:getPosition()
+      lay.cgx, lay.cgy = rel:dot(right), rel:dot(fwd)
+    end
   end
 
-  -- BeamNG's newer driving-dynamics assists, when the vehicle has them (named as in its jbeam)
-  assistControllers = {}
+  -- BeamNG's driving-dynamics assists, when the vehicle has them (named as in its jbeam)
+  lay.assists = {}
   if controller and controller.getController then
     for key, name in pairs({ tc = "tractionControl", yc = "yawControl", brake = "brakeControl", motor = "motorTorqueControl" }) do
       local okC, c = pcall(controller.getController, name)
-      if okC and type(c) == "table" and (c.isActing ~= nil or c.isActingAsYC ~= nil) then assistControllers[key] = c end
+      if okC and type(c) == "table" and (c.isActing ~= nil or c.isActingAsYC ~= nil) then lay.assists[key] = c end
     end
   end
 
   local ok, dt = pcall(mapDrivetrain, fwd, right)
-  drivetrain = ok and dt or { sources = {}, driven = {} }
+  lay.drivetrain = ok and dt or { sources = {}, driven = {}, graph = {} }
   if not ok then log('W', 'vgsTelemetry', 'drivetrain map failed: ' .. tostring(dt)) end
+
+  local okS, st = pcall(buildStatic, lay.drivetrain.graph or {})
+  lay.static = okS and st or { w = {} }
+  if not okS then log('W', 'vgsTelemetry', 'layout block failed: ' .. tostring(st)) end
+  tx.lv = tx.lv + 1
+  tx.staticDue, tx.keyFrames = true, 3   -- send the new layout with the next few updates
+  -- per-wheel output tables, reused from here on
+  out.w, out.src, out.dg = {}, {}, {}
+  for i = 0, wheelCount() - 1 do if lay.wheels[i] then out.w[#out.w + 1] = { i = i } end end
+  for k = 1, #lay.drivetrain.sources do out.src[k] = {} end
+  for k = 1, #(lay.drivetrain.graph or {}) do out.dg[k] = 0 end
 end
 
 local function resetState()
-  drivetrain, everDriven, nodeCidByName = nil, {}, nil
-  layout, state = nil, {}
-  layoutWait, sendTimer = 0, 0
-  lastVel, latAccel, lonAccel = nil, 0, 0
-  velHist, histTime, gLat, gLon = {}, 0, 0, 0
-  lastFwd, lastRight, yawRate, travelAng, lockAngle, frontAxle = nil, nil, 0, 0, LOCK_DEFAULT, nil
-  est = { kn = 0, kd = 0, cal = 1, rn = 0, rd = 0, ratio = nil }
-  yawCheck = 0
-  rearTravel, balance, rearAxle = 0, 0, nil
+  lay.wheels, lay.static, lay.drivetrain, lay.front, lay.rear, lay.wait = nil, nil, nil, nil, nil, 0
+  everDriven, nodeCidByName, wstate = {}, nil, {}
+  kin.latAccel, kin.gx, kin.gy, kin.gdx, kin.gdy, kin.gInit = 0, 0, 0, 0, 0, false
+  kin.yawRate, kin.yawCheck, kin.lastFwd, kin.lastRight, kin.travel, kin.rearTravel = 0, 0, nil, nil, 0, 0
+  kin.vring = newRing(128)
+  est.kn, est.kd, est.cal, est.rn, est.rd, est.ratio, est.lock = 0, 0, 1, 0, 0, nil, LOCK_DEFAULT
+  est.balance, est.frontSteer, est.rearSteer, est.slipF, est.slipR, est.shown = 0, nil, 0, nil, nil, nil
+  out.inp, out.vd = {}, {}
+  tx.since, tx.sinceStatic, tx.sincePing, tx.staticDue = 0, math.huge, math.huge, true
 end
 
-local function coupledList()
-  local list = {}
-  for id in pairs(coupled) do list[#list + 1] = id end
-  return list
-end
+-- ===== Per-frame update ====================================================
 
-local function buildPayload(fwd, right, speed)
-  local ev = electrics.values
-  local throttle = ev.throttle or 0
-  local wheelsOut = {}
-
-
-  -- Live drive graph: each differential's lock state, shafts that are disconnected right now
-  -- (e.g. part-time 4WD in 2WD, unlocked hubs), and which wheels are actually connected to
-  -- a power source.
-  local graph = drivetrain and drivetrain.graph or {}
-  local graphOut, liveDriven, live = {}, {}, {}
-  for idx, n in ipairs(graph) do
-    local dc, cps = false, {}
-    for _, c in ipairs(n.cps or {}) do
-      local open = isDisconnected(c.dev)
-      if open then dc = true end
-      cps[#cps + 1] = { t = c.kind, o = open and 1 or nil }
-    end
-    -- a broken shaft anywhere on the link, or a broken part here, passes no drive either
-    for _, d in ipairs(n.path or {}) do if d.isBroken == true then dc = true end end
-    if n.dev and n.dev.isBroken == true then dc = true end
-    live[idx] = (n.p == 0) or (live[n.p] and not dc) or false
-    if n.k == "wheel" and live[idx] then liveDriven[n.w] = true end
-    graphOut[idx] = {
-      -- si: which entry of `src` this engine is, counted from 0 like the app's arrays
-      k = n.k, p = n.p, w = n.w, si = n.si and (n.si - 1) or nil, sub = n.sub,
-      st = (n.k == "diff" and n.dev) and diffState(n.dev) or nil,   -- open / lsd / locked
-      dty = (n.k == "diff" and n.dev) and diffTypeName(n.dev) or nil,
-      cp = (#cps > 0) and cps or nil,   -- disconnectable shaft on the link from the parent
-      dc = dc and 1 or nil,              -- that link is disconnected
-      gx = n.gx and round(n.gx, 3) or nil, gy = n.gy and round(n.gy, 3) or nil,   -- physical position
-    }
+-- G-force: least-squares slope of the velocity over GF_WINDOW, then a One Euro filter.
+local function lpAlpha(cutoff, dt) return 1 / (1 + 1 / (2 * math.pi * cutoff * dt)) end
+local function updateAccel(dt, vel, fwd, right)
+  local r = kin.vring
+  local s = ringNext(r)
+  s.t, s.x, s.y, s.z = clock, vel.x, vel.y, vel.z
+  -- least-squares slope of each velocity component against time over the window
+  local t0 = clock - GF_WINDOW
+  local n, st, sx, sy, sz = 0, 0, 0, 0, 0
+  local idx = r.head
+  for _ = 1, r.count do
+    local q = r.s[idx]
+    if q.t < t0 - 1e-9 then break end
+    n, st, sx, sy, sz = n + 1, st + q.t, sx + q.x, sy + q.y, sz + q.z
+    idx = (idx - 2) % r.n + 1
   end
-  local hasGraph = #graph > 0
+  if n < 3 then return end
+  local tm, xm, ym, zm = st / n, sx / n, sy / n, sz / n
+  local stt, stx, sty, stz = 0, 0, 0, 0
+  idx = r.head
+  for _ = 1, n do
+    local q = r.s[idx]
+    local d = q.t - tm
+    stt, stx, sty, stz = stt + d * d, stx + d * (q.x - xm), sty + d * (q.y - ym), stz + d * (q.z - zm)
+    idx = (idx - 2) % r.n + 1
+  end
+  if stt < 1e-9 then return end
+  local ax, ay, az = stx / stt, sty / stt, stz / stt
+  local aLat = ax * right.x + ay * right.y + az * right.z
+  local aLon = ax * fwd.x + ay * fwd.y + az * fwd.z
+  kin.latAccel = kin.latAccel + (aLat - kin.latAccel) * clamp(dt * ACCEL_SMOOTH_HZ, 0, 1)
+  local x, y = aLat / G, aLon / G
+  if not kin.gInit then kin.gx, kin.gy, kin.gInit = x, y, true return end
+  local ad = lpAlpha(GF_D_CUTOFF, dt)
+  kin.gdx = kin.gdx + ((x - kin.gx) / dt - kin.gdx) * ad
+  kin.gdy = kin.gdy + ((y - kin.gy) / dt - kin.gdy) * ad
+  local a = lpAlpha(GF_MIN_CUTOFF + GF_BETA * math.sqrt(kin.gdx * kin.gdx + kin.gdy * kin.gdy), dt)
+  kin.gx = kin.gx + (x - kin.gx) * a
+  kin.gy = kin.gy + (y - kin.gy) * a
+end
 
-  local frontSteerSum, frontSteerN, rearSteerSum, rearSteerN = 0, 0, 0, 0
-  local centreNow = math.abs(tonumber(ev.steering_input) or 0) < 0.004 and math.abs(yawRate) < 0.03 and speed > 3
+-- Yaw rate (+ = turning left) from the physics (the value BeamNG's own ESC uses), checked
+-- against the change in heading for its sign; the heading change is the fallback.
+local function updateYaw(dt, fwd, right)
+  local headYaw = nil
+  if kin.lastFwd then headYaw = math.atan2(-fwd:dot(kin.lastRight), fwd:dot(kin.lastFwd)) / dt end
+  kin.lastFwd, kin.lastRight = fwd, right
+  local physYaw = nil
+  if obj.getYawAngularVelocity then
+    local okY, y = pcall(obj.getYawAngularVelocity, obj)
+    if okY and type(y) == "number" and y == y then physYaw = -y end
+  end
+  local raw = headYaw
+  if physYaw then
+    if headYaw then
+      kin.yawCheck = kin.yawCheck + (kin.yawSign * physYaw * headYaw - kin.yawCheck) * clamp(dt * 0.5, 0, 1)
+      if kin.yawCheck < -0.01 then kin.yawSign, kin.yawCheck = -kin.yawSign, -kin.yawCheck end
+    end
+    raw = kin.yawSign * physYaw
+  end
+  if raw then kin.yawRate = kin.yawRate + (raw - kin.yawRate) * clamp(dt * YAW_SMOOTH_HZ, 0, 1) end
+  kin.physYaw, kin.headYaw = physYaw, headYaw
+end
 
-  -- Driver assists, read straight from what the vehicle reports, and only when it reports
-  -- having that assist. Two systems are covered:
-  --  * the classic ESC script: the electrics flags absActive / tcsActive / escActive;
-  --  * BeamNG's newer driving-dynamics electronics (the Vivace and others): separate
-  --    supervisors that say exactly what they're doing. tractionControl.isActing and
-  --    yawControl.isActing (ESC); and the parts that carry it out, motorTorqueControl (cuts
-  --    engine power) and brakeControl (brakes wheels), each with isActingAsTC / isActingAsYC /
-  --    isActingAsABS. On these cars ESC often works by cutting power, e.g. holding a car on
-  --    full lock and full throttle on ice, with tcsActive staying false.
-  -- What's shown:
-  --  * ABS (needs hasABS): the brake arc pulses while ABS works, and each wheel's own absActive
-  --    flag puts a red dot by it. Only while the brake is applied.
-  --  * Power being cut, by traction control or by ESC (needs hasTCS / hasESC): the throttle
-  --    arc pulses.
-  --  * ESC braking (needs hasESC): a blue dot by each wheel braked harder than the pedals ask.
-  -- Nothing is held or averaged: each update shows that moment.
+-- Direction an axle is moving (+ = left of where the car points), all the way round: how far
+-- its hub nodes moved over the last TRAVEL_WINDOW against the car's heading over that time
+-- (averaging out the hubs' vibration). If the nodes can't be read: the body's velocity plus
+-- the yaw rate's share at the axle.
+local function hubMotion(axle, origin, fwd, right)
+  local nodes = axle.nodes
+  if not nodes or #nodes == 0 then return nil end
+  local sx, sy, sz = 0, 0, 0
+  for _, cid in ipairs(nodes) do
+    local q = obj:getNodePosition(cid)
+    sx, sy, sz = sx + q.x, sy + q.y, sz + q.z
+  end
+  local n = #nodes
+  local s = ringNext(axle.ring)
+  s.t = clock
+  s.px, s.py, s.pz = origin.x + sx / n, origin.y + sy / n, origin.z + sz / n
+  s.fx, s.fy, s.fz, s.rx, s.ry, s.rz = fwd.x, fwd.y, fwd.z, right.x, right.y, right.z
+  local o = ringFind(axle.ring, clock - TRAVEL_WINDOW)
+  local span = clock - o.t
+  if span < TRAVEL_WINDOW * 0.3 then return nil end
+  local vx, vy, vz = (s.px - o.px) / span, (s.py - o.py) / span, (s.pz - o.pz) / span
+  local fx, fy, fz = s.fx + o.fx, s.fy + o.fy, s.fz + o.fz   -- heading across the window
+  local rx, ry, rz = s.rx + o.rx, s.ry + o.ry, s.rz + o.rz
+  local fl, rl = math.sqrt(fx * fx + fy * fy + fz * fz), math.sqrt(rx * rx + ry * ry + rz * rz)
+  if fl < 1e-6 or rl < 1e-6 then return nil end
+  return (vx * rx + vy * ry + vz * rz) / rl, (vx * fx + vy * fy + vz * fz) / fl
+end
+
+local function axleTravel(axle, current, tag, vel, origin, fwd, right, k)
+  local yx = vel:dot(right) - kin.yawRate * axle.y   -- from the yaw rate: sideways, + = right
+  local yy = vel:dot(fwd) + kin.yawRate * axle.x     -- forwards
+  local ok, vx, vy = pcall(hubMotion, axle, origin, fwd, right)
+  if not ok then vx, vy = nil, nil end
+  diag[tag .. "Yaw"] = math.atan2(-yx, yy)
+  diag[tag .. "Hub"] = vx and math.atan2(-vx, vy) or nil
+  if not vx then vx, vy = yx, yy end
+  if vx * vx + vy * vy < 0.09 then return current end   -- barely moving: keep the last value
+  -- step the short way round, so the angle stays continuous past +-180
+  local a = current + wrapAngle(math.atan2(-vx, vy) - current) * k
+  if a > 1.5 * math.pi then a = a - 2 * math.pi elseif a < -1.5 * math.pi then a = a + 2 * math.pi end
+  return a
+end
+
+-- Driver-assist context for this frame. Two systems are covered:
+--  * the classic ESC script: electrics absActive / tcsActive / escActive;
+--  * BeamNG's driving-dynamics electronics (the Vivace and others): tractionControl and
+--    yawControl say whether they're acting; motorTorqueControl (power) and brakeControl
+--    (brakes) carry it out, each with isActingAsTC / isActingAsYC / isActingAsABS.
+-- Only assists the vehicle reports having are shown. Nothing is held: each update is that moment.
+local ax = {}
+local function updateAssists(ev)
+  local dd = lay.assists or {}
   local function present(hasKey, activeKey)
     if ev[hasKey] ~= nil then return truthy(ev[hasKey]) end
     return ev[activeKey] ~= nil
   end
   local function acting(c, key) return c ~= nil and c[key] == true end
-  local dd = assistControllers or {}
-  local hasABS = truthy(ev.hasABS)
-  local hasTCS = present("hasTCS", "tcsActive") or dd.tc ~= nil
-  local hasESC = present("hasESC", "escActive") or dd.yc ~= nil
-  local brakeIn = clamp(tonumber(ev.brake) or 0, 0, 1)
-  local parkIn  = clamp(tonumber(ev.parkingbrake) or 0, 0, 1)
-  local brakeOn = brakeIn > 0
-  -- electrics.abs is the dashboard light's blink; absActive is the real state. The per-wheel
-  -- check below also catches the driving-dynamics ABS, which sets neither (its isActingAsABS
-  -- only reflects the last wheel it processed).
-  local absOn = hasABS and brakeOn and truthy(ev.absActive)
-  local tcsOn = hasTCS and (truthy(ev.tcsActive) or acting(dd.tc, "isActing"))
-  local escOn = hasESC and (truthy(ev.escActive) or acting(dd.yc, "isActing"))
+  ax.hasABS = truthy(ev.hasABS)
+  ax.hasTCS = present("hasTCS", "tcsActive") or dd.tc ~= nil
+  ax.hasESC = present("hasESC", "escActive") or dd.yc ~= nil
+  ax.brakeIn = clamp(tonumber(ev.brake) or 0, 0, 1)
+  ax.parkIn = clamp(tonumber(ev.parkingbrake) or 0, 0, 1)
+  ax.brakeOn = ax.brakeIn > 0
+  -- electrics.abs is the dash light's blink; absActive is the real state. The per-wheel check
+  -- also catches the driving-dynamics ABS, which sets neither.
+  ax.absOn = ax.hasABS and ax.brakeOn and truthy(ev.absActive)
+  ax.tcsOn = ax.hasTCS and (truthy(ev.tcsActive) or acting(dd.tc, "isActing"))
+  ax.escOn = ax.hasESC and (truthy(ev.escActive) or acting(dd.yc, "isActing"))
   -- power cut by an assist: traction control, or ESC working through the engine
-  local powerCut = tcsOn or (hasESC and acting(dd.motor, "isActingAsYC"))
+  ax.powerCut = ax.tcsOn or (ax.hasESC and acting(dd.motor, "isActingAsYC"))
   -- ESC braking wheels: the classic script, or the driving-dynamics brake part doing it for ESC
-  local escBraking = escOn and (dd.brake == nil or acting(dd.brake, "isActingAsYC"))
-  -- traction control braking wheels. It handles one spinning wheel (say the inside wheel in a
-  -- corner) by braking it, and only cuts engine power once every driven wheel spins, so this is
-  -- often the only thing it's doing. Classic script: its tcsActive flag, while ESC isn't acting
-  -- (with both, it holds its brakes and ESC's take over). Driving-dynamics: the brake part
-  -- acting for traction control, or the traction-control supervisor while that part brakes.
-  local tcBraking = hasTCS and ((dd.brake == nil and tcsOn and not escOn)
+  ax.escBraking = ax.escOn and (dd.brake == nil or acting(dd.brake, "isActingAsYC"))
+  -- Traction control braking a spinning wheel (it only cuts power once every driven wheel
+  -- spins, so this is often all it's doing). Classic: tcsActive while ESC isn't acting.
+  -- Driving dynamics: the brake part acting for it, or the supervisor while that part brakes.
+  ax.tcBraking = ax.hasTCS and ((dd.brake == nil and ax.tcsOn and not ax.escOn)
     or (dd.brake ~= nil and (acting(dd.brake, "isActingAsTC") or acting(dd.tc, "isActing"))))
-  local tcBraked = {}   -- [wheel id] = traction control is braking it
+  ax.drivingDynamics = dd.tc ~= nil or dd.yc ~= nil or dd.brake ~= nil or dd.motor ~= nil
+  ax.throttleOn = (tonumber(ev.throttle) or 0) > 0.01
+  ax.tcCause = dd.motor == nil or acting(dd.motor, "isActingAsTC") or acting(dd.tc, "isActing")
+end
 
-  -- Traction control cutting power, per engine or motor. Each one multiplies its throttle by a
-  -- throttle factor (combustionEngine.lua, electricMotor.lua): the electrics value it names
-  -- (electricsThrottleFactorName, normally "throttleFactor") if set, otherwise its own
-  -- device.throttleFactor. Only traction control and ESC ever lower it:
-  --  * the classic ESC script's traction control writes the electrics value, and snaps it back
-  --    to exactly 1 once the cut is under 5 %, so below 1 is a real cut;
-  --  * the driving-dynamics motorTorqueControl sets device.throttleFactor to the lower of its
-  --    traction-control and ESC factors, so a cut only counts as traction control while that
-  --    part (or the traction-control supervisor) says it's acting for traction control.
-  -- Counted only while you're on the throttle (with none, there's no power to cut).
-  -- Where it's shown: classic traction control on the engine; the driving-dynamics kind, which
-  -- works per wheel group, by each wheel it acts on (braked, or driven by a motor it's cutting).
-  local drivingDynamics = dd.tc ~= nil or dd.yc ~= nil or dd.brake ~= nil or dd.motor ~= nil
-  local throttleOn = (tonumber(ev.throttle) or 0) > 0.01
-  local tcCause = dd.motor == nil or acting(dd.motor, "isActingAsTC") or acting(dd.tc, "isActing")
-  local srcCut, cutWheel, anyCut = {}, {}, false   -- anyCut: traction control intervening anywhere (pulses the throttle arc)
-  for si, s in ipairs(drivetrain and drivetrain.sources or {}) do
-    local d = s.dev
-    local factor = 1
+-- Traction control cutting power, per engine or motor. Each multiplies its throttle by a factor:
+-- the electrics value it names (electricsThrottleFactorName) if set, else its own
+-- throttleFactor; some hybrids apply it to their gearbox instead. Only traction control and
+-- ESC lower it: the classic script snaps it back to exactly 1 under a 5 % cut, and the
+-- driving-dynamics motorTorqueControl sets the lower of its TC and ESC factors (so it only
+-- counts as traction control while that part says so). Only while on the throttle.
+local srcCut, cutWheel = {}, {}
+local function updateSourceCuts(ev)
+  for k in pairs(cutWheel) do cutWheel[k] = nil end
+  ax.anyCut, ax.minFactor = false, 1
+  for si, s in ipairs(lay.drivetrain.sources) do
+    local d, factor = s.dev, 1
     if type(d) == "table" then
-      factor = tonumber(ev[d.electricsThrottleFactorName or "throttleFactor"]) or tonumber(d.throttleFactor) or 1
+      local name = d.electricsThrottleFactorName
+      factor = (type(name) == "string" and tonumber(ev[name])) or tonumber(d.throttleFactor) or 1
+      if type(s.gbDev) == "table" and tonumber(s.gbDev.throttleFactor) then
+        factor = math.min(factor, tonumber(s.gbDev.throttleFactor))
+      end
     end
-    local cut = hasTCS and throttleOn and tcCause and factor < 0.999
+    local cut = ax.hasTCS and ax.throttleOn and ax.tcCause and factor < 0.999
     if cut then
-      anyCut = true
+      ax.anyCut = true
       for _, wi in ipairs(s.wheels or {}) do cutWheel[wi] = true end
     end
-    srcCut[si] = { factor = factor, cut = cut }
+    ax.minFactor = math.min(ax.minFactor, factor)
+    local c = srcCut[si] or {}
+    c.factor, c.cut = factor, cut
+    srcCut[si] = c
   end
-  forEachWheel(function(i, w)
-    local L, S = layout[i], state[i]
-    if not L or not S then return end
+end
 
-    local fz       = w.downForceRaw or w.downForce or 0
-    local radius   = (w.radius and w.radius > 0.05) and w.radius or 0.3
-    local drive    = w.propulsionTorque or 0
-    local brake    = math.abs(w.brakingTorque or 0)
-    local brakeMax = w.brakeTorque or 0
-    local slip     = math.abs(w.lastSlip or 0)
-    local broken   = w.isBroken and true or false
-    local airborne = broken or fz < MIN_LOAD
-    if math.abs(drive) > 1 then everDriven[i] = true end
-    local driven
-    if hasGraph then driven = liveDriven[i] or false
-    else driven = (drivetrain and drivetrain.driven[i]) or everDriven[i] or w.isPropulsed == true end
-
-    -- Slow-moving load, used to express drive torque as a share of what the tyre can take.
-    S.fzAvg = S.fzAvg + (math.max(fz, 0) - S.fzAvg) * clamp(LOAD_SMOOTH_HZ / SEND_HZ, 0, 1)
-    local tyreTorqueCapacity = MU_NOMINAL * math.max(S.fzAvg, 300) * radius
-
-    -- Grip use --------------------------------------------------------------
-    local use = 0
-    if not airborne then
-      local brakeTorque = (speed > STANDSTILL_SPEED) and brake or 0
-      local fx = math.max(math.abs(drive), brakeTorque) / radius   -- longitudinal (N)
-      local fy = fz * math.abs(latAccel) / G                       -- lateral share by load (N)
-      local forceUse = math.sqrt(fx * fx + fy * fy) / (MU_NOMINAL * fz)
-      use = math.max(forceUse, slip / SLIP_PEAK)
+-- Live drive graph: each differential's lock state, disconnected or broken shafts, and which
+-- wheels are connected to a power source. dg[k] packs node k's state into one number:
+-- bits 0-1 diff state (1 open, 2 lsd, 3 locked), bit 2 link disconnected, bit 3+j the j-th
+-- disconnectable shaft on the link is open.
+local liveDriven, live = {}, {}
+local function updateGraph()
+  local graph = lay.drivetrain.graph or {}
+  for k in pairs(liveDriven) do liveDriven[k] = nil end
+  for idx, n in ipairs(graph) do
+    local dc, code = false, 0
+    for j, c in ipairs(n.cps or {}) do
+      if isDisconnected(c.dev) then dc = true; code = code + 2 ^ (2 + j) end
     end
-    S.grip = S.grip + (use - S.grip) * gripK
-
-    if airborne then
-      S.sliding = false
-    elseif slip > SLIP_LIMIT then
-      S.sliding = true
-    elseif slip < SLIP_LIMIT * SLIP_RELEASE then
-      S.sliding = false
-    end
-
-    -- How far past the limit, 0..1, from the slip ratio: stays pink (0..PINK_SEVERITY) through
-    -- the near-peak band, then deepens to full red at a lock-up or full spin.
-    local severity = 0
-    if S.sliding then
-      local ratio = slip / math.max(speed, RATIO_MIN_SPEED)
-      if ratio <= SLIP_RATIO_PINK then
-        severity = PINK_SEVERITY * ratio / SLIP_RATIO_PINK
-      else
-        severity = PINK_SEVERITY + (1 - PINK_SEVERITY)
-          * clamp((ratio - SLIP_RATIO_PINK) / (SLIP_RATIO_FULL - SLIP_RATIO_PINK), 0, 1)
-      end
-    end
-    S.severity = (S.severity or 0) + (severity - (S.severity or 0)) * gripK
-
-    -- Torque application: + drive, - braking (engine braking / regen count as braking)
-    local driveFrac, brakeFrac = 0, 0
-    if throttle > 0.02 then
-      driveFrac = math.abs(drive) / tyreTorqueCapacity
-    else
-      brakeFrac = math.abs(drive) / tyreTorqueCapacity
-    end
-    -- what flows through the driveline only (no friction brakes): tints shafts and axles
-    local driveline = clamp(driveFrac, 0, 1) - clamp(brakeFrac, 0, 1)
-    if brakeMax > 0 then brakeFrac = math.max(brakeFrac, brake / brakeMax) end
-    local torque = clamp(driveFrac, 0, 1) - clamp(brakeFrac, 0, 1)
-
-    -- Steering ----------------------------------------------------------------
-    local rawYaw = axleYaw(w, fwd, right)
-    -- straight-ahead reference: captured with the layout, then kept true whenever you're really
-    -- driving straight (no steering input, the car not rotating, moving), so an off-centre
-    -- capture or a knock to the alignment doesn't leave an offset (TUNE.CENTRE_TAU)
-    if centreNow and not broken then
-      local d = rawYaw - L.steerBase
-      if d > math.pi / 2 then d = d - math.pi elseif d < -math.pi / 2 then d = d + math.pi end
-      L.steerBase = L.steerBase + d * clamp(1 / (SEND_HZ * TUNE.CENTRE_TAU), 0, 1)
-    end
-    local steer = rawYaw - L.steerBase
-    if steer >  math.pi / 2 then steer = steer - math.pi end
-    if steer < -math.pi / 2 then steer = steer + math.pi end
-    if frontAxle and L.y > frontAxle.y - 0.3 and not broken then
-      frontSteerSum, frontSteerN = frontSteerSum + steer, frontSteerN + 1
-    end
-    if rearAxle and L.y < rearAxle.cut and not broken then
-      rearSteerSum, rearSteerN = rearSteerSum + steer, rearSteerN + 1
-    end
-
-    -- assist acting on this wheel right now: 1 = ABS, 3 = ESC braking it. Both read BeamNG's
-    -- own brake numbers for the wheel (wheels.lua): desiredMainBrakingTorque is the pedal's
-    -- share after brake split and ABS; desiredBrakingTorque is what the wheel is finally asked
-    -- for, which ESC (classic or driving-dynamics) raises above the pedal's and handbrake's.
-    local iv = nil
-    local usage = w.defaultBrakeInputUsageCoef or 1
-    local mainReq = math.abs(w.desiredMainBrakingTorque or 0)
-    local parkReq = (w.parkingTorque or 0) * parkIn * usage
-    local added = math.abs(w.desiredBrakingTorque or 0) - math.max(mainReq, parkReq)
-    local assistBrake = added > math.max(ESC_BRAKE_MARGIN, brakeMax * 0.03)
-    if escBraking and assistBrake then iv = 3 end
-    if tcBraking and assistBrake then tcBraked[i] = true end
-    -- driving-dynamics traction control acting on this wheel: braking it, or cutting the power
-    -- of a motor that drives it (ESC's blue dot wins if both act on the same wheel)
-    if not iv and drivingDynamics and (tcBraked[i] or cutWheel[i]) then iv = 2 end
-    if not iv and hasABS and brakeOn then
-      -- the pedal's share without ABS, worked out the way wheels.lua does it
-      local bIn = (tonumber(ev[w.brakeElectricsName or "brake"]) or brakeIn) * usage
-      local split = w.brakeInputSplit or 1
-      local nonABS = brakeMax * (math.min(bIn, split) + math.max(bIn - split, 0) * (w.brakeSplitCoef or 1))
-      local reduced = w.desiredMainBrakingTorque ~= nil and nonABS > ESC_BRAKE_MARGIN and mainReq < nonABS * 0.9
-      if w.absActive == true or w.absActive == 1 or reduced then
-        iv = 1
-        absOn = true
-      end
-    end
-
-    local entry = {
-      i  = i,                      -- wheel id (matches src.w)
-      d  = driven and 1 or 0,      -- connected to a power source
-      nt = L.tyres or 1,           -- tyres this wheel represents (2 = dual pair modelled as one)
-      rd = L.radius and round(L.radius, 3) or nil,   -- tyre radius (m)
-      wd = L.width and round(L.width, 3) or nil,     -- width of each tyre (m)
-      x  = round(L.x, 3),          -- metres right of reference node
-      y  = round(L.y, 3),          -- metres forward of reference node
-      s  = round(steer, 4),        -- steering yaw, radians, + = left
-      g  = round(S.grip, 3),       -- grip used, 1 = 100 %
-      e  = S.sliding and 1 or 0,   -- grip limit exceeded
-      ex = S.sliding and round(S.severity, 3) or 0,   -- how far past the limit, 0..1
-      t  = round(torque, 3),       -- -1 full brake .. +1 full drive
-      dr = round(driveline, 3),    -- driveline only: + drive, - engine braking / regen
-      b  = broken and 1 or 0,
-      fl = (not broken and (w.isTireDeflated or w.isPunctured)) and 1 or nil,   -- flat or punctured tyre
-      sl = round(slip, 2),         -- raw contact slip (m/s), for calibration
-      fz = math.floor(fz),         -- wheel load (N), for calibration
-      iv = iv,                     -- assist on this wheel: 1 = ABS, 2 = traction control, 3 = ESC
-    }
-    wheelsOut[#wheelsOut + 1] = entry
-  end)
-
-  local sources = {}
-  for si, s in ipairs(drivetrain and drivetrain.sources or {}) do
-    local c = srcCut[si]
-    -- or braking one of the wheels this one drives
-    local braking = false
-    for _, wi in ipairs(s.wheels or {}) do if tcBraked[wi] then braking = true end end
-    if braking then anyCut = true end
-    sources[#sources + 1] = {
-      x = round(s.x, 3), y = round(s.y, 3),
-      k = s.kind,                  -- "ice" or "ev"
-      e = s.est and 1 or 0,        -- position estimated (not found in the vehicle data)
-      w = s.wheels,                -- wheel ids this source drives
-      -- classic traction control: a green dot on the engine while it's cutting this one's
-      -- power or braking a wheel it drives (driving-dynamics traction control shows by the wheels)
-      tc = (not drivingDynamics and (c.cut or braking)) and 1 or nil,
-      tf = (c.factor < 0.999) and round(c.factor, 2) or nil,   -- its throttle factor, for the numbers / dumps
-    }
+    for _, d in ipairs(n.path or {}) do if d.isBroken == true then dc = true end end
+    if n.dev and n.dev.isBroken == true then dc = true end
+    if dc then code = code + 4 end
+    if n.k == "diff" and n.dev then code = code + DIFF_CODE[diffState(n.dev)] end
+    live[idx] = (n.k == "src") or (live[n.p] and not dc) or false
+    if n.k == "wheel" and live[idx] then liveDriven[n.w] = true end
+    out.dg[idx] = code
   end
+  return #graph > 0
+end
 
-  -- Inputs for the rim arcs. Steering is read like BeamNG's Steering app: steering_input,
-  -- negative to the left (we send + = left).
-  -- The pedals are read exactly like BeamNG's Simple Pedals app: the applied electrics values
-  -- throttle, brake, clutch and parkingbrake (brake includes the automatic hold at standstill),
-  -- turned into whole percent with its "smart rounding". Anything not exactly 0 shows at least
-  -- 1 %, and only exactly full shows 100 %, so a controller deadzone or a pedal that doesn't
-  -- quite reach the end is visible.
+local tcBraked = {}
+local function updateWheels(dt, fwd, right, speed, ev, hasGraph)
+  local throttle = ev.throttle or 0
+  local gripK = 1 - (1 - GRIP_SMOOTHING) ^ (30 * dt)
+  local loadK = clamp(LOAD_SMOOTH_HZ * dt, 0, 1)
+  local steerInAbs = math.abs(tonumber(ev.steering_input) or 0)
+  local centreNow = steerInAbs < CENTRE_INPUT and math.abs(kin.yawRate) < 0.03 and speed > 3
+  -- a layout captured with the steering turned: take the straight-ahead reference the first
+  -- time the steering is centred with the car not cornering (standing, or driving straight)
+  local snapNow = steerInAbs < CENTRE_INPUT and (speed < 3 or math.abs(kin.yawRate) < 0.03)
+  local centreK = clamp(dt / TUNE.CENTRE_TAU, 0, 1)
+  local fSum, fN, rSum, rN = 0, 0, 0, 0
+  for k in pairs(tcBraked) do tcBraked[k] = nil end
+  local front, rear = lay.front, lay.rear
+  for _, o in ipairs(out.w) do
+    local i = o.i
+    local w, L, S = wheels.wheels[i], lay.wheels[i], wstate[i]
+    if w and L and S then
+      local fz       = w.downForceRaw or w.downForce or 0
+      local radius   = (w.radius and w.radius > 0.05) and w.radius or 0.3
+      local drive    = w.propulsionTorque or 0
+      local brake    = math.abs(w.brakingTorque or 0)
+      local brakeMax = w.brakeTorque or 0
+      local slip     = math.abs(w.lastSlip or 0)
+      local broken   = w.isBroken and true or false
+      local airborne = broken or fz < MIN_LOAD
+      if math.abs(drive) > 1 then everDriven[i] = true end
+      local driven
+      if hasGraph then driven = liveDriven[i] or false
+      else driven = lay.drivetrain.driven[i] or everDriven[i] or w.isPropulsed == true end
+
+      -- slow-moving load: drive torque as a share of what the tyre can take
+      S.fzAvg = S.fzAvg + (math.max(fz, 0) - S.fzAvg) * loadK
+      local capacity = MU_NOMINAL * math.max(S.fzAvg, 300) * radius
+
+      -- grip use
+      local use = 0
+      if not airborne then
+        local fx = math.max(math.abs(drive), (speed > STANDSTILL_SPEED) and brake or 0) / radius
+        local fy = fz * math.abs(kin.latAccel) / G
+        use = math.max(math.sqrt(fx * fx + fy * fy) / (MU_NOMINAL * fz), slip / SLIP_PEAK)
+      end
+      S.grip = S.grip + (use - S.grip) * gripK
+      if airborne then S.sliding = false
+      elseif slip > SLIP_LIMIT then S.sliding = true
+      elseif slip < SLIP_LIMIT * SLIP_RELEASE then S.sliding = false end
+      local severity = 0
+      if S.sliding then
+        local ratio = slip / math.max(speed, RATIO_MIN_SPEED)
+        if ratio <= SLIP_RATIO_PINK then severity = PINK_SEVERITY * ratio / SLIP_RATIO_PINK
+        else
+          severity = PINK_SEVERITY + (1 - PINK_SEVERITY) * clamp((ratio - SLIP_RATIO_PINK) / (SLIP_RATIO_FULL - SLIP_RATIO_PINK), 0, 1)
+        end
+      end
+      S.severity = S.severity + (severity - S.severity) * gripK
+
+      -- torque: + drive, - braking (engine braking and regen count as braking)
+      local driveFrac, brakeFrac = 0, 0
+      if throttle > 0.02 then driveFrac = math.abs(drive) / capacity
+      else brakeFrac = math.abs(drive) / capacity end
+      local driveline = clamp(driveFrac, 0, 1) - clamp(brakeFrac, 0, 1)   -- tints shafts and axles
+      if brakeMax > 0 then brakeFrac = math.max(brakeFrac, brake / brakeMax) end
+      local torque = clamp(driveFrac, 0, 1) - clamp(brakeFrac, 0, 1)
+
+      -- steering, against a straight-ahead reference that's kept true whenever you're really
+      -- driving straight (an off-centre capture or a knock to the alignment leaves no offset)
+      local rawYaw = axleYaw(w, fwd, right)
+      if snapNow and not L.centred and not broken then
+        L.steerBase, L.centred = rawYaw, true
+      elseif centreNow and not broken then
+        local d = rawYaw - L.steerBase
+        if d > math.pi / 2 then d = d - math.pi elseif d < -math.pi / 2 then d = d + math.pi end
+        L.steerBase = L.steerBase + d * centreK
+      end
+      local steer = rawYaw - L.steerBase
+      if steer > math.pi / 2 then steer = steer - math.pi end
+      if steer < -math.pi / 2 then steer = steer + math.pi end
+      S.steer = steer
+      if front and L.y > front.y - 0.3 and not broken then fSum, fN = fSum + steer, fN + 1 end
+      if rear and L.y < rear.cut and not broken then rSum, rN = rSum + steer, rN + 1 end
+
+      -- assist acting on this wheel: 1 = ABS, 2 = traction control, 3 = ESC. From BeamNG's own
+      -- brake numbers (wheels.lua): desiredMainBrakingTorque is the pedal's share after brake
+      -- split and ABS; desiredBrakingTorque is what the wheel is finally asked for, which ESC
+      -- and traction control raise above the pedal's and handbrake's.
+      local iv = nil
+      local usage = w.defaultBrakeInputUsageCoef or 1
+      local mainReq = math.abs(w.desiredMainBrakingTorque or 0)
+      local parkReq = (w.parkingTorque or 0) * ax.parkIn * usage
+      local added = math.abs(w.desiredBrakingTorque or 0) - math.max(mainReq, parkReq)
+      local assistBrake = added > math.max(ESC_BRAKE_MARGIN, brakeMax * 0.03)
+      if ax.escBraking and assistBrake then iv = 3 end
+      if ax.tcBraking and assistBrake then tcBraked[i] = true end
+      if not iv and ax.drivingDynamics and (tcBraked[i] or cutWheel[i]) then iv = 2 end
+      if not iv and ax.hasABS and ax.brakeOn then
+        local bIn = (tonumber(ev[w.brakeElectricsName or "brake"]) or ax.brakeIn) * usage
+        local split = w.brakeInputSplit or 1
+        local nonABS = brakeMax * (math.min(bIn, split) + math.max(bIn - split, 0) * (w.brakeSplitCoef or 1))
+        local reduced = w.desiredMainBrakingTorque ~= nil and nonABS > ESC_BRAKE_MARGIN and mainReq < nonABS * 0.9
+        if w.absActive == true or w.absActive == 1 or reduced then iv = 1; ax.absOn = true end
+      end
+
+      o.d  = driven and 1 or 0                         -- connected to a power source
+      o.s  = round(steer, 4)                           -- steering angle, rad, + = left
+      o.g  = round(S.grip, 3)                          -- grip used, 1 = 100 %
+      o.e  = S.sliding and 1 or 0                      -- sliding
+      o.ex = S.sliding and round(S.severity, 3) or 0   -- how far past the limit, 0..1
+      o.t  = round(torque, 3)                          -- -1 full brake .. +1 full drive
+      o.dr = round(driveline, 3)                       -- driveline only: + drive, - engine braking / regen
+      o.b  = broken and 1 or 0
+      o.fl = (not broken and (w.isTireDeflated or w.isPunctured)) and 1 or nil   -- flat or punctured
+      o.sl = round(slip, 2)                            -- contact-patch slip, m/s
+      o.iv = iv
+    end
+  end
+  est.frontSteer = fN > 0 and fSum / fN or nil
+  est.rearSteer = rN > 0 and rSum / rN or 0
+  est.rearSteerN = rN
+end
+
+-- How much the car is actually turning, as a steering angle, on the steering arc's scale, and
+-- the understeer / oversteer balance.
+local function updateTravel(dt, fwd, right, ev)
+  local inputs = out.inp
   local steerIn = clamp(-(ev.steering_input or 0), -1, 1)
-  local inputs = {
-    s = round(steerIn, 3),
-    t = pedalLevel(ev.throttle),
-    b = pedalLevel(ev.brake),
-    c = pedalLevel(ev.clutch),         -- 1 = pedal fully down
-    p = pedalLevel(ev.parkingbrake),   -- handbrake
-    abs = absOn and 1 or nil,          -- ABS working: the brake arc pulses
-    tcs = (powerCut or anyCut) and 1 or nil,   -- an assist cutting power (TCS or ESC): the throttle arc pulses
-  }
-
-  -- Direction of travel, on the steering arc's scale: the front axle's travel angle as a share
-  -- of the road-wheel angle at full lock. That scale is learned from how far the front wheels
-  -- actually turn for a given steering input.
-  lastFrontSteer = frontSteerN > 0 and frontSteerSum / frontSteerN or nil
-  if frontSteerN > 0 and math.abs(steerIn) > 0.15 then
-    local front = math.abs(frontSteerSum / frontSteerN)
-    if front > 0.02 then
-      lockAngle = lockAngle + (clamp(front / math.abs(steerIn), 0.15, 1.4) - lockAngle) * 0.05
-    end
+  -- full-lock road-wheel angle, learned from how far the front wheels turn
+  if est.frontSteer and math.abs(steerIn) > 0.15 then
+    local front = math.abs(est.frontSteer)
+    if front > 0.02 then est.lock = est.lock + (clamp(front / math.abs(steerIn), 0.15, 1.4) - est.lock) * clamp(3 * dt, 0, 1) end
   end
 
-  -- Understeer / oversteer: each axle's slip angle is where its wheels point minus where that
-  -- axle is actually going. Whichever axle slips more, in the direction the car is rotating,
-  -- sets the balance.
-  --  * A slip angle is folded into +-90 deg: a tyre rolling backwards is rolling, not sliding,
-  --    so an axle going backwards in a spin doesn't flip the sign.
-  --  * The direction comes from the yaw rate, which keeps its sign through a drift or a spin;
-  --    the cornering acceleration can flip at low speed or as the car slides sideways.
+  -- Balance: each axle's slip angle is where its wheels point minus where it's going (folded
+  -- to +-90 deg: a tyre rolling backwards in a spin is rolling, not sliding). The direction
+  -- comes from the yaw rate, which keeps its sign through drifts and spins.
   local function slipAngle(steerAvg, travel)
     local d = steerAvg - travel
     return math.atan2(math.sin(d), math.abs(math.cos(d)))
   end
+  local front, rear = lay.front, lay.rear
   local target = 0
-  local slipR = rearAxle and slipAngle(rearSteerN > 0 and rearSteerSum / rearSteerN or 0, rearTravel) or nil
-  if frontAxle and rearAxle and frontSteerN > 0 then
-    local slipF = slipAngle(frontSteerSum / frontSteerN, travelAng)
-    local turn = yawRate >= 0 and 1 or -1                  -- + = rotating left
+  est.slipF, est.slipR = nil, nil
+  if front and rear and est.frontSteer then
+    local slipR = slipAngle(est.rearSteer, kin.rearTravel)
+    local slipF = slipAngle(est.frontSteer, kin.travel)
+    est.slipF, est.slipR = slipF, slipR
+    local turn = kin.yawRate >= 0 and 1 or -1
     local diff = (slipR - slipF) * turn                    -- + = rear slipping more
     if diff >= 0 then
-      -- oversteer: shown once the rear is clearly sliding more than the front
-      local mag = clamp((diff - TUNE.BAL_DEADBAND) / (TUNE.BAL_FULL - TUNE.BAL_DEADBAND), 0, 1)
-      mag = mag * mag * (3 - 2 * mag)                      -- ease in: small differences barely tint
-      -- only once the rear is actually working hard (near its grip limit), not while both are
-      -- in the few degrees of slip of ordinary cornering
+      local mag = smoothstep((diff - TUNE.BAL_DEADBAND) / (TUNE.BAL_FULL - TUNE.BAL_DEADBAND))
       mag = mag * clamp((math.abs(slipR) - TUNE.BAL_SLIP_START) / (TUNE.BAL_SLIP_FULL - TUNE.BAL_SLIP_START), 0, 1)
-      target = mag * clamp(math.abs(yawRate) / TUNE.BAL_MIN_YAW, 0, 1)
+      target = mag * clamp(math.abs(kin.yawRate) / TUNE.BAL_MIN_YAW, 0, 1)
     else
-      -- understeer: an early warning as the front approaches its limit (see TUNE.US_SLIP_START)
       local frontWork = clamp((slipF * turn - TUNE.US_SLIP_START) / (TUNE.US_SLIP_FULL - TUNE.US_SLIP_START), 0, 1)
       local frontLead = clamp((-diff - TUNE.US_LEAD_START) / (TUNE.US_LEAD_FULL - TUNE.US_LEAD_START), 0, 1)
       local pastPeak = clamp((slipF * turn - TUNE.US_PAST_START) / (TUNE.US_PAST_FULL - TUNE.US_PAST_START), 0, 1)
         * clamp((-diff - TUNE.US_PAST_LEAD) / (TUNE.US_PAST_LEAD_FULL - TUNE.US_PAST_LEAD), 0, 1)
       local severity = TUNE.US_WARN_SHARE * frontWork * frontLead + (1 - TUNE.US_WARN_SHARE) * pastPeak
-      -- not once the rear is sliding (a slide or spin is oversteer, whatever the front does):
-      -- faded out with the rear axle's sideways travel, like the marker's change-over
-      local rs = clamp((math.abs(rearTravel) - TUNE.REAR_GRIP_SLIP) / (TUNE.REAR_SLIDE_SLIP - TUNE.REAR_GRIP_SLIP), 0, 1)
-      target = -severity * clamp(math.abs(yawRate) / TUNE.US_MIN_YAW, 0, 1) * (1 - rs * rs * (3 - 2 * rs))
+      -- not once the rear is sliding (a slide or spin is oversteer, whatever the front does)
+      local rs = smoothstep((math.abs(kin.rearTravel) - TUNE.REAR_GRIP_SLIP) / (TUNE.REAR_SLIDE_SLIP - TUNE.REAR_GRIP_SLIP))
+      target = -severity * clamp(math.abs(kin.yawRate) / TUNE.US_MIN_YAW, 0, 1) * (1 - rs)
     end
   end
-  balance = balance + (target - balance) * clamp(TRAVEL_SMOOTH_HZ / SEND_HZ, 0, 1)
+  est.balance = est.balance + (target - est.balance) * clamp(TRAVEL_SMOOTH_HZ * dt, 0, 1)
 
   -- Shown whenever the car is moving, including sliding backwards in a spin, but not when
-  -- reversing on purpose (reverse gear selected and rolling backwards).
-  local vel = obj:getVelocity()
-  local speed2d = math.sqrt(vel:dot(fwd) ^ 2 + vel:dot(right) ^ 2)
-  local reversing = (ev.gearIndex or 0) < 0 and vel:dot(fwd) < 0
-  if speed2d > TRAVEL_FADE_LO and frontAxle and not reversing then
-    -- How much the car is turning, as a steering angle: the front axle's direction against the
-    -- rear axle's path while the rear grips (plus any rear steer), easing over to the front's
-    -- direction against the body as the rear slides (the countersteer target).
-    -- (from the rear's true sliding angle, not folded: an axle sliding backwards in a spin is
-    -- fully sliding, even though as a tyre it counts as rolling)
+  -- reversing on purpose (reverse gear and rolling backwards).
+  local vel = kin.vel
+  local vFwd = vel:dot(fwd)
+  local speed2d = math.sqrt(vFwd ^ 2 + vel:dot(right) ^ 2)
+  local reversing = (ev.gearIndex or 0) < 0 and vFwd < 0
+  inputs.tv, inputs.sr, inputs.ta, inputs.bal = nil, nil, nil, nil
+  est.shown = nil
+  if speed2d > TRAVEL_FADE_LO and front and not reversing then
+    -- The front axle's direction against the rear axle's path while the rear grips (plus any
+    -- rear steer), easing over to the front's direction against the body as the rear slides
+    -- (the countersteer target). From the rear's true sliding angle, not folded: an axle
+    -- sliding backwards in a spin is fully sliding.
     local w = 1
-    if rearAxle then
-      local rsNow = (rearSteerN > 0) and rearSteerSum / rearSteerN or 0
-      local slide = math.abs(wrapAngle(rsNow - rearTravel))
-      local k = clamp((slide - TUNE.REAR_GRIP_SLIP) / (TUNE.REAR_SLIDE_SLIP - TUNE.REAR_GRIP_SLIP), 0, 1)
-      w = 1 - k * k * (3 - 2 * k)
+    if rear then
+      local slide = math.abs(wrapAngle(est.rearSteer - kin.rearTravel))
+      w = 1 - smoothstep((slide - TUNE.REAR_GRIP_SLIP) / (TUNE.REAR_SLIDE_SLIP - TUNE.REAR_GRIP_SLIP))
     end
-    local vFwd = vel:dot(fwd)
-    local kinHub = rearAxle and (travelAng - rearTravel) or travelAng
-    local kin = kinHub
-    local dtS = 1 / SEND_HZ
-    if rearAxle and vFwd > 3 then
+    local kinHub = rear and (kin.travel - kin.rearTravel) or kin.travel
+    local kinTurn = kinHub
+    if rear and vFwd > 3 then
       -- rigid car: front minus rear direction = atan(wheelbase x yaw rate / forward speed)
-      local kinYaw = math.atan2((frontAxle.y - rearAxle.y) * yawRate, vFwd)
+      local kinYaw = math.atan2((front.y - rear.y) * kin.yawRate, vFwd)
       if w > 0.99 and math.abs(kinYaw) > 0.003 then   -- calibrate against the hubs while gripping
-        local f = 1 - dtS / TUNE.TURN_CAL_TAU
+        local f = 1 - dt / TUNE.TURN_CAL_TAU
         est.kn = est.kn * f + kinHub * kinYaw
         est.kd = est.kd * f + kinYaw * kinYaw
       end
       est.cal = clamp((est.kn + 0.002) / (est.kd + 0.002), 0.6, 1.4)
-      kin = est.cal * kinYaw
+      kinTurn = est.cal * kinYaw
     end
-    local rs = (rearSteerN > 0) and rearSteerSum / rearSteerN or 0
+    local rs = est.rearSteer
     if math.abs(rs) < 0.01 then rs = 0 end   -- unsteered rear axle: ignore the nodes' noise
-    local shown = (1 - w) * travelAng + w * (kin + rs)
-    travelDiag.shown, travelDiag.kinHub, travelDiag.kin = shown, kinHub, kin
+    local shown = (1 - w) * kin.travel + w * (kinTurn + rs)
+    est.shown = shown
+    diag.shown, diag.kinHub, diag.kin = shown, kinHub, kinTurn
 
-    -- In steering-input units: where the arc would be if the wheels pointed exactly where the
-    -- car is turning, so the marker meets the arc whenever front and rear tyres slip equally.
-    -- The input-to-wheel ratio is the running least-squares slope (see TUNE.RATIO_TAU).
-    local fs = lastFrontSteer
-    if fs then
-      local f = 1 - dtS / TUNE.RATIO_TAU
-      est.rn = est.rn * f + fs * steerIn
+    -- In steering-input units, with the ratio the wheels show right now (TUNE.RATIO_TAU), so
+    -- the marker meets the arc whenever front and rear tyres slip equally.
+    if est.frontSteer then
+      local f = 1 - dt / TUNE.RATIO_TAU
+      est.rn = est.rn * f + est.frontSteer * steerIn
       est.rd = est.rd * f + steerIn * steerIn
     end
     local eps = 2e-4   -- a little of the full-lock ratio, for when there's been no steering
-    est.ratio = clamp((est.rn + lockAngle * eps) / (est.rd + eps), lockAngle * 0.3, lockAngle * 1.5)
+    est.ratio = clamp((est.rn + est.lock * eps) / (est.rd + eps), est.lock * 0.3, est.lock * 1.5)
     inputs.tv = round(clamp(shown / est.ratio, -TRAVEL_MAX, TRAVEL_MAX), 4)   -- + = left of the nose
-    -- the steering a 1 g corner needs at this speed (input units), for the app's scale
-    if rearAxle and vFwd > 3 then
-      inputs.sr = round(((frontAxle.y - rearAxle.y) * G / (vFwd * vFwd) + 0.03) / lockAngle, 4)
+    if rear and vFwd > 3 then   -- the steering a 1 g corner needs at this speed, for the app's scale
+      inputs.sr = round(((front.y - rear.y) * G / (vFwd * vFwd) + 0.03) / est.lock, 4)
     end
     inputs.ta = round(clamp((speed2d - TRAVEL_FADE_LO) / (TRAVEL_FADE_HI - TRAVEL_FADE_LO), 0, 1), 2)
-    inputs.bal = round(balance, 3)   -- -1 understeer .. 0 neutral .. +1 oversteer
+    inputs.bal = round(est.balance, 3)   -- -1 understeer .. 0 neutral .. +1 oversteer
   end
 
-  local pos = obj:getPosition()
-  return {
-    inp = inputs,
-    ext = bodyExtent and {
-      x0 = round(bodyExtent.x0, 2), x1 = round(bodyExtent.x1, 2),
-      y0 = round(bodyExtent.y0, 2), y1 = round(bodyExtent.y1, 2),
-    } or nil,
-    -- G-force as felt by the driver (opposite to the acceleration), in g:
-    -- x + = pushed right (turning left), y + = pushed forward (braking)
-    gf = { x = round(-gLat / G, 3), y = round(-gLon / G, 3) },
-    src = sources,
-    dt = hasGraph and graphOut or nil,   -- simplified drive graph (see buildDriveGraph)
-
-    id = obj:getId(),
-    px = round(pos.x, 2), py = round(pos.y, 2),
-    hx = round(fwd.x, 4), hy = round(fwd.y, 4),
-    c  = coupledList(),
-    w  = wheelsOut,
-  }
+  -- Inputs for the rim arcs. Steering like BeamNG's Steering app (steering_input, negative to
+  -- the left; we send + = left); pedals like its Simple Pedals app (applied throttle, brake,
+  -- clutch, parkingbrake in whole percent: anything not exactly 0 shows at least 1 %, only
+  -- exactly full shows 100 %).
+  inputs.s = round(steerIn, 3)
+  inputs.t = pedalLevel(ev.throttle)
+  inputs.b = pedalLevel(ev.brake)
+  inputs.c = pedalLevel(ev.clutch)
+  inputs.p = pedalLevel(ev.parkingbrake)
 end
 
--- Diagnostic: the driver-assist values this vehicle reports. In the vehicle Lua console:
---   extensions.load("vgsTelemetry") extensions.vgsTelemetry.dumpAssists()
--- prints them once; watchAssists(true) prints every change while you drive (false to stop).
+-- Extra values for the app's numbers mode (only while it's on, and only when sending)
+local function fillDetail(fwd, right, ev)
+  local vel, yaw = kin.vel, kin.yawRate
+  local vr0, vf0 = vel:dot(right), vel:dot(fwd)
+  local envP = 101325
+  if obj.getEnvPressure then
+    local okE, p = pcall(obj.getEnvPressure, obj)
+    if okE and type(p) == "number" and p > 1000 then envP = p end
+  end
+  for _, o in ipairs(out.w) do
+    local i = o.i
+    local w, L, S = wheels.wheels[i], lay.wheels[i], wstate[i]
+    if w and L and S then
+      -- this wheel's own ground velocity, from the body's velocity and the yaw rate at its spot
+      local vr, vf = vr0 - yaw * L.y, vf0 + yaw * L.x
+      local h = S.steer or 0
+      local vLong = vf * math.cos(h) - vr * math.sin(h)
+      local ground = math.sqrt(vr * vr + vf * vf)
+      if ground > 1 and not (w.isBroken) then
+        local d = h - math.atan2(-vr, vf)
+        o.sa = round(math.atan2(math.sin(d), math.abs(math.cos(d))), 4)   -- slip angle, rad, + = force to the left
+      else o.sa = nil end
+      local ws = tonumber(w.wheelSpeed)
+      if ws and math.abs(vLong) > 1 and not w.isBroken then
+        o.sr = round(clamp((ws - vLong) / math.abs(vLong), -9.99, 9.99), 3)   -- slip ratio, + = spinning
+      else o.sr = nil end
+      o.ws = ws and round(ws, 2) or nil                           -- wheel's own speed, m/s
+      o.fz = math.floor((w.downForce or w.downForceRaw or 0) + 0.5)   -- load, N
+      o.dq = math.floor((w.propulsionTorque or 0) * (w.wheelDir or 1) + 0.5)   -- drive torque, Nm (+ forwards)
+      o.bq = math.floor(math.abs(w.brakingTorque or 0) + 0.5)     -- brake torque, Nm
+      o.tt, o.tc, o.tp, o.bt = nil, nil, nil, nil
+      if L.wheelID and obj.getWheelAvgTemperature and L.pgroup then
+        local okA, ta = pcall(obj.getWheelAvgTemperature, obj, L.wheelID)
+        local okC, tc = pcall(obj.getWheelCoreTemperature, obj, L.wheelID)
+        if okA and type(ta) == "number" and ta > 100 then o.tt = round(ta - 273.15, 1) end   -- tyre tread, deg C
+        if okC and type(tc) == "number" and tc > 100 then o.tc = round(tc - 273.15, 1) end   -- tyre core, deg C
+      end
+      if L.pgroup and obj.getGroupPressure then
+        local okP, p = pcall(obj.getGroupPressure, obj, L.pgroup)
+        if okP and type(p) == "number" and p > 0 then o.tp = round((p - envP) / 1000, 1) end   -- tyre pressure, kPa gauge
+      end
+      if w.enableBrakeThermals and type(w.brakeSurfaceTemperature) == "number" then
+        o.bt = round(w.brakeSurfaceTemperature, 0)                -- brake disc surface, deg C
+      end
+    end
+  end
+  local vd = out.vd
+  local front, rear = lay.front, lay.rear
+  vd.v = round(kin.speed, 2)                                 -- ground speed, m/s
+  vd.yr = round(yaw, 3)                                      -- yaw rate, rad/s, + = left
+  local bx, by = 0, 0
+  if front and rear then bx, by = (front.x + rear.x) / 2, (front.y + rear.y) / 2 end
+  local vrm, vfm = vr0 - yaw * by, vf0 + yaw * bx
+  vd.beta = (kin.speed > 1) and round(math.atan2(-vrm, vfm), 3) or nil   -- body slip angle mid-wheelbase, + = moving left of the nose
+  vd.fw = est.frontSteer and round(est.frontSteer, 4) or nil -- front road-wheel angle, rad
+  vd.turn = est.shown and round(est.shown, 4) or nil         -- how much the car is turning, as a road-wheel angle
+  local turnSign = yaw >= 0 and 1 or -1
+  vd.af = est.slipF and round(est.slipF * turnSign, 4) or nil   -- front / rear axle slip angle, in the turn's direction
+  vd.ar = est.slipR and round(est.slipR * turnSign, 4) or nil
+  vd.rpm = tonumber(ev.rpm) and math.floor(ev.rpm + 0.5) or nil
+  local gear = ev.gear
+  vd.gear = (type(gear) == "string" or type(gear) == "number") and tostring(gear) or nil
+  vd.tf = round(ax.minFactor or 1, 2)                        -- lowest throttle factor (1 = no cut)
+  -- assists fitted (bits: 1 ABS, 2 TCS, 4 ESC) and acting right now
+  vd.asf = (ax.hasABS and 1 or 0) + (ax.hasTCS and 2 or 0) + (ax.hasESC and 4 or 0)
+  vd.asa = (ax.absOn and 1 or 0) + ((ax.anyCut or ax.powerCut or ax.tcsOn) and 2 or 0) + (ax.escOn and 4 or 0)
+end
+
+-- ===== Sending =============================================================
+
+local function transmit(payload)
+  if guihooks and guihooks.trigger then
+    guihooks.trigger('VGSData', payload)          -- straight to the UI, no game-engine hop
+  else                                            -- older game versions: through the hub
+    obj:queueGameEngineLua(string.format("if extensions.vgsHub then extensions.vgsHub.onVehicleJson(%q) end", jsonEncode(payload)))
+  end
+end
+
+-- What this vehicle is coupled to right now: BeamNG's own record of its attached couplers
+-- (so a trailer hitched before the app opened counts too), plus the coupler events seen since.
+local function couplings()
+  local set, me = {}, obj:getId()
+  for id in pairs(coupled) do set[id] = true end
+  local att = beamstate and beamstate.attachedCouplers
+  if type(att) == "table" then
+    for _, c in pairs(att) do
+      local other = type(c) == "table" and tonumber(c.obj2id) or nil
+      if other and other ~= me and other >= 0 then set[other] = true end
+    end
+  end
+  return set
+end
+
+local function pingHub()
+  local list = {}
+  for id in pairs(couplings()) do list[#list + 1] = id end
+  table.sort(list)
+  obj:queueGameEngineLua(string.format("if extensions.vgsHub then extensions.vgsHub.onVehiclePing(%d, {%s}) end",
+    obj:getId(), table.concat(list, ",")))
+end
+
+-- Does the UI want a new frame? BeamNG's UI acknowledges each frame it has drawn; sending only
+-- then means every update is drawn at once, with no backlog building up when the game runs
+-- faster than the UI.
+local function uiWantsFrame()
+  if tx.uiFlag == nil then
+    tx.uiFlag = false
+    if obj.getUpdateUIflag then tx.uiFlag = pcall(obj.getUpdateUIflag, obj) end
+  end
+  if not tx.uiFlag then return tx.since >= 0.95 / FALLBACK_HZ end
+  local ok, want = pcall(obj.getUpdateUIflag, obj)
+  if not ok then return tx.since >= 0.95 / FALLBACK_HZ end
+  if want then return MAX_SEND_HZ <= 0 or tx.since >= 0.95 / MAX_SEND_HZ end
+  return tx.since >= KEEPALIVE
+end
+
+local function send(fwd, right, ev)
+  local pos = obj:getPosition()
+  local p = out
+  p.v, p.id, p.lv = PROTOCOL, obj:getId(), tx.lv
+  p.pl = (playerInfo and playerInfo.firstPlayerSeated) and 1 or nil
+  p.px, p.py = round(pos.x, 2), round(pos.y, 2)
+  p.hx, p.hy = round(fwd.x, 4), round(fwd.y, 4)
+  for k = #couplerList, 1, -1 do couplerList[k] = nil end
+  if tx.sincePing == 0 or not tx.couplings then tx.couplings = couplings() end
+  for id in pairs(tx.couplings) do couplerList[#couplerList + 1] = id end
+  p.c = (#couplerList > 0) and couplerList or nil
+  -- G-force as felt by the driver (opposite to the acceleration), in g:
+  -- x + = pushed right (turning left), y + = pushed forward (braking)
+  p.gf.x, p.gf.y = round(-kin.gx, 3), round(-kin.gy, 3)
+  p.inp.abs = ax.absOn and 1 or nil                          -- ABS working: the brake arc pulses
+  for si, s in ipairs(lay.drivetrain.sources) do
+    local sc, cut = p.src[si], srcCut[si] or { factor = 1, cut = false }
+    local braking = false
+    for _, wi in ipairs(s.wheels or {}) do if tcBraked[wi] then braking = true end end
+    if braking then ax.anyCut = true end
+    -- classic traction control: a green dot on the engine while cutting its power or braking a
+    -- wheel it drives (the driving-dynamics kind shows by the wheels)
+    sc.tc = (not ax.drivingDynamics and (cut.cut or braking)) and 1 or nil
+    sc.tf = (cut.factor < 0.999) and round(cut.factor, 2) or nil
+  end
+  p.inp.tcs = (ax.powerCut or ax.anyCut) and 1 or nil        -- an assist cutting power: the throttle arc pulses
+  if detail then
+    fillDetail(fwd, right, ev); p.vd = out.vd; tx.detailSent = true
+  else
+    p.vd = nil
+    if tx.detailSent then   -- numbers mode just switched off: drop the extra values
+      for _, o in ipairs(out.w) do for _, key in ipairs(DETAIL_KEYS) do o[key] = nil end end
+      tx.detailSent = false
+    end
+  end
+  -- the layout: when it changes, on request, and every STATIC_EVERY seconds
+  local withStatic = tx.staticDue or tx.keyFrames > 0 or tx.sinceStatic >= STATIC_EVERY
+  p.st = withStatic and lay.static or nil
+  if withStatic then
+    tx.sinceStatic, tx.staticDue = 0, false
+    if tx.keyFrames > 0 then tx.keyFrames = tx.keyFrames - 1 end
+  end
+  local okT, err = pcall(transmit, p)
+  if not okT then log('W', 'vgsTelemetry', 'send failed: ' .. tostring(err)) end
+  p.st = nil
+  tx.since = 0
+end
+
+-- ===== Diagnostics =========================================================
+-- Run from the game-engine Lua console through vgsHub (see vgsHub.lua), or in this vehicle's
+-- console as extensions.vgsTelemetry.<name>().
 local ASSIST_KEY = { "abs", "tcs", "esc", "traction", "yaw", "stabil", "throttlefactor", "intervention" }
-local watchingAssists, lastAssistValues = false, {}
+local function say(line) log('I', 'vgsTelemetry', line); print(line) end
 local function assistElectrics()
-  local out = {}
+  local res = {}
   for k, val in pairs(electrics.values or {}) do
     local lk = type(k) == "string" and k:lower() or ""
     for _, pat in ipairs(ASSIST_KEY) do
-      if lk:find(pat, 1, true) and type(val) ~= "table" then out[k] = val; break end
+      if lk:find(pat, 1, true) and type(val) ~= "table" then res[k] = val; break end
     end
   end
-  return out
+  return res
 end
+
 local function dumpAssists()
-  local function out(line) log('I', 'vgsTelemetry', line); print(line) end
   local vals, keys = assistElectrics(), {}
   for k in pairs(vals) do keys[#keys + 1] = k end
   table.sort(keys)
-  out("electrics: " .. (#keys == 0 and "(no assist-related values)" or ""))
-  for _, k in ipairs(keys) do out(string.format("  %-24s %s", k, tostring(vals[k]))) end
-  -- every field of each wheel to do with ABS, brakes or slip, whatever it's called
+  say("electrics: " .. (#keys == 0 and "(no assist-related values)" or ""))
+  for _, k in ipairs(keys) do say(string.format("  %-24s %s", k, tostring(vals[k]))) end
   forEachWheel(function(i, w)
     local parts = {}
     pcall(function()
@@ -1235,9 +1449,8 @@ local function dumpAssists()
       end
     end)
     table.sort(parts)
-    out(string.format("  wheel %s: %s", tostring(w.name), table.concat(parts, "  ")))
+    say(string.format("  wheel %s: %s", tostring(w.name), table.concat(parts, "  ")))
   end)
-  -- the assist controllers, and what each one offers (functions and plain values)
   if controller and controller.getController then
     for _, name in ipairs({ "tractionControl", "yawControl", "absControl", "esc", "brakeControl", "motorTorqueControl", "CMU" }) do
       local ok, c = pcall(controller.getController, name)
@@ -1248,191 +1461,91 @@ local function dumpAssists()
           elseif type(val) ~= "table" then vals2[#vals2 + 1] = tostring(k) .. "=" .. tostring(val) end
         end
         table.sort(fns); table.sort(vals2)
-        out(string.format("  controller %s: functions %s", name, table.concat(fns, ", ")))
-        if #vals2 > 0 then out(string.format("  controller %s: values %s", name, table.concat(vals2, ", "))) end
+        say(string.format("  controller %s: functions %s", name, table.concat(fns, ", ")))
+        if #vals2 > 0 then say(string.format("  controller %s: values %s", name, table.concat(vals2, ", "))) end
       else
-        out(string.format("  controller %-18s -", name))
+        say(string.format("  controller %-18s -", name))
       end
     end
   end
 end
--- Prints what's behind the direction-of-travel marker four times a second, for a few seconds
--- (default 10), so you can start it and then drive a corner.
-local function dumpTravel(seconds)
-  travelWatch, travelWatchNext = tonumber(seconds) or 10, 0
+
+local function watchAssistsStep()
+  local function changed(key, val)
+    if watch.assistValues[key] ~= val then
+      say(string.format("[vgs assists] %s = %s", key, tostring(val)))
+      watch.assistValues[key] = val
+    end
+  end
+  for k, val in pairs(assistElectrics()) do changed(k, val) end
+  for key, c in pairs(lay.assists or {}) do
+    for _, f in ipairs({ "isActing", "isActingAsTC", "isActingAsYC", "isActingAsABS" }) do
+      if c[f] ~= nil then changed("controller " .. key .. " " .. f, c[f]) end
+    end
+  end
+  forEachWheel(function(i, w)
+    pcall(function()
+      for k, val in pairs(w) do
+        if type(k) == "string" and k:lower():find("abs", 1, true) and type(val) ~= "table" and type(val) ~= "function" then
+          changed("wheel " .. tostring(w.name) .. " " .. k, val)
+        end
+      end
+    end)
+  end)
 end
-local function watchAssists(on)
-  watchingAssists = on ~= false
-  lastAssistValues = {}
+
+local function travelDumpStep(dt)
+  watch.travel = watch.travel - dt
+  watch.travelNext = watch.travelNext - dt
+  if watch.travelNext > 0 then return end
+  watch.travelNext = 0.25
+  local function deg(a) return a and string.format("%+6.1f", math.deg(a)) or "   n/a" end
+  local function num(a) return a and string.format("%+5.2f", a) or "  n/a" end
+  say(string.format(
+    "[vgs travel] %4.1f m/s  steer in %+.2f  front wheels %s deg  lock %4.1f deg (input-to-wheel ratio now %4.1f deg, turn cal x%.2f) | shown %s deg | front going %s deg (hubs %s, yaw %s)  rear %s deg | yaw rate: physics %s (sign %+d), heading %s, used %s rad/s | balance %+.2f",
+    kin.speed, clamp(-(electrics.values.steering_input or 0), -1, 1), deg(est.frontSteer), math.deg(est.lock),
+    math.deg(est.ratio or est.lock), est.cal, deg(diag.shown),
+    deg(kin.travel), deg(diag.frontHub), deg(diag.frontYaw), deg(kin.rearTravel),
+    num(kin.physYaw), kin.yawSign, num(kin.headYaw), num(kin.yawRate), est.balance))
 end
+
+-- ===== Main loop ===========================================================
 
 local function updateGFX(dt)
-  if watchingAssists then
-    local function changed(key, val)
-      if lastAssistValues[key] ~= val then
-        local line = string.format("[vgs assists] %s = %s", key, tostring(val))
-        log('I', 'vgsTelemetry', line); print(line)
-        lastAssistValues[key] = val
-      end
-    end
-    for k, val in pairs(assistElectrics()) do changed(k, val) end
-    -- what the driving-dynamics assist parts say they're doing
-    for key, c in pairs(assistControllers or {}) do
-      for _, f in ipairs({ "isActing", "isActingAsTC", "isActingAsYC", "isActingAsABS" }) do
-        if c[f] ~= nil then changed("controller " .. key .. " " .. f, c[f]) end
-      end
-    end
-    -- each wheel's ABS-related fields, whatever they're called
-    forEachWheel(function(i, w)
-      pcall(function()
-        for k, val in pairs(w) do
-          if type(k) == "string" and k:lower():find("abs", 1, true) and type(val) ~= "table" and type(val) ~= "function" then
-            changed("wheel " .. tostring(w.name) .. " " .. k, val)
-          end
-        end
-      end)
-    end)
-  end
+  if watch.assists then watchAssistsStep() end
   if not active or not dt or dt <= 0 then return end
+  clock = clock + dt
+  tx.since, tx.sinceStatic, tx.sincePing = tx.since + dt, tx.sinceStatic + dt, tx.sincePing + dt
+  if tx.sincePing >= PING_EVERY then tx.sincePing = 0; pcall(pingHub) end
 
   local fwd, right = basis()
-
-  -- Lateral acceleration from the change in velocity, projected on the vehicle's right axis.
   local vel = obj:getVelocity()
-  if lastVel then
-    local dv = vel - lastVel
-    local k = clamp(dt * ACCEL_SMOOTH_HZ, 0, 1)
-    latAccel = latAccel + (dv:dot(right) / dt - latAccel) * k
-    lonAccel = lonAccel + (dv:dot(fwd) / dt - lonAccel) * k
-  end
-  lastVel = vec3(vel)
-
-  -- G-force dot: velocity change across the last GF_WINDOW seconds (the oldest sample kept is
-  -- the last one at or before the start of the window), projected on the current axes
-  histTime = histTime + dt
-  velHist[#velHist + 1] = { t = histTime, v = vec3(vel) }
-  while #velHist > 2 and velHist[2].t <= histTime - GF_WINDOW do table.remove(velHist, 1) end
-  local old = velHist[1]
-  local span = histTime - old.t
-  if span > 1e-3 then
-    local a = (vel - old.v) * (1 / span)
-    local kg = clamp(dt * GF_SMOOTH_HZ, 0, 1)
-    gLat = gLat + (a:dot(right) - gLat) * kg
-    gLon = gLon + (a:dot(fwd) - gLon) * kg
-  end
-
-  -- Yaw rate (+ = turning left), and from it the direction the front axle is moving: the
-  -- body's velocity plus the rotation's share at the axle. The yaw rate comes from the physics
-  -- (the same value BeamNG's own ESC uses), which is far steadier than the change in heading
-  -- from frame to frame; that change still serves as a check on its sign, and as the fallback.
-  local headYaw = nil
-  if lastFwd then headYaw = math.atan2(-fwd:dot(lastRight), fwd:dot(lastFwd)) / dt end
-  lastFwd, lastRight = vec3(fwd), vec3(right)
-  local physYaw = nil
-  if obj.getYawAngularVelocity then
-    local okY, y = pcall(obj.getYawAngularVelocity, obj)
-    if okY and type(y) == "number" and y == y then physYaw = -y end
-  end
-  local rawYaw = headYaw
-  if physYaw then
-    if headYaw then
-      -- if the two keep disagreeing in sign while the car is clearly rotating, flip
-      yawCheck = yawCheck + (yawSign * physYaw * headYaw - yawCheck) * clamp(dt * 0.5, 0, 1)
-      if yawCheck < -0.01 then yawSign, yawCheck = -yawSign, -yawCheck end
-    end
-    rawYaw = yawSign * physYaw
-  end
-  if rawYaw then yawRate = yawRate + (rawYaw - yawRate) * clamp(dt * YAW_SMOOTH_HZ, 0, 1) end
-  -- Direction each axle is moving (+ = left of where the car points), all the way round. It's
-  -- measured straight from the axle's hub nodes: how far they've moved over the last
-  -- TRAVEL_WINDOW seconds, against the way the car pointed over that time. Measuring across a
-  -- window rather than frame to frame averages out the hubs' vibration. If the nodes can't be
-  -- read, it falls back to the body's velocity plus the yaw rate's share at the axle.
+  kin.vel, kin.speed = vel, vel:length()
+  updateAccel(dt, vel, fwd, right)
+  updateYaw(dt, fwd, right)
   local k = clamp(dt * TRAVEL_SMOOTH_HZ, 0, 1)
   local origin = obj:getPosition()
-  local function hubMotion(axle)
-    local nodes = axle.nodes
-    if not nodes or #nodes == 0 then return nil end
-    local okP, p = pcall(function()
-      local sx, sy, sz = 0, 0, 0
-      for _, cid in ipairs(nodes) do
-        local q = obj:getNodePosition(cid)
-        sx, sy, sz = sx + q.x, sy + q.y, sz + q.z
-      end
-      return vec3(origin.x + sx / #nodes, origin.y + sy / #nodes, origin.z + sz / #nodes)
-    end)
-    if not okP or not p then return nil end
-    local h = axle.hist
-    h[#h + 1] = { t = histTime, p = p, fwd = vec3(fwd), right = vec3(right) }
-    while #h > 2 and h[2].t <= histTime - TRAVEL_WINDOW do table.remove(h, 1) end
-    local o = h[1]
-    local span = histTime - o.t
-    if span < TRAVEL_WINDOW * 0.3 then return nil end
-    local v = (p - o.p) * (1 / span)
-    local f, r = fwd + o.fwd, right + o.right            -- the car's heading across the window
-    local fl, rl = f:length(), r:length()
-    if fl < 1e-6 or rl < 1e-6 then return nil end
-    return v:dot(r) / rl, v:dot(f) / fl
-  end
-  local function axleTravel(axle, current, tag)
-    local yx = vel:dot(right) - yawRate * axle.y          -- from the yaw rate: sideways, + = right
-    local yy = vel:dot(fwd) + yawRate * axle.x            -- forwards
-    local vx, vy = hubMotion(axle)
-    travelDiag[tag .. "Yaw"] = math.atan2(-yx, yy)
-    travelDiag[tag .. "Hub"] = vx and math.atan2(-vx, vy) or nil
-    if not vx then vx, vy = yx, yy end
-    if vx * vx + vy * vy < 0.09 then return current end   -- barely moving: keep the last value
-    -- step from the current value the short way round, so the angle stays continuous past
-    -- +-180 deg instead of jumping from one side to the other
-    local a = current + wrapAngle(math.atan2(-vx, vy) - current) * k
-    -- a genuine full rotation (past +-270 deg) comes back round to the other side
-    if a > 1.5 * math.pi then a = a - 2 * math.pi elseif a < -1.5 * math.pi then a = a + 2 * math.pi end
-    return a
-  end
-  if frontAxle then travelAng = axleTravel(frontAxle, travelAng, "front") end
-  if rearAxle then rearTravel = axleTravel(rearAxle, rearTravel, "rear") end
-  travelDiag.physYaw, travelDiag.headYaw = physYaw, headYaw
+  if lay.front then kin.travel = axleTravel(lay.front, kin.travel, "front", vel, origin, fwd, right, k) end
+  if lay.rear then kin.rearTravel = axleTravel(lay.rear, kin.rearTravel, "rear", vel, origin, fwd, right, k) end
+  diag.physYaw, diag.headYaw = kin.physYaw, kin.headYaw
+  if watch.travel > 0 then travelDumpStep(dt) end
 
-  if travelWatch > 0 then
-    travelWatch = travelWatch - dt
-    travelWatchNext = travelWatchNext - dt
-    if travelWatchNext <= 0 then
-      travelWatchNext = 0.25
-      local function deg(a) return a and string.format("%+6.1f", math.deg(a)) or "   n/a" end
-      local function num(a) return a and string.format("%+5.2f", a) or "  n/a" end
-      local line = string.format(
-        "[vgs travel] %4.1f m/s  steer in %+.2f  front wheels %s deg  lock %4.1f deg (input-to-wheel ratio now %4.1f deg, turn cal x%.2f) | shown %s deg | front going %s deg (hubs %s, yaw %s)  rear %s deg | yaw rate: physics %s (sign %+d), heading %s, used %s rad/s",
-        vel:length(), clamp(-(electrics.values.steering_input or 0), -1, 1), deg(lastFrontSteer), math.deg(lockAngle), math.deg(est.ratio or lockAngle), est.cal, deg(travelDiag.shown),
-        deg(travelAng), deg(travelDiag.frontHub), deg(travelDiag.frontYaw), deg(rearTravel),
-        num(travelDiag.physYaw), yawSign, num(travelDiag.headYaw), num(yawRate))
-      log('I', 'vgsTelemetry', line); print(line)
-    end
-  end
-
-  -- Capture the wheel layout once, ideally with the steering centred.
-  if not layout then
-    layoutWait = layoutWait + dt
+  -- capture the wheel layout once, ideally with the steering centred
+  if not lay.wheels then
+    lay.wait = lay.wait + dt
     local steerIn = math.abs(electrics.values.steering_input or 0)
-    if steerIn < 0.02 then
-      captureLayout(fwd, right, true)
-    elseif layoutWait > 1.5 then
-      captureLayout(fwd, right, false)
-    else
-      return
-    end
+    if steerIn < CENTRE_INPUT then captureLayout(fwd, right, true)
+    elseif lay.wait > 1.5 then captureLayout(fwd, right, false)
+    else return end
   end
 
-  -- keep the leftover time, so a frame that lands a hair early doesn't halve the rate;
-  -- after a long stall, start fresh rather than sending a burst
-  sendTimer = sendTimer + dt
-  local interval = 1 / SEND_HZ
-  if sendTimer < interval * 0.95 then return end
-  sendTimer = sendTimer - interval
-  if sendTimer > interval or sendTimer < 0 then sendTimer = 0 end
-
-  local payload = buildPayload(fwd, right, vel:length())
-  obj:queueGameEngineLua(string.format(
-    "if extensions.vgsHub then extensions.vgsHub.onVehicleJson(%q) end", jsonEncode(payload)))
+  local ev = electrics.values
+  updateAssists(ev)
+  updateSourceCuts(ev)
+  local hasGraph = updateGraph()
+  updateWheels(dt, fwd, right, kin.speed, ev, hasGraph)
+  updateTravel(dt, fwd, right, ev)
+  if uiWantsFrame() then send(fwd, right, ev) end
 end
 
 local function setActive(on)
@@ -1441,63 +1554,63 @@ local function setActive(on)
   active = on
 end
 
+-- Numbers mode: work out and send the extra values
+local function setDetail(on) detail = on and true or false end
+-- Send the layout with the next update (the app asks when it doesn't have it)
+local function requestLayout() tx.staticDue = true end
+
 -- Couplers (fifth wheel, tow hitch, articulation joints between separate vehicles)
 local function onCouplerAttached(nodeId, obj2id)
   if type(obj2id) == "number" and obj2id ~= obj:getId() then
     coupled[obj2id] = (coupled[obj2id] or 0) + 1
+    tx.sincePing = PING_EVERY   -- tell the hub straight away
   end
 end
-
 local function onCouplerDetached(nodeId, obj2id)
   if type(obj2id) == "number" and coupled[obj2id] then
     coupled[obj2id] = coupled[obj2id] - 1
     if coupled[obj2id] <= 0 then coupled[obj2id] = nil end
+    tx.sincePing = PING_EVERY
   end
 end
 
--- Diagnostic: lists every wheel and how its tyres were read. Run in the vehicle Lua console:
---   extensions.load("vgsTelemetry") extensions.vgsTelemetry.dumpWheels()
 local function dumpWheels()
   local fwd, right = basis()
   forEachWheel(function(i, w)
     local okT, tyres, offset, reason, radius, width = pcall(tyreInfo, i, w)
-    local _, mid = axleYaw(w, fwd, right)
+    local _, p1, p2 = axleYaw(w, fwd, right)
+    local mid = (p1 + p2) * 0.5
     local d = wheelJbeam(i, w) or {}
-    local line = string.format(
+    say(string.format(
       "[%d] %s  nodes %s/%s  x=%.2f y=%.2f  radius=%s width=%s offset=%s  tyres=%s (%s)  group=%s hubGroup=%s",
       i, tostring(w.name), tostring(w.node1), tostring(w.node2), mid:dot(right), mid:dot(fwd),
       tostring(radius), tostring(width), tostring(offset), okT and tostring(tyres) or "error",
-      tostring(okT and (reason or "single") or tyres), tostring(d.group or w.group), tostring(d.hubGroup or w.hubGroup))
-    log('I', 'vgsTelemetry', line)
-    print(line)
+      tostring(okT and (reason or "single") or tyres), tostring(d.group or w.group), tostring(d.hubGroup or w.hubGroup)))
   end)
 end
 
--- Diagnostic: the drivetrain as the VGS reads it. In the vehicle Lua console:
---   extensions.load("vgsTelemetry") extensions.vgsTelemetry.dumpDrivetrain()
 local function dumpDrivetrain()
-  local function out(line) log('I', 'vgsTelemetry', line); print(line) end
   local devices = (powertrain and powertrain.getDevices) and powertrain.getDevices() or {}
-  out("-- powertrain devices --")
+  say("-- powertrain devices --")
   for name, d in pairs(devices) do
     if type(d) == "table" then
       local kids = {}
       for _, c in pairs(type(d.children) == "table" and d.children or {}) do
         if type(c) == "table" then kids[#kids + 1] = tostring(c.name) end
       end
-      out(string.format("%s  type=%s visualType=%s diffType=%s mode=%s splitType=%s activeLockCoef=%s broken=%s canDisconnect=%s wheel=%s -> [%s]",
+      say(string.format("%s  type=%s visualType=%s diffType=%s mode=%s splitType=%s activeLockCoef=%s broken=%s canDisconnect=%s wheel=%s throttleFactor=%s -> [%s]",
         tostring(name), tostring(d.type), tostring(d.visualType), tostring(d.diffType), tostring(d.mode),
         tostring(d.splitType), tostring(d.activeLockCoef), tostring(d.isBroken), tostring(canDisconnect(d)),
-        tostring(d.connectedWheel), table.concat(kids, ", ")))
+        tostring(d.connectedWheel), tostring(d.throttleFactor), table.concat(kids, ", ")))
     end
   end
-  out("-- what the VGS draws --")
-  local graph = drivetrain and drivetrain.graph or {}
-  if #graph == 0 then out("(nothing yet: open the app with this vehicle first)") end
+  say("-- what the VGS draws --")
+  local graph = lay.drivetrain and lay.drivetrain.graph or {}
+  if #graph == 0 then say("(nothing yet: open the app with this vehicle first)") end
   for idx, n in ipairs(graph) do
     local cps = {}
     for _, c in ipairs(n.cps or {}) do cps[#cps + 1] = c.kind .. "(" .. tostring(c.dev.name) .. ")" end
-    out(string.format("%d. %s %s parent=%d%s%s%s%s", idx, n.k, tostring(n.name or (n.w and ("wheel " .. n.w)) or ""),
+    say(string.format("%d. %s %s parent=%d%s%s%s%s", idx, n.k, tostring(n.name or (n.w and ("wheel " .. n.w)) or ""),
       n.p, n.sub and ("  " .. n.sub) or "",
       n.dev and n.k == "diff" and ("  " .. diffTypeName(n.dev) .. ", " .. diffState(n.dev)) or "",
       #cps > 0 and ("  link: " .. table.concat(cps, ", ")) or "",
@@ -1508,13 +1621,15 @@ end
 M.dumpWheels        = dumpWheels
 M.dumpDrivetrain    = dumpDrivetrain
 M.dumpAssists       = dumpAssists
-M.watchAssists      = watchAssists
-M.dumpTravel        = dumpTravel
-M.travelState      = function() return travelDiag, lockAngle, travelAng, rearTravel, yawRate end   -- for tests
+M.watchAssists      = function(on) watch.assists = on ~= false; watch.assistValues = {} end
+M.dumpTravel        = function(seconds) watch.travel, watch.travelNext = tonumber(seconds) or 10, 0 end
+M.travelState       = function() return diag, est.lock, kin.travel, kin.rearTravel, kin.yawRate end   -- for tests
 M.onExtensionLoaded = resetState
 M.onReset           = resetState
 M.updateGFX         = updateGFX
 M.setActive         = setActive
+M.setDetail         = setDetail
+M.requestLayout     = requestLayout
 M.onCouplerAttached = onCouplerAttached
 M.onCouplerDetached = onCouplerDetached
 
