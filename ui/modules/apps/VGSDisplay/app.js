@@ -30,6 +30,7 @@
     panelStroke: 'rgba(255, 255, 255, 0.22)',
     tyreBg:      'rgba(0, 0, 0, 0.5)',
     broken:      'rgba(160, 160, 160, 0.6)',
+    airborne:    'rgba(165, 215, 250, 0.95)',   // inside of a wheel that's off the ground
     text:        'rgba(255, 255, 255, 0.88)'
   };
 
@@ -785,12 +786,11 @@
   // further round, and whether they line up, are exactly as on a straight scale. Past full lock
   // (the marker in big slides and spins) it carries on straight, so the marker still goes all
   // the way round.
-  // The stretch follows speed: the vehicle sends the steering a 1 g corner needs at its current
-  // speed (inp.sr, from its wheelbase), and k is chosen so that much steering fills STEER_TARGET
-  // of the quarter. At highway speed that's a few per cent of the input, so k grows a lot; at
-  // low speed it never drops below STEER_EXPAND (a typical 34 deg lock: 1 deg of road-wheel
-  // angle on 14 deg of rim, half lock on 73). STEER_EXPAND = 0 and STEER_TARGET = 0 give a
-  // straight scale.
+  // The stretch follows speed, and the vehicle works it out (inp.k; its settings are
+  // TUNE.STEER_* in vgsTelemetry.lua), because it smooths the marker on this same scale. The
+  // values here are only the fallback for data without k (the README's images): k chosen so
+  // the steering a 1 g corner needs (inp.sr) fills STEER_TARGET of the quarter, never below
+  // STEER_EXPAND.
   var STEER_EXPAND = 20, STEER_TARGET = 0.6, STEER_K_MAX = 400;
   function asinhNorm(x, k) {
     return Math.log(k * x + Math.sqrt(k * k * x * x + 1)) / Math.log(k + Math.sqrt(k * k + 1));
@@ -827,7 +827,7 @@
     var hasTravel = inp.tv !== undefined && inp.tv !== null;
     var tv = hasTravel ? clamp(+inp.tv || 0, -4, 4) : 0, alpha = clamp(inp.ta === undefined ? 1 : +inp.ta, 0, 1);
     ctx.lineWidth = lw; ctx.lineCap = 'butt';
-    var sk = steerK(+inp.sr);
+    var sk = +inp.k > 0 ? +inp.k : steerK(+inp.sr);   // the vehicle sends the scale's stretch
     var steerShown = steerScale(steer, sk);
     if (steerShown > 0) arc(INPUT.steer, TOP - steerShown * Q, TOP);        // left: counter-clockwise from the top
     else if (steerShown < 0) arc(INPUT.steer, TOP, TOP - steerShown * Q);   // right: clockwise from the top
@@ -946,6 +946,7 @@
 
   function drawTyre(ctx, x, y, w, h, wh, onLeft, opts) {
     var broken = !!+wh.b, sliding = !!+wh.e, flat = !broken && !!+wh.fl;   // fl: flat or punctured tyre
+    var airborne = !broken && !!+wh.a;   // off the ground: the whole inside light blue
     var rawGrip = +wh.g || 0, grip = clamp(rawGrip, 0, 1);
     var lw = clamp(w * 0.16, 1, 3.5);
 
@@ -960,8 +961,8 @@
       var inset = w > 8 ? 2 : 1;
       var iw = w - lw * 2 - inset, ih = h - lw * 2 - inset;
       if (iw > 0 && ih > 0) {
-        var fh = sliding ? ih : ih * grip;   // grows from the centre outward
-        ctx.fillStyle = sliding ? slideColour(wh.ex) : STYLE.gripFill;
+        var fh = (sliding || airborne) ? ih : ih * grip;   // grows from the centre outward
+        ctx.fillStyle = airborne ? STYLE.airborne : (sliding ? slideColour(wh.ex) : STYLE.gripFill);
         ctx.fillRect(-iw / 2, -fh / 2, iw, fh);
       }
     }

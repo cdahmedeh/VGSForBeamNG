@@ -80,6 +80,35 @@ TUNE.TURN_CAL_TAU     = 5     -- s of history in that calibration
 -- you're steering, so straights (input near zero) add no noise.
 TUNE.RATIO_TAU        = 1.0   -- s of history in that slope
 TUNE.CENTRE_TAU       = 3     -- s for each wheel's straight-ahead reference to settle while driving straight
+-- The steering scale the arc and the marker share (the app draws with the k sent here):
+-- asinh(k x) / asinh(k), so the few degrees you steer at speed are easy to read. k is chosen so
+-- the steering a 1 g corner needs at this speed fills STEER_TARGET of the quarter turn, never
+-- below STEER_EXPAND (low speed) or above STEER_K_MAX. STEER_EXPAND = STEER_TARGET = 0: straight.
+TUNE.STEER_EXPAND     = 20
+TUNE.STEER_TARGET     = 0.6
+TUNE.STEER_K_MAX      = 400
+-- Smoothing the marker, done on where it's drawn (degrees round the rim, so noise is judged as
+-- the eye sees it, after the scale's magnification). A "One Euro" filter: strong smoothing
+-- while it holds still, opening up as it moves, from its own movement and, without any delay,
+-- a little from how fast you're turning the steering (a clean signal; only a little, because
+-- the car hardly responds to small quick corrections). The yaw rate it starts from has only a
+-- light filter of its own.
+-- In a simulated test with yaw-rate noise and hub vibration, against the earlier fixed
+-- smoothing: about twice as steady on a straight at highway speed, three to four times in a
+-- curve, and the delay behind the real turn of the car cut from 60-84 ms to 26-36 ms.
+TUNE.MARK_MIN_CUTOFF  = 0.5   -- Hz while still (lower = stiller)
+TUNE.MARK_BETA        = 0.015 -- Hz per deg/s of its own movement (slides, the car settling)
+TUNE.MARK_D_CUTOFF    = 0.5   -- Hz: smoothing of that movement estimate
+TUNE.MARK_STEER_GAIN  = 0.06  -- Hz per deg/s of steering movement (on the same scale)
+TUNE.MARK_STEER_CUTOFF = 8    -- Hz: smoothing of the steering's movement
+-- Big, fast swings (a slide, a spin) open it almost at once: a second, quicker estimate of its
+-- movement opens it with the square of the speed above MARK_FAST_FROM, a speed noise doesn't
+-- reach (in the simulated tests noise made it look like at most about 150 deg/s of rim; a
+-- slide moves it at 400-1000 deg/s).
+TUNE.MARK_FAST_FROM   = 180   -- deg/s of rim
+TUNE.MARK_BETA2       = 0.002 -- Hz per (deg/s)^2 above that
+TUNE.MARK_D_FAST_CUTOFF = 2   -- Hz: smoothing of that quicker estimate
+TUNE.MARK_YAW_HZ      = 10    -- light low-pass on the yaw rate the marker uses, Hz (0 = none)
 -- Understeer / oversteer (the marker's colour): rear slip angle minus front, in the direction
 -- the car is rotating. + = rear sliding more (oversteer), - = front (understeer).
 TUNE.BAL_DEADBAND     = 0.05  -- rad (~3 deg) of difference that still counts as neutral
@@ -101,6 +130,8 @@ TUNE.US_PAST_FULL     = 0.175 -- rad (~10 deg): full orange
 TUNE.US_PAST_LEAD     = 0.035 -- rad (~2 deg) more than the rear where it starts ...
 TUNE.US_PAST_LEAD_FULL = 0.07 -- rad (~4 deg) ... and full
 TUNE.US_MIN_YAW       = 0.10  -- rad/s of rotation before it's shown at full strength
+-- tests can override any of the TUNE values
+if type(VGS_TUNE_OVERRIDE) == "table" then for k2, v2 in pairs(VGS_TUNE_OVERRIDE) do TUNE[k2] = v2 end end
 -- ===========================================================================
 
 local G = 9.81
@@ -131,13 +162,14 @@ local coupled = {}      -- [objId] = number of couplers attached to that vehicle
 -- Kinematics, updated every frame
 local kin = {
   latAccel = 0, gx = 0, gy = 0, gdx = 0, gdy = 0, gInit = false,
-  yawRate = 0, yawSign = 1, yawCheck = 0, lastFwd = nil, lastRight = nil,
+  yawRate = 0, yawFast = 0, yawSign = 1, yawCheck = 0, lastFwd = nil, lastRight = nil,
   travel = 0, rearTravel = 0,   -- rad, + = axle moving left of where the car points; continuous to +-270
   vring = nil, physYaw = nil, headYaw = nil, vel = nil, speed = 0,
 }
 -- Running estimates for the marker and the balance colour
 local est = { kn = 0, kd = 0, cal = 1, rn = 0, rd = 0, ratio = nil, lock = LOCK_DEFAULT,
               balance = 0, frontSteer = nil, rearSteer = 0, slipF = nil, slipR = nil, shown = nil }
+local mark = { init = false, y = 0, d = 0, df = 0, ds = 0, s = 0 }   -- the marker's smoothing
 local diag = {}         -- values behind the marker, for dumpTravel
 local watch = { travel = 0, travelNext = 0, assists = false, assistValues = {} }
 
@@ -814,6 +846,7 @@ local function resetState()
   everDriven, nodeCidByName, wstate = {}, nil, {}
   kin.latAccel, kin.gx, kin.gy, kin.gdx, kin.gdy, kin.gInit = 0, 0, 0, 0, 0, false
   kin.yawRate, kin.yawCheck, kin.lastFwd, kin.lastRight, kin.travel, kin.rearTravel = 0, 0, nil, nil, 0, 0
+  kin.yawFast, mark.init = 0, false
   kin.vring = newRing(128)
   est.kn, est.kd, est.cal, est.rn, est.rd, est.ratio, est.lock = 0, 0, 1, 0, 0, nil, LOCK_DEFAULT
   est.balance, est.frontSteer, est.rearSteer, est.slipF, est.slipR, est.shown = 0, nil, 0, nil, nil, nil
@@ -884,7 +917,11 @@ local function updateYaw(dt, fwd, right)
     end
     raw = kin.yawSign * physYaw
   end
-  if raw then kin.yawRate = kin.yawRate + (raw - kin.yawRate) * clamp(dt * YAW_SMOOTH_HZ, 0, 1) end
+  if raw then
+    kin.yawRate = kin.yawRate + (raw - kin.yawRate) * clamp(dt * YAW_SMOOTH_HZ, 0, 1)
+    if TUNE.MARK_YAW_HZ > 0 then kin.yawFast = kin.yawFast + (raw - kin.yawFast) * lpAlpha(TUNE.MARK_YAW_HZ, dt)
+    else kin.yawFast = raw end
+  end
   kin.physYaw, kin.headYaw = physYaw, headYaw
 end
 
@@ -1050,7 +1087,9 @@ local function updateWheels(dt, fwd, right, speed, ev, hasGraph)
       local brakeMax = w.brakeTorque or 0
       local slip     = math.abs(w.lastSlip or 0)
       local broken   = w.isBroken and true or false
-      local airborne = broken or fz < MIN_LOAD
+      -- off the ground below MIN_LOAD, back on it above twice that (no flicker on a wheel skimming the road)
+      if fz < MIN_LOAD then S.air = true elseif fz > MIN_LOAD * 2 then S.air = false end
+      local airborne = broken or S.air
       if math.abs(drive) > 1 then everDriven[i] = true end
       local driven
       if hasGraph then driven = liveDriven[i] or false
@@ -1135,6 +1174,7 @@ local function updateWheels(dt, fwd, right, speed, ev, hasGraph)
       o.t  = round(torque, 3)                          -- -1 full brake .. +1 full drive
       o.dr = round(driveline, 3)                       -- driveline only: + drive, - engine braking / regen
       o.b  = broken and 1 or 0
+      o.a  = (S.air and not broken) and 1 or nil      -- off the ground
       o.fl = (not broken and (w.isTireDeflated or w.isPunctured)) and 1 or nil   -- flat or punctured
       o.sl = round(slip, 2)                            -- contact-patch slip, m/s
       o.iv = iv
@@ -1143,6 +1183,55 @@ local function updateWheels(dt, fwd, right, speed, ev, hasGraph)
   est.frontSteer = fN > 0 and fSum / fN or nil
   est.rearSteer = rN > 0 and rSum / rN or 0
   est.rearSteerN = rN
+end
+
+-- The steering scale (see TUNE.STEER_EXPAND), the same as the app's.
+local function asinhNorm(x, k) return math.log(k * x + math.sqrt(k * k * x * x + 1)) / math.log(k + math.sqrt(k * k + 1)) end
+local function steerK(ref)
+  local k0, target, kMax = TUNE.STEER_EXPAND, TUNE.STEER_TARGET, TUNE.STEER_K_MAX
+  if not (target > 0) or not ref or not (ref > 0) or ref >= 1 then return k0 end
+  if k0 > 0 and asinhNorm(ref, k0) >= target then return k0 end
+  if asinhNorm(ref, kMax) <= target then return kMax end
+  local lo, hi = math.log(math.max(k0, 1)), math.log(kMax)
+  for _ = 1, 30 do   -- asinhNorm grows with k: bisect on log k
+    local mid = (lo + hi) / 2
+    if asinhNorm(ref, math.exp(mid)) < target then lo = mid else hi = mid end
+  end
+  return math.exp((lo + hi) / 2)
+end
+local function toScale(x, k)   -- steering-input units -> share of the quarter turn as drawn
+  local a = math.abs(x)
+  if not (k > 0) or a >= 1 then return x end
+  return (x < 0 and -1 or 1) * asinhNorm(a, k)
+end
+local function fromScale(u, k)
+  local a = math.abs(u)
+  if not (k > 0) or a >= 1 then return u end
+  local e = math.exp(a * math.log(k + math.sqrt(k * k + 1)))
+  return (u < 0 and -1 or 1) * (e - 1 / e) / 2 / k
+end
+
+-- the marker's smoothing (see TUNE.MARK_MIN_CUTOFF), on where it's drawn, in degrees of rim.
+-- grip: 1 while the rear grips, easing to 0 as it slides. In a slide the marker comes from the
+-- hubs' measurement, already smoothed and moving a long way, so the smoothing fades out with
+-- it and a slide is shown as quickly as ever.
+local function markerFilter(dt, tv, steerIn, k, grip)
+  local x, s = toScale(tv, k) * 90, toScale(steerIn, k) * 90
+  if not mark.init then
+    mark.y, mark.d, mark.df, mark.ds, mark.s, mark.init = x, 0, 0, 0, s, true
+    return tv
+  end
+  local rate = (x - mark.y) / dt
+  mark.d = mark.d + (rate - mark.d) * lpAlpha(TUNE.MARK_D_CUTOFF, dt)
+  mark.df = mark.df + (rate - mark.df) * lpAlpha(TUNE.MARK_D_FAST_CUTOFF, dt)
+  mark.ds = mark.ds + ((s - mark.s) / dt - mark.ds) * lpAlpha(TUNE.MARK_STEER_CUTOFF, dt)
+  mark.s = s
+  local fast = math.max(0, math.abs(mark.df) - TUNE.MARK_FAST_FROM)
+  local cutoff = TUNE.MARK_MIN_CUTOFF + TUNE.MARK_BETA * math.abs(mark.d) + TUNE.MARK_BETA2 * fast * fast
+    + TUNE.MARK_STEER_GAIN * math.abs(mark.ds)
+  mark.y = mark.y + (x - mark.y) * lpAlpha(cutoff, dt)
+  if grip < 1 then mark.y = x + (mark.y - x) * grip end
+  return fromScale(mark.y / 90, k)
 end
 
 -- How much the car is actually turning, as a steering angle, on the steering arc's scale, and
@@ -1195,7 +1284,7 @@ local function updateTravel(dt, fwd, right, ev)
   local vFwd = vel:dot(fwd)
   local speed2d = math.sqrt(vFwd ^ 2 + vel:dot(right) ^ 2)
   local reversing = (ev.gearIndex or 0) < 0 and vFwd < 0
-  inputs.tv, inputs.sr, inputs.ta, inputs.bal = nil, nil, nil, nil
+  inputs.tv, inputs.sr, inputs.k, inputs.ta, inputs.bal = nil, nil, nil, nil, nil
   est.shown = nil
   if speed2d > TRAVEL_FADE_LO and front and not reversing then
     -- The front axle's direction against the rear axle's path while the rear grips (plus any
@@ -1211,14 +1300,17 @@ local function updateTravel(dt, fwd, right, ev)
     local kinTurn = kinHub
     if rear and vFwd > 3 then
       -- rigid car: front minus rear direction = atan(wheelbase x yaw rate / forward speed)
-      local kinYaw = math.atan2((front.y - rear.y) * kin.yawRate, vFwd)
+      -- (calibrated against the hubs with the smoothed yaw rate, whose delay matches theirs;
+      -- shown from the unsmoothed one, for the least delay)
+      local wb = front.y - rear.y
+      local kinYaw = math.atan2(wb * kin.yawRate, vFwd)
       if w > 0.99 and math.abs(kinYaw) > 0.003 then   -- calibrate against the hubs while gripping
         local f = 1 - dt / TUNE.TURN_CAL_TAU
         est.kn = est.kn * f + kinHub * kinYaw
         est.kd = est.kd * f + kinYaw * kinYaw
       end
       est.cal = clamp((est.kn + 0.002) / (est.kd + 0.002), 0.6, 1.4)
-      kinTurn = est.cal * kinYaw
+      kinTurn = est.cal * math.atan2(wb * kin.yawFast, vFwd)
     end
     local rs = est.rearSteer
     if math.abs(rs) < 0.01 then rs = 0 end   -- unsteered rear axle: ignore the nodes' noise
@@ -1235,12 +1327,18 @@ local function updateTravel(dt, fwd, right, ev)
     end
     local eps = 2e-4   -- a little of the full-lock ratio, for when there's been no steering
     est.ratio = clamp((est.rn + est.lock * eps) / (est.rd + eps), est.lock * 0.3, est.lock * 1.5)
-    inputs.tv = round(clamp(shown / est.ratio, -TRAVEL_MAX, TRAVEL_MAX), 4)   -- + = left of the nose
-    if rear and vFwd > 3 then   -- the steering a 1 g corner needs at this speed, for the app's scale
-      inputs.sr = round(((front.y - rear.y) * G / (vFwd * vFwd) + 0.03) / est.lock, 4)
-    end
+    -- the steering a 1 g corner needs at this speed sets the scale's stretch (TUNE.STEER_TARGET)
+    local sr = (rear and vFwd > 3) and ((front.y - rear.y) * G / (vFwd * vFwd) + 0.03) / est.lock or nil
+    local k = steerK(sr)
+    inputs.sr = sr and round(sr, 4) or nil
+    inputs.k = round(k, 3)                           -- the scale's stretch, for the app
+    local tvRaw = clamp(shown / est.ratio, -TRAVEL_MAX, TRAVEL_MAX)
+    diag.tvRaw = tvRaw
+    inputs.tv = round(clamp(markerFilter(dt, tvRaw, steerIn, k, w), -TRAVEL_MAX, TRAVEL_MAX), 4)   -- + = left of the nose
     inputs.ta = round(clamp((speed2d - TRAVEL_FADE_LO) / (TRAVEL_FADE_HI - TRAVEL_FADE_LO), 0, 1), 2)
     inputs.bal = round(est.balance, 3)   -- -1 understeer .. 0 neutral .. +1 oversteer
+  else
+    mark.init = false   -- hidden: start afresh when it shows again
   end
 
   -- Inputs for the rim arcs. Steering like BeamNG's Steering app (steering_input, negative to
@@ -1648,7 +1746,7 @@ M.dumpDrivetrain    = function() protect('dumpDrivetrain', dumpDrivetrain) end
 M.dumpAssists       = function() protect('dumpAssists', dumpAssists) end
 M.watchAssists      = function(on) watch.assists = on ~= false; watch.assistValues = {} end
 M.dumpTravel        = function(seconds) watch.travel, watch.travelNext = tonumber(seconds) or 10, 0 end
-M.travelState       = function() return diag, est.lock, kin.travel, kin.rearTravel, kin.yawRate end   -- for tests
+M.travelState       = function() return diag, est.lock, kin.travel, kin.rearTravel, kin.yawRate, est.ratio end   -- for tests
 M.onExtensionLoaded = function() protect('load', resetState) end
 M.onReset           = function() protect('reset', resetState) end
 M.updateGFX         = updateGFX
