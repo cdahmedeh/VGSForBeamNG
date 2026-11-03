@@ -1626,7 +1626,8 @@
   // which vehicles make up the player's chain ('VGSChain'). The layout comes as a separate block
   // (st) when it changes and every couple of seconds; it's kept per vehicle and merged with the
   // live values into the shape the renderer draws.
-  var DYN_KEYS = ['d', 's', 'g', 'e', 'ex', 't', 'dr', 'b', 'fl', 'sl', 'iv', 'sa', 'sr', 'ws', 'fz', 'dq', 'bq', 'tt', 'tc', 'tp', 'bt'];
+  // layout fields a live update never overwrites (everything else it sends is copied as is)
+  var STATIC_KEYS = { i: 1, n: 1, nt: 1, rd: 1, wd: 1, x: 1, y: 1 };
   var READ_WHEEL = ['g', 'sa', 'sr', 'fz', 'tt', 'tc', 'tp', 'bt', 'sl'];
   var READ_VD = ['v', 'yr', 'beta', 'fw', 'turn', 'af', 'ar', 'rpm'];
   var STALE_MS = 1500;   // a coupled body this far behind the lead vehicle's updates is dropped
@@ -1711,7 +1712,11 @@
         if (!byI) { byI = {}; dw.forEach(function (x) { byI[x.i] = x; }); }
         src = byI[w.i];
       }
-      for (var j = 0; j < DYN_KEYS.length; j++) w[DYN_KEYS[j]] = src ? src[DYN_KEYS[j]] : undefined;
+      // every live value the vehicle sends for this wheel; values it stopped sending go
+      var old = w._live || [], now = [], key, j;
+      for (j = 0; j < old.length; j++) w[old[j]] = undefined;
+      if (src) for (key in src) if (!STATIC_KEYS[key]) { w[key] = src[key]; now.push(key); }
+      w._live = now;
     });
     var ds = toArray(d.src);
     m.sources.forEach(function (s, k) { var x = ds[k] || {}; s.tc = x.tc; s.tf = x.tf; });
