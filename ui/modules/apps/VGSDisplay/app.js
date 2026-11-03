@@ -30,7 +30,7 @@
     panelStroke: 'rgba(255, 255, 255, 0.22)',
     tyreBg:      'rgba(0, 0, 0, 0.5)',
     broken:      'rgba(160, 160, 160, 0.6)',
-    airborne:    'rgba(165, 215, 250, 0.95)',   // inside of a wheel that's off the ground
+    airborne:    'rgb(40, 130, 235)',   // inside of a wheel that's off the ground: a strong blue, unlike the white grip bar and the slide reds
     text:        'rgba(255, 255, 255, 0.88)'
   };
 
