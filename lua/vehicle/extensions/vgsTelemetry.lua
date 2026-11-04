@@ -116,6 +116,16 @@ TUNE.BAL_FULL         = 0.21  -- rad (~12 deg) of difference shown as the full c
 TUNE.BAL_SLIP_START   = 0.08  -- rad (~4.5 deg): the rear must pass this to colour at all
 TUNE.BAL_SLIP_FULL    = 0.14  -- rad (~8 deg, around a road tyre's peak): full colour from here
 TUNE.BAL_MIN_YAW      = 0.15  -- rad/s of rotation before it's shown at full strength
+-- A controlled drift is shown in its own colour (aquamarine), full magenta being kept for
+-- oversteer that's getting away. A slide counts as controlled when the countersteer matches it
+-- (the front tyres slip only a few degrees: the steering points about where the front is
+-- going) and it isn't growing fast (not spinning away). Recovering from a slide counts too.
+TUNE.DRIFT_STEER_OK   = 0.09  -- rad (~5 deg) of front slip still fully controlled
+TUNE.DRIFT_STEER_OFF  = 0.26  -- rad (~15 deg): not controlled (the steering well off the slide)
+TUNE.DRIFT_GROW_OK    = 0.35  -- rad/s (~20 deg/s) the slide can grow and still be controlled
+TUNE.DRIFT_GROW_OFF   = 1.0   -- rad/s (~57 deg/s): spinning away
+TUNE.DRIFT_MAX_ANGLE  = 1.57  -- rad (90 deg) of slide: past this it's a spin, whatever the steering
+TUNE.DRIFT_RATE_HZ    = 4     -- Hz: smoothing of the slide's growth rate
 -- Understeer comes in two stages (0 .. -US_WARN_SHARE, then on to -1):
 --  1. a warning as the front tyres approach their limit: front slip on its way to a road tyre's
 --     peak, together with the front slipping more than the rear;
@@ -168,7 +178,8 @@ local kin = {
 }
 -- Running estimates for the marker and the balance colour
 local est = { kn = 0, kd = 0, cal = 1, rn = 0, rd = 0, ratio = nil, lock = LOCK_DEFAULT,
-              balance = 0, frontSteer = nil, rearSteer = 0, slipF = nil, slipR = nil, shown = nil }
+              balance = 0, frontSteer = nil, rearSteer = 0, slipF = nil, slipR = nil, shown = nil,
+              drift = 0, slideRate = 0, prevSlide = nil }
 local mark = { init = false, y = 0, d = 0, df = 0, ds = 0, s = 0 }   -- the marker's smoothing
 local diag = {}         -- values behind the marker, for dumpTravel
 local watch = { travel = 0, travelNext = 0, assists = false, assistValues = {} }
@@ -850,6 +861,7 @@ local function resetState()
   kin.vring = newRing(128)
   est.kn, est.kd, est.cal, est.rn, est.rd, est.ratio, est.lock = 0, 0, 1, 0, 0, nil, LOCK_DEFAULT
   est.balance, est.frontSteer, est.rearSteer, est.slipF, est.slipR, est.shown = 0, nil, 0, nil, nil, nil
+  est.drift, est.slideRate, est.prevSlide = 0, 0, nil
   out.inp, out.vd = {}, nil
   for k in pairs(vdOut) do vdOut[k] = nil end
   tx.since, tx.sinceStatic, tx.sincePing, tx.staticDue = 0, math.huge, math.huge, true
@@ -1278,13 +1290,29 @@ local function updateTravel(dt, fwd, right, ev)
   end
   est.balance = est.balance + (target - est.balance) * clamp(TRAVEL_SMOOTH_HZ * dt, 0, 1)
 
+  -- how controlled a slide is (see TUNE.DRIFT_STEER_OK): 1 = a controlled drift
+  local control = 0
+  if est.slipF and rear then
+    local slide = wrapAngle(est.rearSteer - kin.rearTravel)   -- the rear's true sliding angle
+    local rate = est.prevSlide and wrapAngle(slide - est.prevSlide) / dt or 0
+    est.prevSlide = slide
+    est.slideRate = est.slideRate + (rate - est.slideRate) * lpAlpha(TUNE.DRIFT_RATE_HZ, dt)
+    local growing = math.max(0, est.slideRate * (slide >= 0 and 1 or -1))   -- shrinking (recovering) is fine
+    local steerOk = 1 - smoothstep((math.abs(est.slipF) - TUNE.DRIFT_STEER_OK) / (TUNE.DRIFT_STEER_OFF - TUNE.DRIFT_STEER_OK))
+    local holding = 1 - smoothstep((growing - TUNE.DRIFT_GROW_OK) / (TUNE.DRIFT_GROW_OFF - TUNE.DRIFT_GROW_OK))
+    control = (math.abs(slide) > TUNE.DRIFT_MAX_ANGLE) and 0 or steerOk * holding
+  else
+    est.prevSlide = nil
+  end
+  est.drift = est.drift + (control - est.drift) * clamp(TRAVEL_SMOOTH_HZ * dt, 0, 1)
+
   -- Shown whenever the car is moving, including sliding backwards in a spin, but not when
   -- reversing on purpose (reverse gear and rolling backwards).
   local vel = kin.vel
   local vFwd = vel:dot(fwd)
   local speed2d = math.sqrt(vFwd ^ 2 + vel:dot(right) ^ 2)
   local reversing = (ev.gearIndex or 0) < 0 and vFwd < 0
-  inputs.tv, inputs.sr, inputs.k, inputs.ta, inputs.bal = nil, nil, nil, nil, nil
+  inputs.tv, inputs.sr, inputs.k, inputs.ta, inputs.bal, inputs.dc = nil, nil, nil, nil, nil, nil
   est.shown = nil
   if speed2d > TRAVEL_FADE_LO and front and not reversing then
     -- The front axle's direction against the rear axle's path while the rear grips (plus any
@@ -1337,6 +1365,7 @@ local function updateTravel(dt, fwd, right, ev)
     inputs.tv = round(clamp(markerFilter(dt, tvRaw, steerIn, k, w), -TRAVEL_MAX, TRAVEL_MAX), 4)   -- + = left of the nose
     inputs.ta = round(clamp((speed2d - TRAVEL_FADE_LO) / (TRAVEL_FADE_HI - TRAVEL_FADE_LO), 0, 1), 2)
     inputs.bal = round(est.balance, 3)   -- -1 understeer .. 0 neutral .. +1 oversteer
+    inputs.dc = (est.balance > 0.01) and round(est.drift, 2) or nil   -- oversteer: 1 = a controlled drift
   else
     mark.init = false   -- hidden: start afresh when it shows again
   end

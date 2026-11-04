@@ -751,14 +751,22 @@
   // Direction of travel: a small marker just inside the steering arc, on the same scale (a quarter
   // turn = full lock), where the front axle is actually going. Steering at the marker points the
   // front wheels exactly where they're travelling. It goes on round the circle in big slides.
-  // The marker's colour shows the balance: light blue when neutral, magenta as the rear slides
-  // more (oversteer). Understeer comes in two stages: up to UNDER_WARN of the scale is the
+  // The marker's colour shows the balance: light blue when neutral. Oversteer (the rear sliding
+  // more) goes towards magenta, or towards aquamarine for a controlled drift (inp.dc, 0..1: the
+  // countersteer matching the slide and the slide not growing; see TUNE.DRIFT_* in
+  // vgsTelemetry.lua). Aquamarine: a "good, in control" green that doesn't clash with the
+  // throttle arc or drive outlines, and the colour that stays most distinct from magenta, the
+  // light blue and the oranges with the common kinds of colour blindness (checked by simulation). Understeer comes in two stages: up to UNDER_WARN of the scale is the
   // warning as the front nears its limit, light blue to a light orange; beyond it is understeer
   // proper, the front past its peak, light orange deepening to full orange.
-  var TRAVEL_COLOUR = { neutral: [150, 210, 245], warn: [250, 200, 140], under: [255, 150, 45], over: [235, 70, 205] };
+  var TRAVEL_COLOUR = { neutral: [150, 210, 245], warn: [250, 200, 140], under: [255, 150, 45], over: [235, 70, 205], drift: [140, 255, 224] };
   var UNDER_WARN = 0.35;   // must match US_WARN_SHARE in vgsTelemetry.lua
-  function travelColour(bal) {
+  function travelColour(bal, drift) {
     var b = clamp(+bal || 0, -1, 1), k = Math.abs(b), from = TRAVEL_COLOUR.neutral, to = TRAVEL_COLOUR.over;
+    if (b > 0 && +drift > 0) {   // oversteer: magenta, aquamarine for a controlled drift
+      var dc = clamp(+drift, 0, 1), o = TRAVEL_COLOUR.over, dr = TRAVEL_COLOUR.drift;
+      to = [0, 1, 2].map(function (i) { return o[i] + (dr[i] - o[i]) * dc; });
+    }
     if (b < 0) {
       if (k <= UNDER_WARN) { to = TRAVEL_COLOUR.warn; k = k / UNDER_WARN; }
       else { from = TRAVEL_COLOUR.warn; to = TRAVEL_COLOUR.under; k = (k - UNDER_WARN) / (1 - UNDER_WARN); }
@@ -850,7 +858,7 @@
       ctx.lineTo(cx + ux * base + px * half, cy + uy * base + py * half);
       ctx.lineTo(cx + ux * base - px * half, cy + uy * base - py * half);
       ctx.closePath();
-      ctx.fillStyle = travelColour(inp.bal);
+      ctx.fillStyle = travelColour(inp.bal, inp.dc);
       ctx.strokeStyle = 'rgba(10, 12, 16, 0.7)'; ctx.lineWidth = 1; ctx.lineJoin = 'round';
       ctx.fill(); ctx.stroke();
       ctx.globalAlpha = 1;
@@ -1212,10 +1220,10 @@
       var diff = (af !== undefined && ar !== undefined) ? degOf(af - ar) : undefined;   // + = front slipping more
       var status = '–', colour = PANEL.dim;
       if (bal !== undefined && bal !== null) {
-        colour = travelColour(bal);
+        colour = travelColour(bal, inp.dc);
         if (bal <= -UNDER_WARN) status = 'Understeer';
         else if (bal < -0.04) status = 'Front near limit';
-        else if (bal >= 0.15) status = 'Oversteer';
+        else if (bal >= 0.15) status = (+inp.dc >= 0.6) ? 'Drifting, in control' : 'Oversteer';
         else { status = 'Neutral'; colour = PANEL.text; }
       }
       text(ctx, 'BALANCE', x, y + 0.85 * f, 0.72 * f, 600, PANEL.label);
@@ -1226,7 +1234,7 @@
       var dv = sm('vd.bal', diff);
       if (dv !== undefined) {
         var len = clamp(dv / 8, -1, 1) * w / 2;
-        ctx.fillStyle = bal !== undefined ? travelColour(bal) : PANEL.grip;
+        ctx.fillStyle = bal !== undefined ? travelColour(bal, inp.dc) : PANEL.grip;
         ctx.fillRect(len > 0 ? cx - len : cx, by - bh / 2, Math.abs(len), bh);
       }
       ctx.fillStyle = PANEL.tick; ctx.fillRect(cx - 0.5, by - bh, 1, bh * 2);
