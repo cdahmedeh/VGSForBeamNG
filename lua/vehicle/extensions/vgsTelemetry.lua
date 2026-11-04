@@ -96,8 +96,8 @@ TUNE.STEER_K_MAX      = 400
 -- In a simulated test with yaw-rate noise and hub vibration, against the earlier fixed
 -- smoothing: about twice as steady on a straight at highway speed, three to four times in a
 -- curve, and the delay behind the real turn of the car cut from 60-84 ms to 26-36 ms.
-TUNE.MARK_MIN_CUTOFF  = 0.5   -- Hz while still (lower = stiller)
-TUNE.MARK_BETA        = 0.015 -- Hz per deg/s of its own movement (slides, the car settling)
+TUNE.MARK_MIN_CUTOFF  = 0.3   -- Hz while still (lower = stiller)
+TUNE.MARK_BETA        = 0.005 -- Hz per deg/s of its own movement (slides, the car settling)
 TUNE.MARK_D_CUTOFF    = 0.5   -- Hz: smoothing of that movement estimate
 TUNE.MARK_STEER_GAIN  = 0.06  -- Hz per deg/s of steering movement (on the same scale)
 TUNE.MARK_STEER_CUTOFF = 8    -- Hz: smoothing of the steering's movement
@@ -200,6 +200,16 @@ local function wrapAngle(a)   -- to -pi .. pi
   a = (a + math.pi) % (2 * math.pi)
   if a < 0 then a = a + 2 * math.pi end
   return a - math.pi
+end
+
+-- Real (wall-clock) milliseconds. os.clockhp is BeamNG's high-resolution clock in seconds; without
+-- it, simulation time stands in (exact except in slow motion).
+local function realMs()
+  if os.clockhp then
+    local ok, t = pcall(os.clockhp)
+    if ok and type(t) == "number" then return t * 1000 end
+  end
+  return clock * 1000
 end
 
 local function round(v, digits)
@@ -1362,7 +1372,7 @@ local function updateTravel(dt, fwd, right, ev)
     inputs.k = round(k, 3)                           -- the scale's stretch, for the app
     local tvRaw = clamp(shown / est.ratio, -TRAVEL_MAX, TRAVEL_MAX)
     diag.tvRaw = tvRaw
-    inputs.tv = round(clamp(markerFilter(dt, tvRaw, steerIn, k, w), -TRAVEL_MAX, TRAVEL_MAX), 4)   -- + = left of the nose
+    inputs.tv = round(clamp(markerFilter(dt, tvRaw, steerIn, k, w), -TRAVEL_MAX, TRAVEL_MAX), 6)   -- + = left of the nose
     inputs.ta = round(clamp((speed2d - TRAVEL_FADE_LO) / (TRAVEL_FADE_HI - TRAVEL_FADE_LO), 0, 1), 2)
     inputs.bal = round(est.balance, 3)   -- -1 understeer .. 0 neutral .. +1 oversteer
     inputs.dc = (est.balance > 0.01) and round(est.drift, 2) or nil   -- oversteer: 1 = a controlled drift
@@ -1374,7 +1384,7 @@ local function updateTravel(dt, fwd, right, ev)
   -- the left; we send + = left); pedals like its Simple Pedals app (applied throttle, brake,
   -- clutch, parkingbrake in whole percent: anything not exactly 0 shows at least 1 %, only
   -- exactly full shows 100 %).
-  inputs.s = round(steerIn, 3)
+  inputs.s = round(steerIn, 5)   -- fine enough that the stretched centre of the scale moves smoothly
   inputs.t = pedalLevel(ev.throttle)
   inputs.b = pedalLevel(ev.brake)
   inputs.c = pedalLevel(ev.clutch)
@@ -1446,6 +1456,9 @@ local function send(fwd, right, ev)
   local pos = obj:getPosition()
   local p = out
   p.v, p.id, p.lv = PROTOCOL, obj:getId(), tx.lv
+  -- when this frame happened, in real milliseconds, so the app can space the updates exactly
+  -- as the game produced them and draw smooth motion between them at the screen's own rate
+  p.ts = round(realMs(), 2)
   p.pl = (playerInfo and playerInfo.firstPlayerSeated) and 1 or nil
   p.px, p.py = round(pos.x, 2), round(pos.y, 2)
   p.hx, p.hy = round(fwd.x, 4), round(fwd.y, 4)

@@ -836,7 +836,9 @@
     var tv = hasTravel ? clamp(+inp.tv || 0, -4, 4) : 0, alpha = clamp(inp.ta === undefined ? 1 : +inp.ta, 0, 1);
     ctx.lineWidth = lw; ctx.lineCap = 'butt';
     var sk = +inp.k > 0 ? +inp.k : steerK(+inp.sr);   // the vehicle sends the scale's stretch
-    var steerShown = steerScale(steer, sk);
+    // sd, tvd: the steering and the marker already on the scale, as they are this very frame
+    // (see Motion); without them (still pictures), from the raw values
+    var steerShown = inp.sd !== undefined ? clamp(+inp.sd, -1, 1) : steerScale(steer, sk);
     if (steerShown > 0) arc(INPUT.steer, TOP - steerShown * Q, TOP);        // left: counter-clockwise from the top
     else if (steerShown < 0) arc(INPUT.steer, TOP, TOP - steerShown * Q);   // right: clockwise from the top
     // ABS working: the brake arc pulses; traction control working: the throttle arc pulses
@@ -850,7 +852,7 @@
     arc(INPUT.clutch, BOTTOM - clu * Q, BOTTOM);
     // the marker: a small wedge pointing out at the steering arc, where the front is going
     if (hasTravel && alpha > 0) {
-      var ang = TOP - steerScale(tv, sk) * Q, mh = markerSize(rPx), tip = rPx - lw - 0.5, base = tip - mh, half = mh * 0.5;
+      var ang = TOP - (inp.tvd !== undefined ? +inp.tvd : steerScale(tv, sk)) * Q, mh = markerSize(rPx), tip = rPx - lw - 0.5, base = tip - mh, half = mh * 0.5;
       var ux = Math.cos(ang), uy = Math.sin(ang), px = -uy, py = ux;
       ctx.globalAlpha = alpha;
       ctx.beginPath();
@@ -871,6 +873,7 @@
   // fading ghosts, like a mouse trail, so the dot leaves a path.
   var GF_MAX = 1.5;          // g at the edge of the circle (road cars peak around 1 g)
   var TRAIL_MS = 1300;       // how long a ghost takes to fade out completely
+  var TRAIL_STEP_MS = 12;    // at most one trail point this often, however fast the screen refreshes
   var GF_COLOUR = [240, 215, 130];   // soft butter yellow, to sit with the muted drivetrain colours
   var GF_ALPHA = 0.5;                 // see-through, so the part underneath still shows
   var GF_RIM_ALPHA = 0.65;            // the rim is a little stronger so the dot keeps its shape
@@ -880,7 +883,9 @@
     var gx = +gf.x || 0, gy = +gf.y || 0, mag = Math.hypot(gx, gy);
     if (mag > GF_MAX) { gx *= GF_MAX / mag; gy *= GF_MAX / mag; }   // pin to the edge
     // positions are stored as fractions of the radius so a resize doesn't smear the trail
-    trail.push({ x: gx / GF_MAX, y: -gy / GF_MAX, t: now });
+    var last = trail[trail.length - 1];
+    if (last && now - last.t < TRAIL_STEP_MS) { last.x = gx / GF_MAX; last.y = -gy / GF_MAX; }   // drawing faster than the trail needs
+    else trail.push({ x: gx / GF_MAX, y: -gy / GF_MAX, t: now });
     while (trail.length && now - trail[0].t > TRAIL_MS) trail.shift();
 
     var dotR = clamp(R * 0.05, 3, 7.5), reach = R - dotR - 2;
@@ -1171,7 +1176,14 @@
     return half >= inner ? inner : inner - Math.sqrt(inner * inner - half * half);
   }
   // Where the two lines go, worked out for the longest text so nothing moves as it changes.
+  var balanceCache = { key: null, val: null };
   function balanceLayout(ctx, rPx, inner, compact) {
+    var key = rPx.toFixed(2) + '|' + inner.toFixed(2) + '|' + compact;
+    if (balanceCache.key === key) return balanceCache.val;
+    balanceCache.key = key;
+    return (balanceCache.val = balanceLayoutNow(ctx, rPx, inner, compact));
+  }
+  function balanceLayoutNow(ctx, rPx, inner, compact) {
     var fs = balanceFont(rPx), dfs = degreeFont(rPx), h1 = dfs * 1.05, h2 = fs * 1.2;
     var w1 = measure(ctx, '88.8°', dfs, 700), w2 = measure(ctx, compact ? 'Near limit' : 'Front near limit', fs, 600);
     var drop = Math.max(chordDrop(inner, w1), chordDrop(inner, w2) - h1) + 1;
@@ -1192,18 +1204,29 @@
 
 
   // ===== Renderer ==========================================================
+  // The wheel list to draw, and the layout worked out from it, are kept with the body and reused
+  // while its layout stays the same (only the live values are refreshed), so a frame doesn't
+  // redo the layout.
   function prepareBodies(data) {
     return toArray(data && data.bodies)
       .map(function (b) {
-        var wheels = [];
-        toArray(b.wheels).forEach(function (w, k) {
-          if (w.i === undefined) w.i = k;   // older payloads without ids
-          // a wheel standing in for a dual pair (w.nt = 2) is drawn as that many tyres;
-          // they share its data and are laid out side by side like any dual set
-          var n = clamp(Math.round(+w.nt || 1), 1, 4);
-          for (var c = 0; c < n; c++) wheels.push(c === 0 ? w : Object.assign({}, w));
-        });
-        return { id: b.id, wheels: wheels, sources: toArray(b.sources), inp: b.inp, gf: b.gf, ext: b.ext, dt: b.dt, vd: b.vd, cg: b.cg, m: b.m };
+        var prep = b._prep;
+        if (!prep || prep.from !== b.wheels || prep.sources !== b.sources || prep.ext !== b.ext) {
+          var wheels = [], dups = [];
+          toArray(b.wheels).forEach(function (w, k) {
+            if (w.i === undefined) w.i = k;   // older payloads without ids
+            // a wheel standing in for a dual pair (w.nt = 2) is drawn as that many tyres;
+            // they share its data and are laid out side by side like any dual set
+            var n = clamp(Math.round(+w.nt || 1), 1, 4);
+            wheels.push(w);
+            for (var c = 1; c < n; c++) { var d = Object.assign({}, w); wheels.push(d); dups.push([d, w]); }
+          });
+          prep = { from: b.wheels, sources: b.sources, ext: b.ext, wheels: wheels, dups: dups, geo: null };
+          try { Object.defineProperty(b, '_prep', { value: prep, writable: true, configurable: true }); } catch (e) { b._prep = prep; }
+        } else {
+          prep.dups.forEach(function (pr) { var d = pr[0], w = pr[1]; for (var key in w) if (key.charAt(0) !== '_') d[key] = w[key]; });
+        }
+        return { id: b.id, wheels: prep.wheels, sources: toArray(b.sources), inp: b.inp, gf: b.gf, ext: b.ext, dt: b.dt, vd: b.vd, cg: b.cg, m: b.m, _prep: prep };
       })
       .filter(function (b) { return b.wheels.length > 0; });
   }
@@ -1221,7 +1244,7 @@
     if (!bodies[0].gf || (this.leadId !== undefined && bodies[0].id !== this.leadId)) trail.length = 0;
     this.leadId = bodies[0].id;
     // every vehicle is laid out from its real footprint when the vehicle reports one
-    bodies.forEach(function (b) { b.geo = bodyGeometry(b.wheels, b.sources, b.ext); });
+    bodies.forEach(function (b) { b.geo = b._prep.geo || (b._prep.geo = bodyGeometry(b.wheels, b.sources, b.ext)); });
 
     var scale, placements = [];
     // The big circle always fills the app; vehicles are scaled to fit inside it, clear of the
@@ -1249,7 +1272,11 @@
     if (bodies.length === 1) {
       // centred on the vehicle's body, one scale for everything (true proportions)
       scale = inner / fitRadius(bodies[0]);
-      if (opts.numbers) scale *= readoutShrink(ctx, bodies[0], scale, inner, band, compact);
+      if (opts.numbers) {   // worked out once per layout and size
+        var sk = [scale.toFixed(4), inner.toFixed(2), band.toFixed(2), compact].join('|'), sc = this.shrinkCache;
+        if (!sc || sc.geo !== bodies[0].geo || sc.key !== sk) sc = this.shrinkCache = { geo: bodies[0].geo, key: sk, k: readoutShrink(ctx, bodies[0], scale, inner, band, compact) };
+        scale *= sc.k;
+      }
       if (bodies[0].geo.hasExt) outline(bodies[0], ccx, ccy);
       placements.push({ body: bodies[0], ox: ccx, oy: ccy });
     } else {
@@ -1340,6 +1367,120 @@
     return 0.35;
   }
 
+  // ===== Motion between updates ===========================================
+  // The app draws at the screen's own rate, which rarely matches the rate updates arrive at
+  // (game frames vary, the UI may run slower, messages arrive in clumps). Showing each update
+  // only as it lands makes moving parts step unevenly. Instead every moving value (the
+  // direction marker, the steering and pedal arcs, the G-force dot, the tyres' steering) is
+  // carried forward from its last update at the speed it was moving, for at most about one
+  // update's time, and when the next update lands any small difference is blended out over a
+  // few milliseconds rather than jumped. Nothing waits for a later update, so this adds no
+  // delay; it only fills the gaps between updates.
+  var MOTION_VEL_TAU = 20;    // ms: smoothing of each value's speed
+  var MOTION_AHEAD = 2.0, MOTION_AHEAD_MIN = 12, MOTION_AHEAD_MAX = 80;   // how far a value is carried forward: updates' spacing x, limits in ms
+  var MOTION_BLEND = 1.2, MOTION_BLEND_MIN = 6, MOTION_BLEND_MAX = 40;    // how fast a difference is blended out: updates' spacing x, limits in ms
+  var MOTION_JUMP = 3;        // a step this many times the one before counts as a jump
+  var CLOCK_DRIFT = 0.01;     // how fast (ms per ms) the clock match may move to later deliveries
+
+  // One moving value. Times are the app's own clock (ms); snap: a jump bigger than this is shown
+  // at once (a reset, a vehicle switch); lo/hi: limits.
+  function Channel(snap, lo, hi) { this.t = null; this.snap = snap; this.lo = lo; this.hi = hi; }
+  Channel.prototype.reset = function () { this.t = null; };
+  Channel.prototype.base = function (now, ahead) {
+    var age = now - this.t, x;
+    if (age <= 0) x = this.v;   // stamped a touch after 'now' (clock jitter): as is
+    else if (age <= ahead) x = this.v + this.vel * age;
+    else x = this.v + this.vel * ahead;   // no update for a while (a hitch, paused): stop there
+    return x;
+  };
+  Channel.prototype.at = function (now, m) {
+    if (this.t === null) return undefined;
+    var x = this.base(now, m.ahead);
+    if (this.e) x += this.e * Math.exp(-(now - this.te) / this.tauE);
+    if (this.lo !== undefined && x < this.lo) x = this.lo;
+    if (this.hi !== undefined && x > this.hi) x = this.hi;
+    return x;
+  };
+  Channel.prototype.push = function (t, v, now, m) {
+    if (v === undefined || v === null || !isFinite(v)) { this.t = null; return; }
+    v = +v;
+    if (this.t === null) { this.t = t; this.v = v; this.vel = 0; this.d1 = 0; this.e = 0; this.te = now; this.tauE = m.blend; return; }
+    var shown = this.at(now, m), dt = t - this.t, jump = false;
+    if (dt > 0.5 && dt < 250) {
+      // The speed to carry it forward at. A step far bigger than the one before (a key press, a
+      // reset) is a jump, not motion: it isn't carried on past where it really is.
+      var d0 = (v - this.v) / dt, d1 = this.d1;
+      jump = Math.abs(d0) > MOTION_JUMP * Math.abs(d1) && Math.abs(d0 - d1) * dt > this.snap * 0.05;
+      var raw = jump ? 0 : d0;
+      this.d1 = d0;
+      this.vel += (raw - this.vel) * (1 - Math.exp(-dt / MOTION_VEL_TAU));
+    } else if (dt >= 250 || dt < -250) { this.vel = 0; this.d1 = 0; }   // a gap (pause): start again from rest
+    this.t = Math.max(t, this.t); this.v = v;
+    var e = shown - this.base(now, m.ahead);
+    this.e = (Math.abs(e) > this.snap) ? 0 : e; this.te = now;
+    this.tauE = jump ? Math.max(MOTION_BLEND_MIN, m.blend / 3) : m.blend;   // a jump catches up faster
+  };
+
+  // A vehicle's moving values, and how its clock (the update's ts) maps onto the app's.
+  function Motion() {
+    this.off = undefined; this.lastTs = undefined; this.lastNow = 0; this.interval = 16.7;
+    this.ahead = MOTION_AHEAD_MIN; this.blend = MOTION_BLEND_MIN;
+    this.ch = {};
+  }
+  Motion.prototype.chan = function (key, snap, lo, hi) {
+    return this.ch[key] || (this.ch[key] = new Channel(snap, lo, hi));
+  };
+  // When (on the app's clock) an update stamped ts happened. The match is the quickest delivery
+  // seen, creeping later only slowly, so a late or clumped delivery doesn't move it.
+  Motion.prototype.when = function (ts, now) {
+    if (typeof ts !== 'number' || !isFinite(ts)) { this.lastNow = now; return now; }
+    var o = now - ts;
+    if (this.off === undefined || Math.abs(o - this.off) > 1000) this.off = o;   // first, or a new clock
+    else this.off = Math.min(o, this.off + CLOCK_DRIFT * Math.max(0, now - this.lastNow));
+    if (this.lastTs !== undefined) {
+      var dt = ts - this.lastTs;
+      if (dt > 0.5 && dt < 250) this.interval += (dt - this.interval) * 0.1;
+    }
+    this.lastTs = ts; this.lastNow = now;
+    this.ahead = clamp(this.interval * MOTION_AHEAD, MOTION_AHEAD_MIN, MOTION_AHEAD_MAX);
+    this.blend = clamp(this.interval * MOTION_BLEND, MOTION_BLEND_MIN, MOTION_BLEND_MAX);
+    return ts + this.off;
+  };
+  // Feed one update (p) with its layout merged in (m).
+  Motion.prototype.feed = function (p, m, now) {
+    var t = this.when(p.ts, now), self = this, inp = p.inp || {};
+    var sk = +inp.k > 0 ? +inp.k : steerK(+inp.sr);
+    this.chan('sd', 0.6).push(t, steerScale(clamp(+inp.s || 0, -1, 1), sk), now, this);
+    var tvd = (inp.tv === undefined || inp.tv === null) ? undefined : steerScale(clamp(+inp.tv || 0, -4, 4), sk);
+    this.chan('tvd', 0.8).push(t, tvd, now, this);
+    ['t', 'b', 'c', 'p'].forEach(function (k) { self.chan(k, 2, 0, 1).push(t, inp[k] === undefined ? undefined : +inp[k] || 0, now, self); });
+    if (p.gf) { this.chan('gx', 1.0).push(t, +p.gf.x || 0, now, this); this.chan('gy', 1.0).push(t, +p.gf.y || 0, now, this); }
+    else { this.chan('gx').reset(); this.chan('gy').reset(); }
+    toArray(m.wheels).forEach(function (w) { self.chan('s' + w.i, 0.5).push(t, w.s === undefined ? undefined : +w.s, now, self); });
+  };
+  // Put the values for the moment 'now' into the merged body (its live values are refreshed from
+  // the latest update first, so nothing builds up).
+  Motion.prototype.apply = function (m, d, now) {
+    var self = this, inp = d.inp, shown = m._inpShown || (m._inpShown = {}), k;
+    if (inp) {
+      for (k in shown) delete shown[k];
+      for (k in inp) shown[k] = inp[k];
+      var sd = this.chan('sd').at(now, this), tvd = this.chan('tvd').at(now, this);
+      if (sd !== undefined) shown.sd = sd;
+      if (tvd !== undefined && inp.tv !== undefined && inp.tv !== null) shown.tvd = tvd;
+      ['t', 'b', 'c', 'p'].forEach(function (c) { var v = self.chan(c).at(now, self); if (v !== undefined) shown[c] = v; });
+      m.inp = shown;
+    } else m.inp = inp;
+    if (d.gf) {
+      var gx = this.chan('gx').at(now, this), gy = this.chan('gy').at(now, this);
+      m.gf = { x: gx === undefined ? d.gf.x : gx, y: gy === undefined ? d.gf.y : gy };
+    } else m.gf = d.gf;
+    toArray(m.wheels).forEach(function (w) {
+      var c = self.ch['s' + w.i], v = c && c.at(now, self);
+      if (v !== undefined) w.s = v;
+    });
+  };
+
   // ===== Data from the game ================================================
   // Each displayed vehicle sends its own updates ('VGSData', straight from its Lua); the hub says
   // which vehicles make up the player's chain ('VGSChain'). The layout comes as a separate block
@@ -1371,6 +1512,7 @@
     if (!p || typeof p.id !== 'number') return null;
     var b = this.bodies[p.id] || (this.bodies[p.id] = { id: p.id });
     if (p.st) { b.st = p.st; b.lv = p.lv; b.merged = null; }
+    if (b.d && b.d.lv !== p.lv && b.motion) b.motion = null;   // a reset: no motion carried over
     b.d = p; b.t = now;
     var ask = null;
     if (!b.st || b.lv !== p.lv) {   // updates without (the current) layout: ask, at most once a second
@@ -1378,6 +1520,7 @@
       return ask;
     }
     var m = mergeBody(b), R = this.read, id = p.id;
+    (b.motion || (b.motion = new Motion())).feed(p, m, now);
     if (p.vd) {   // numbers mode: feed the readouts
       toArray(m.wheels).forEach(function (w) {
         READ_WHEEL.forEach(function (f) { if (w[f] !== undefined && w[f] !== null) R.add(id + ':w' + w.i + '.' + f, w[f]); });
@@ -1433,11 +1576,18 @@
       n.cp.forEach(function (c, j) { c.o = (code >> (3 + j)) & 1 ? 1 : undefined; });
     });
     m.inp = d.inp; m.gf = d.gf; m.vd = d.vd;
+    b.mergedFrom = d;
+    return m;
+  }
+  // the merged body with its moving values as they are at 'now' (when given)
+  function shownBody(b, now) {
+    var m = (b.mergedFrom === b.d && b.merged) ? b.merged : mergeBody(b);
+    if (now !== undefined && b.motion) b.motion.apply(m, b.d, now);
     return m;
   }
 
   // The bodies to draw: the player's vehicle first, then whatever is coupled to it, front to back.
-  VGSStore.prototype.frame = function () {
+  VGSStore.prototype.frame = function (now) {
     var self = this, leadId = this.leadId();
     if (this.chain && this.chain.p < 0) return { bodies: [] };
     var lead = leadId !== undefined ? this.bodies[leadId] : undefined;
@@ -1454,7 +1604,7 @@
     var ref = lead.d, hl = Math.hypot(+ref.hx || 0, +ref.hy || 0) || 1, hx = (+ref.hx || 0) / hl, hy = (+ref.hy || 1) / hl;
     list.forEach(function (b) { b.along = b === lead ? 0 : (b.d.px - ref.px) * hx + (b.d.py - ref.py) * hy; });
     list.sort(function (a, b) { return b.along - a.along; });
-    return { bodies: list.map(mergeBody) };
+    return { bodies: list.map(function (b) { return shownBody(b, now); }) };
   };
 
   VGSRenderer.synthDrivetrain = synthDrivetrain;   // used by the browser preview
@@ -1483,6 +1633,7 @@
   function wantDetail() { return instances.some(function (it) { return it.opts.numbers; }); }
   function pushDetail() { lua('if extensions.vgsHub then extensions.vgsHub.setDetail(' + wantDetail() + ') end'); }
   function nowMsApp() { return (window.performance && performance.now) ? performance.now() : Date.now(); }
+  var ANIMATE_AFTER_MS = 1500;   // keep drawing every refresh this long after the last update (the trail fades)
 
   angular.module('beamng.apps')
   .directive('vgsDisplay', [function () {
@@ -1504,13 +1655,18 @@
         var opts = me.opts;
         instances.push(me);
         var pending = false, alive = true, lastData = 0, lastChain = 0;
-        // Drawing happens once per screen refresh, with whatever arrived last: several updates
-        // in one refresh (a truck and its trailer, a fast game) cost one draw, and nothing waits.
+        // While updates are coming in, the app draws on every screen refresh, with the moving
+        // parts where they are at that moment (see Motion), so motion is as smooth as the screen
+        // allows whatever rate the updates come at. Several updates in one refresh cost one
+        // draw. When updates stop (paused, no vehicle) it carries on just long enough for the
+        // G-force trail to fade, then draws only when something changes.
         var raf = window.requestAnimationFrame ? window.requestAnimationFrame.bind(window) : function (fn) { return setTimeout(fn, 16); };
         function render() {
           pending = false;
           if (!alive) return;
-          try { renderer.draw(store.frame(), opts); } catch (e) { if (window.console) console.error('VGS Display:', e); }
+          var t = nowMsApp();
+          try { renderer.draw(store.frame(t), opts); } catch (e) { if (window.console) console.error('VGS Display:', e); }
+          if (t - lastData < ANIMATE_AFTER_MS) schedule();
         }
         function schedule() { if (!pending && alive) { pending = true; raf(render); } }
         function enableHub() {
