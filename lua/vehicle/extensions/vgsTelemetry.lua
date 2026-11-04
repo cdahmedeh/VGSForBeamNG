@@ -41,6 +41,10 @@ local SLIP_RATIO_FULL  = 1.00
 local PINK_SEVERITY    = 0.2   -- how far towards deep red the colour gets by the end of the pink band
 local RATIO_MIN_SPEED  = 5.0   -- m/s; slip ratio is taken against at least this (no /0 at a crawl)
 local MIN_LOAD         = 150   -- N; below this a wheel is treated as off the ground
+local AIR_SHOW_AFTER   = 0.25  -- s a wheel must be unloaded before it's shown off the ground (not every bump)
+local LIGHT_FRAC       = 0.25  -- a wheel carrying less than this share of its normal load is nearly off the ground
+local LIGHT_HZ         = 2     -- smoothing of the load for that (a bump doesn't flash it)
+local LIGHT_REF_TAU    = 2     -- s: how slowly the normal load is followed
 local GRIP_SMOOTHING   = 0.4   -- share of the gap closed every 1/30 s (higher = snappier)
 local ACCEL_SMOOTH_HZ  = 6     -- low-pass on the lateral acceleration the grip estimate uses
 local LOAD_SMOOTH_HZ   = 0.5   -- low-pass on the wheel load used to scale drive torque
@@ -111,6 +115,10 @@ TUNE.MARK_D_FAST_CUTOFF = 2   -- Hz: smoothing of that quicker estimate
 TUNE.MARK_YAW_HZ      = 10    -- light low-pass on the yaw rate the marker uses, Hz (0 = none)
 -- Understeer / oversteer (the marker's colour): rear slip angle minus front, in the direction
 -- the car is rotating. + = rear sliding more (oversteer), - = front (understeer).
+-- Once the tyres' stiffness is known (the grip model, below: BeamNG's own calibration, or
+-- learnt), understeer and the warnings come from how near each axle is to its limit, and the
+-- car's own designed balance is taken out of the oversteer test (as BeamNG's stability control
+-- does). Until then, the fixed slip angles below are used.
 TUNE.BAL_DEADBAND     = 0.05  -- rad (~3 deg) of difference that still counts as neutral
 TUNE.BAL_FULL         = 0.21  -- rad (~12 deg) of difference shown as the full colour
 TUNE.BAL_SLIP_START   = 0.08  -- rad (~4.5 deg): the rear must pass this to colour at all
@@ -140,6 +148,33 @@ TUNE.US_PAST_FULL     = 0.175 -- rad (~10 deg): full orange
 TUNE.US_PAST_LEAD     = 0.035 -- rad (~2 deg) more than the rear where it starts ...
 TUNE.US_PAST_LEAD_FULL = 0.07 -- rad (~4 deg) ... and full
 TUNE.US_MIN_YAW       = 0.10  -- rad/s of rotation before it's shown at full strength
+-- Grip model: how close each axle is to its grip limit, from the force it's making against what
+-- its tyres would make at the same slip angle if they were still in their linear range (their
+-- cornering stiffness, N/rad: BeamNG's own stability-control calibration when the vehicle has
+-- one, refined while you drive gently, or learnt that way when it has none). That ratio is 1
+-- while a tyre is well within its grip and falls as it nears the peak, to about the same value
+-- at the peak whatever the tyre (a stiff race tyre or a soft off-road one), so the limit is
+-- found for each car without fixed angles. Proximity: 0 = linear, 1 = at the peak.
+TUNE.GRIP_RATIO_PEAK  = 0.42  -- force / (stiffness x slip) at a tyre's peak
+TUNE.GRIP_HZ          = 6     -- smoothing of the sideways acceleration behind the force
+TUNE.GRIP_SLIP_HZ     = 2.8   -- smoothing of the slip, to lag as much as the force does
+TUNE.GRIP_RD_HZ       = 2.7   -- smoothing of the change of rotation, likewise
+TUNE.GRIP_MIN_SPEED   = 4     -- m/s: below this the grip model stays out (fading in over the next 3 m/s)
+TUNE.GRIP_MIN_SLIP    = 0.012 -- rad (~0.7 deg): below this an axle counts as well within its grip
+TUNE.NEAR_ON          = 0.56  -- proximity from which an axle is near its limit (the warning) ...
+TUNE.NEAR_OFF         = 0.46  -- ... and below which it's clear again
+TUNE.PAST_ON          = 1.0   -- proximity from which the front is past its peak (understeer) ...
+TUNE.PAST_OFF         = 0.9   -- ... and below which it's back under it
+TUNE.LEAD             = 0.15  -- one axle this much nearer its limit than the other is the one that's near it
+TUNE.WARN_HOLD        = 0.12  -- s an axle must stay near its limit before the warning shows
+-- learning the stiffness: while cornering gently (well within the grip), steadily
+TUNE.CAL_AY_LO        = 1.0   -- m/s^2 of cornering, at least ...
+TUNE.CAL_AY_HI        = 2.5   -- ... and at most (about a quarter of a road car's grip: still linear)
+TUNE.CAL_SLIP_HI      = 0.05  -- rad (~3 deg) of slip at most
+TUNE.CAL_TAU          = 40    -- s of such driving the estimate averages over
+TUNE.CAL_PRIOR_BNG    = 20    -- s of driving BeamNG's own calibration counts as
+TUNE.CAL_READY        = 2.5   -- s of such cornering before a learnt (not BeamNG's) value is trusted ...
+TUNE.CAL_SPREAD       = 0.0015 -- rad (~0.1 deg): ... over at least this spread of front slip
 -- tests can override any of the TUNE values
 if type(VGS_TUNE_OVERRIDE) == "table" then for k2, v2 in pairs(VGS_TUNE_OVERRIDE) do TUNE[k2] = v2 end end
 -- ===========================================================================
@@ -179,7 +214,8 @@ local kin = {
 -- Running estimates for the marker and the balance colour
 local est = { kn = 0, kd = 0, cal = 1, rn = 0, rd = 0, ratio = nil, lock = LOCK_DEFAULT,
               balance = 0, frontSteer = nil, rearSteer = 0, slipF = nil, slipR = nil, shown = nil,
-              drift = 0, slideRate = 0, prevSlide = nil }
+              drift = 0, slideRate = 0, prevSlide = nil, state = 0 }
+local gm = {}   -- the grip model's state (see gripSetup)
 local mark = { init = false, y = 0, d = 0, df = 0, ds = 0, s = 0 }   -- the marker's smoothing
 local diag = {}         -- values behind the marker, for dumpTravel
 local watch = { travel = 0, travelNext = 0, assists = false, assistValues = {} }
@@ -871,7 +907,8 @@ local function resetState()
   kin.vring = newRing(128)
   est.kn, est.kd, est.cal, est.rn, est.rd, est.ratio, est.lock = 0, 0, 1, 0, 0, nil, LOCK_DEFAULT
   est.balance, est.frontSteer, est.rearSteer, est.slipF, est.slipR, est.shown = 0, nil, 0, nil, nil, nil
-  est.drift, est.slideRate, est.prevSlide = 0, 0, nil
+  est.drift, est.slideRate, est.prevSlide, est.state = 0, 0, nil, 0
+  for k in pairs(gm) do gm[k] = nil end
   out.inp, out.vd = {}, nil
   for k in pairs(vdOut) do vdOut[k] = nil end
   tx.since, tx.sinceStatic, tx.sincePing, tx.staticDue = 0, math.huge, math.huge, true
@@ -910,6 +947,7 @@ local function updateAccel(dt, vel, fwd, right)
   local aLat = ax * right.x + ay * right.y + az * right.z
   local aLon = ax * fwd.x + ay * fwd.y + az * fwd.z
   kin.latAccel = kin.latAccel + (aLat - kin.latAccel) * clamp(dt * ACCEL_SMOOTH_HZ, 0, 1)
+  kin.aLatRaw = aLat   -- the grip model's own, less smoothed (see gripStep)
   local x, y = aLat / G, aLon / G
   if not kin.gInit then kin.gx, kin.gy, kin.gInit = x, y, true return end
   local ad = lpAlpha(GF_D_CUTOFF, dt)
@@ -1109,9 +1147,26 @@ local function updateWheels(dt, fwd, right, speed, ev, hasGraph)
       local brakeMax = w.brakeTorque or 0
       local slip     = math.abs(w.lastSlip or 0)
       local broken   = w.isBroken and true or false
-      -- off the ground below MIN_LOAD, back on it above twice that (no flicker on a wheel skimming the road)
-      if fz < MIN_LOAD then S.air = true elseif fz > MIN_LOAD * 2 then S.air = false end
-      local airborne = broken or S.air
+      -- For the grip and slide: no load below MIN_LOAD, frame by frame (as always).
+      -- Shown off the ground (blue) only once the wheel has carried less than that for a while:
+      -- on a rough road a wheel is unloaded for a frame or two on every bump without leaving the
+      -- ground in any way that matters. Back on the ground as soon as it carries load again.
+      local unloaded = fz < MIN_LOAD
+      if unloaded then S.airT = (S.airT or 0) + dt else S.airT = 0 end
+      if unloaded and S.airT >= AIR_SHOW_AFTER then S.air = true
+      elseif fz > MIN_LOAD * 2 then S.air = false end
+      local airborne = broken or unloaded
+      -- How near the ground it is to leaving it (0 = normal, 1 = about to): its load, smoothed a
+      -- little so a bump doesn't flash it, against its normal load (followed slowly while the
+      -- wheel is properly loaded). It starts below LIGHT_FRAC of the normal load.
+      S.fzLp = S.fzLp and (S.fzLp + (fz - S.fzLp) * lpAlpha(LIGHT_HZ, dt)) or fz
+      if not S.fzRef then S.fzRef = math.max(fz, MIN_LOAD * 4)
+      elseif fz > S.fzRef * 0.5 then S.fzRef = math.max(S.fzRef + (fz - S.fzRef) * clamp(dt / LIGHT_REF_TAU, 0, 1), MIN_LOAD * 4) end
+      local edge = math.max(LIGHT_FRAC * S.fzRef, MIN_LOAD * 2)
+      local light = (broken or S.air) and 0 or clamp((edge - S.fzLp) / (edge - MIN_LOAD), 0, 1)
+      -- Unloaded but not (yet) shown off the ground (a bump, or just lifting): the grip and
+      -- slide hold what they showed, rather than the bar dropping to nothing for a moment.
+      local hold = unloaded and not S.air and not broken
       if math.abs(drive) > 1 then everDriven[i] = true end
       local driven
       if hasGraph then driven = liveDriven[i] or false
@@ -1128,10 +1183,12 @@ local function updateWheels(dt, fwd, right, speed, ev, hasGraph)
         local fy = fz * math.abs(kin.latAccel) / G
         use = math.max(math.sqrt(fx * fx + fy * fy) / (MU_NOMINAL * fz), slip / SLIP_PEAK)
       end
-      S.grip = S.grip + (use - S.grip) * gripK
-      if airborne then S.sliding = false
-      elseif slip > SLIP_LIMIT then S.sliding = true
-      elseif slip < SLIP_LIMIT * SLIP_RELEASE then S.sliding = false end
+      if not hold then
+        S.grip = S.grip + (use - S.grip) * gripK
+        if airborne then S.sliding = false
+        elseif slip > SLIP_LIMIT then S.sliding = true
+        elseif slip < SLIP_LIMIT * SLIP_RELEASE then S.sliding = false end
+      end
       local severity = 0
       if S.sliding then
         local ratio = slip / math.max(speed, RATIO_MIN_SPEED)
@@ -1140,7 +1197,7 @@ local function updateWheels(dt, fwd, right, speed, ev, hasGraph)
           severity = PINK_SEVERITY + (1 - PINK_SEVERITY) * clamp((ratio - SLIP_RATIO_PINK) / (SLIP_RATIO_FULL - SLIP_RATIO_PINK), 0, 1)
         end
       end
-      S.severity = S.severity + (severity - S.severity) * gripK
+      if not hold then S.severity = S.severity + (severity - S.severity) * gripK end
 
       -- torque: + drive, - braking (engine braking and regen count as braking)
       local driveFrac, brakeFrac = 0, 0
@@ -1197,6 +1254,7 @@ local function updateWheels(dt, fwd, right, speed, ev, hasGraph)
       o.dr = round(driveline, 3)                       -- driveline only: + drive, - engine braking / regen
       o.b  = broken and 1 or 0
       o.a  = (S.air and not broken) and 1 or nil      -- off the ground
+      o.lf = (light > 0.02) and round(light, 2) or nil -- nearly off the ground, 0..1
       o.fl = (not broken and (w.isTireDeflated or w.isPunctured)) and 1 or nil   -- flat or punctured
       o.sl = round(slip, 2)                            -- contact-patch slip, m/s
       o.iv = iv
@@ -1258,6 +1316,171 @@ end
 
 -- How much the car is actually turning, as a steering angle, on the steering arc's scale, and
 -- the understeer / oversteer balance.
+-- ===== Grip model (see TUNE.GRIP_RATIO_PEAK) =================================
+-- A running straight-line fit of an axle's force against its slip, F = C (slip - offset), with
+-- an exponential forgetting: the slope is the stiffness; the offset soaks up any small constant
+-- error in the measured slip (the straight-ahead calibration, the hubs), which would otherwise
+-- matter most for stiff tyres that corner on a fraction of a degree.
+local function fitNew(c0, weight, ref)   -- a prior: two points at +-ref on the line through 0 with slope c0
+  local w = weight
+  return { n = 2 * w, sa = 0, sf = 0, saa = 2 * w * ref * ref, saf = 2 * w * c0 * ref * ref }
+end
+local function fitAdd(f, a, F, w, decay)
+  f.n, f.sa, f.sf = f.n * decay + w, f.sa * decay + w * a, f.sf * decay + w * F
+  f.saa, f.saf = f.saa * decay + w * a * a, f.saf * decay + w * a * F
+end
+local function fitSolve(f)   -- slope, offset (slip at zero force), spread of the slip seen
+  local va = f.n * f.saa - f.sa * f.sa
+  if va <= 1e-14 or f.n <= 0 then return nil end
+  local c = (f.n * f.saf - f.sa * f.sf) / va
+  if c <= 0 then return nil end
+  return c, (f.sa - f.sf / c) / f.n, math.sqrt(math.max(0, va) / (f.n * f.n))
+end
+local function beamngStiffness()
+  if not (controller and controller.getAllControllers) then return nil end
+  local okA, all = pcall(controller.getAllControllers)
+  if not okA or type(all) ~= "table" then return nil end
+  for _, c in pairs(all) do
+    if type(c) == "table" then
+      local vs = type(c.vehicleData) == "table" and c.vehicleData.vehicleStats
+      if type(vs) == "table" and (tonumber(vs.skewStiffnessFront) or 0) > 1000 and (tonumber(vs.skewStiffnessRear) or 0) > 1000 then
+        return vs.skewStiffnessFront, vs.skewStiffnessRear, "drivingDynamics"
+      end
+      if type(c.getCurrentConfigData) == "function" then
+        local okC, cfg = pcall(c.getCurrentConfigData)
+        if okC and type(cfg) == "table" and (tonumber(cfg.skewStiffnessFront) or 0) > 1000 and (tonumber(cfg.skewStiffnessRear) or 0) > 1000 then
+          return cfg.skewStiffnessFront, cfg.skewStiffnessRear, "esc"
+        end
+      end
+    end
+  end
+  return nil
+end
+-- Once per layout: mass, where the centre of gravity sits between the axles, the stiffness.
+local function gripSetup()
+  for k in pairs(gm) do gm[k] = nil end
+  gm.lv = tx.lv
+  local front, rear = lay.front, lay.rear
+  if not (front and rear and lay.mass and lay.mass > 50) then return end
+  local L = front.y - rear.y
+  if L < 0.5 then return end
+  local cgy = lay.cgy or (front.y + rear.y) / 2
+  local a = clamp(front.y - cgy, 0.15 * L, 0.85 * L)   -- centre of gravity to the front axle
+  local b = L - a
+  gm.m, gm.a, gm.b, gm.L, gm.Iz = lay.mass, a, b, L, lay.mass * a * b   -- yaw inertia: the usual m a b
+  local cf, cr, src = beamngStiffness()
+  local ref = 0.004  -- the prior: points at 0.004 rad of slip, about what gentle cornering gives
+  if cf then
+    gm.src, gm.ready = src, true
+    gm.fitF, gm.fitR = fitNew(cf, TUNE.CAL_PRIOR_BNG, ref), fitNew(cr, TUNE.CAL_PRIOR_BNG, ref)
+  else   -- a road tyre's usual stiffness (about 17 x its load per rad), held only lightly
+    gm.src, gm.ready = "learnt", false
+    local fz, rz = gm.m * G * b / L, gm.m * G * a / L
+    gm.fitF, gm.fitR = fitNew(17 * fz, 0.1, ref), fitNew(17 * rz, 0.1, ref)
+  end
+  gm.bngF, gm.bngR = cf, cr
+  gm.calT, gm.ay, gm.rdot, gm.prevYaw = 0, 0, 0, nil
+  gm.nF, gm.dF, gm.nR, gm.dR, gm.pF, gm.pR, gm.linF, gm.linR, gm.offF, gm.offR = 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+end
+-- Each frame: the axles' sideways forces and slip (in the direction the car is turning) and
+-- from them each axle's proximity to its limit, learning the stiffness when conditions allow.
+local function gripStep(dt, slipF, slipR, turn, rearSliding, steady, steerF, steerR)
+  if gm.lv ~= tx.lv then gripSetup() end
+  if not gm.m then return end
+  -- Each axle's direction of travel is measured across the last TRAVEL_WINDOW, so it belongs to
+  -- half that long ago; compare it with where the wheels pointed then, not now, or turning the
+  -- steering shows up as slip (which matters at low speed, where the real slip is tiny).
+  local h = gm.hist or {}
+  gm.hist = h
+  h[#h + 1] = { t = clock, f = steerF or 0, r = steerR or 0 }
+  while #h > 2 and h[2].t <= clock - TRAVEL_WINDOW do table.remove(h, 1) end
+  local tLag = clock - TRAVEL_WINDOW / 2
+  local lagF, lagR = steerF or 0, steerR or 0
+  for i = #h, 2, -1 do
+    local a, b = h[i - 1], h[i]
+    if a.t <= tLag then
+      local u = (b.t > a.t) and clamp((tLag - a.t) / (b.t - a.t), 0, 1) or 1
+      lagF, lagR = a.f + (b.f - a.f) * u, a.r + (b.r - a.r) * u
+      break
+    end
+  end
+  slipF = slipF - ((steerF or 0) - lagF)
+  slipR = slipR - ((steerR or 0) - lagR)
+  -- in the body's frame (+ = to the left), so left and right turns and straight running all
+  -- feed one fit
+  local ay = -(kin.aLatRaw or kin.latAccel)             -- m/s^2, + = to the left
+  local yaw = kin.yawFast or kin.yawRate                -- the quick yaw rate: its change leads the force
+  local rd = gm.prevYaw and (yaw - gm.prevYaw) / dt or 0
+  gm.prevYaw = yaw
+  -- the acceleration comes from a short fit over the last moment, so it lags a little: the slip
+  -- and the change of rotation are smoothed to lag just as much, so force and slip line up
+  local k = lpAlpha(TUNE.GRIP_HZ, dt)
+  local ks, kr = lpAlpha(TUNE.GRIP_SLIP_HZ, dt), lpAlpha(TUNE.GRIP_RD_HZ, dt)
+  gm.ay = gm.ay + (ay - gm.ay) * k
+  gm.rdot = gm.rdot + (rd - gm.rdot) * kr
+  -- the axle forces a rigid car needs for this sideways acceleration and change of rotation
+  local Ff = (gm.m * gm.ay * gm.b + gm.Iz * gm.rdot) / gm.L
+  local Fr = (gm.m * gm.ay * gm.a - gm.Iz * gm.rdot) / gm.L
+  gm.nF, gm.dF = Ff, gm.dF + (slipF - gm.dF) * ks
+  gm.nR, gm.dR = Fr, gm.dR + (slipR - gm.dR) * ks
+  -- learn while driving gently and steadily (straight running counts: it pins the offset)
+  if steady and not rearSliding and (kin.speed or 0) > 8 and math.abs(gm.ay) < TUNE.CAL_AY_HI
+     and math.abs(gm.rdot) < 0.3 and math.abs(gm.dF) < TUNE.CAL_SLIP_HI and math.abs(gm.dR) < TUNE.CAL_SLIP_HI then
+    local decay = math.exp(-dt / TUNE.CAL_TAU)
+    fitAdd(gm.fitF, gm.dF, gm.nF, dt, decay)
+    fitAdd(gm.fitR, gm.dR, gm.nR, dt, decay)
+    if math.abs(gm.ay) > TUNE.CAL_AY_LO then gm.calT = gm.calT + dt end
+  end
+  local cf, of, sprF = fitSolve(gm.fitF)
+  local cr, orr, sprR = fitSolve(gm.fitR)
+  if cf then gm.cf, gm.offF = cf, of end
+  if cr then gm.cr, gm.offR = cr, orr end
+  -- a learnt value is trusted once there's been enough cornering, over a spread of slip
+  if not gm.ready and gm.calT >= TUNE.CAL_READY and (sprF or 0) > TUNE.CAL_SPREAD and (sprR or 0) > TUNE.CAL_SPREAD * 0.5 then gm.ready = true end
+  -- proximity to the limit, in the direction the car is turning, with the slip offset taken out
+  local function proximity(n, d, c)
+    n, d = n * turn, d * turn
+    if not c or c <= 0 or d < TUNE.GRIP_MIN_SLIP then return 0 end
+    local ratio = clamp(n / (c * d), -1, 1.5)
+    return clamp((1 - ratio) / (1 - TUNE.GRIP_RATIO_PEAK), 0, 2)
+  end
+  -- at walking pace the slip is too small to judge against the measurement's resolution
+  local slowFade = clamp(((kin.speed or 0) - TUNE.GRIP_MIN_SPEED) / 3, 0, 1)
+  gm.pF = proximity(gm.nF, gm.dF - (gm.offF or 0), gm.cf) * slowFade
+  gm.pR = proximity(gm.nR, gm.dR - (gm.offR or 0), gm.cr) * slowFade
+  -- the slip (in the turn's direction) each axle would need for its force if its tyres were linear
+  gm.linF = gm.cf and gm.nF / gm.cf * turn + (gm.offF or 0) * turn or 0
+  gm.linR = gm.cr and gm.nR / gm.cr * turn + (gm.offR or 0) * turn or 0
+end
+
+-- The balance as a state, for the marker and the numbers mode: 0 neutral, 1 front near its
+-- limit, 2 understeer, 3 rear near its limit, 4 both at their limit, 5 oversteer (a controlled
+-- drift is oversteer with inp.dc). The warnings for the rear and for both come from the grip
+-- model, so only once the tyres' stiffness is known; before that the states follow the balance.
+local function balanceStateOf(prev, bal, measured, rearSliding)
+  if not measured then return 0 end
+  if bal >= (prev == 5 and 0.12 or 0.15) then return 5 end
+  if rearSliding then return 0 end   -- a slide that isn't oversteer (yet): no warnings, they'd mean nothing
+  if not gm.ready then
+    if bal <= -(prev == 2 and TUNE.US_WARN_SHARE - 0.05 or TUNE.US_WARN_SHARE) then return 2 end
+    if bal <= ((prev == 1 or prev == 2) and -0.02 or -0.04) then return 1 end
+    return 0
+  end
+  if math.abs(kin.yawRate) < TUNE.US_MIN_YAW * 0.5 then return 0 end
+  local lead = gm.pF - gm.pR
+  if bal <= -(prev == 2 and TUNE.US_WARN_SHARE - 0.05 or TUNE.US_WARN_SHARE) then return 2 end
+  local wasF, wasR = prev == 1 or prev == 2 or prev == 4, prev == 3 or prev == 4 or prev == 5
+  local nearF = gm.pF >= (wasF and TUNE.NEAR_OFF or TUNE.NEAR_ON)
+  local nearR = gm.pR >= (wasR and TUNE.NEAR_OFF or TUNE.NEAR_ON)
+  if nearF and nearR then
+    if lead > TUNE.LEAD then return 1 elseif lead < -TUNE.LEAD then return 3 end
+    return 4
+  end
+  if nearF then return 1 end
+  if nearR then return 3 end
+  return 0
+end
+
 local function updateTravel(dt, fwd, right, ev)
   local inputs = out.inp
   local steerIn = clamp(-(ev.steering_input or 0), -1, 1)
@@ -1283,22 +1506,50 @@ local function updateTravel(dt, fwd, right, ev)
     est.slipF, est.slipR = slipF, slipR
     local turn = kin.yawRate >= 0 and 1 or -1
     local diff = (slipR - slipF) * turn                    -- + = rear slipping more
-    if diff >= 0 then
+    -- how far the rear is sliding (a slide or spin is oversteer, whatever the front does)
+    local rs = smoothstep((math.abs(kin.rearTravel) - TUNE.REAR_GRIP_SLIP) / (TUNE.REAR_SLIDE_SLIP - TUNE.REAR_GRIP_SLIP))
+    est.rs = rs
+    local steady = not (ax.absOn or ax.tcsOn or ax.escOn or ax.anyCut or ax.powerCut) and math.abs(kin.gy) < 0.2
+    gripStep(dt, slipF, slipR, turn, rs > 0.02, steady, est.frontSteer, est.rearSteer)
+    local yawOver = clamp(math.abs(kin.yawRate) / TUNE.BAL_MIN_YAW, 0, 1)
+    local yawUnder = clamp(math.abs(kin.yawRate) / TUNE.US_MIN_YAW, 0, 1)
+    if gm.ready then
+      -- With the tyres' stiffness known (see the grip model): oversteer is the rear slipping more
+      -- than the front beyond what linear tyres would need for the forces (the car's own,
+      -- designed balance taken out, as BeamNG's stability control does with its expected yaw
+      -- rate), with the rear near or past its limit; understeer is the front past its peak, and
+      -- nearer its limit than the rear.
+      local diffEx = diff + gm.linF - gm.linR
+      local rearGate = math.max(clamp((math.abs(slipR) - TUNE.BAL_SLIP_START) / (TUNE.BAL_SLIP_FULL - TUNE.BAL_SLIP_START), 0, 1),
+                                clamp((gm.pR - 0.8) / 0.4, 0, 1))
+      local over = smoothstep((diffEx - TUNE.BAL_DEADBAND) / (TUNE.BAL_FULL - TUNE.BAL_DEADBAND)) * rearGate * yawOver
+      if over > 0 then target = over
+      else
+        local lead = clamp((gm.pF - gm.pR - 0.05) / 0.2, 0, 1)
+        local near = smoothstep((gm.pF - 0.45) / (0.75 - 0.45))
+        local past = smoothstep((gm.pF - 0.85) / (1.15 - 0.85))
+        target = -(TUNE.US_WARN_SHARE * near + (1 - TUNE.US_WARN_SHARE) * past) * lead * yawUnder * (1 - rs)
+      end
+    elseif diff >= 0 then
       local mag = smoothstep((diff - TUNE.BAL_DEADBAND) / (TUNE.BAL_FULL - TUNE.BAL_DEADBAND))
       mag = mag * clamp((math.abs(slipR) - TUNE.BAL_SLIP_START) / (TUNE.BAL_SLIP_FULL - TUNE.BAL_SLIP_START), 0, 1)
-      target = mag * clamp(math.abs(kin.yawRate) / TUNE.BAL_MIN_YAW, 0, 1)
+      target = mag * yawOver
     else
       local frontWork = clamp((slipF * turn - TUNE.US_SLIP_START) / (TUNE.US_SLIP_FULL - TUNE.US_SLIP_START), 0, 1)
       local frontLead = clamp((-diff - TUNE.US_LEAD_START) / (TUNE.US_LEAD_FULL - TUNE.US_LEAD_START), 0, 1)
       local pastPeak = clamp((slipF * turn - TUNE.US_PAST_START) / (TUNE.US_PAST_FULL - TUNE.US_PAST_START), 0, 1)
         * clamp((-diff - TUNE.US_PAST_LEAD) / (TUNE.US_PAST_LEAD_FULL - TUNE.US_PAST_LEAD), 0, 1)
       local severity = TUNE.US_WARN_SHARE * frontWork * frontLead + (1 - TUNE.US_WARN_SHARE) * pastPeak
-      -- not once the rear is sliding (a slide or spin is oversteer, whatever the front does)
-      local rs = smoothstep((math.abs(kin.rearTravel) - TUNE.REAR_GRIP_SLIP) / (TUNE.REAR_SLIDE_SLIP - TUNE.REAR_GRIP_SLIP))
-      target = -severity * clamp(math.abs(kin.yawRate) / TUNE.US_MIN_YAW, 0, 1) * (1 - rs)
+      target = -severity * yawUnder * (1 - rs)
     end
   end
   est.balance = est.balance + (target - est.balance) * clamp(TRAVEL_SMOOTH_HZ * dt, 0, 1)
+  -- a warning (an axle near its limit) shows once it has held a moment, so a quick transient at
+  -- turn-in doesn't flash one; understeer and oversteer show at once
+  local cand = balanceStateOf(est.state, est.balance, front and rear and est.frontSteer, est.rs and est.rs > 0.05)
+  local warn = cand == 1 or cand == 3 or cand == 4
+  if cand ~= est.cand then est.cand, est.candT = cand, 0 else est.candT = (est.candT or 0) + dt end
+  if not warn or est.state == 2 or est.state == 5 or est.candT >= TUNE.WARN_HOLD or (est.state ~= 0 and (cand == 1 or cand == 3 or cand == 4)) then est.state = cand end
 
   -- how controlled a slide is (see TUNE.DRIFT_STEER_OK): 1 = a controlled drift
   local control = 0
@@ -1322,7 +1573,7 @@ local function updateTravel(dt, fwd, right, ev)
   local vFwd = vel:dot(fwd)
   local speed2d = math.sqrt(vFwd ^ 2 + vel:dot(right) ^ 2)
   local reversing = (ev.gearIndex or 0) < 0 and vFwd < 0
-  inputs.tv, inputs.sr, inputs.k, inputs.ta, inputs.bal, inputs.dc = nil, nil, nil, nil, nil, nil
+  inputs.tv, inputs.sr, inputs.k, inputs.ta, inputs.bal, inputs.dc, inputs.bs = nil, nil, nil, nil, nil, nil, nil
   est.shown = nil
   if speed2d > TRAVEL_FADE_LO and front and not reversing then
     -- The front axle's direction against the rear axle's path while the rear grips (plus any
@@ -1375,6 +1626,7 @@ local function updateTravel(dt, fwd, right, ev)
     inputs.tv = round(clamp(markerFilter(dt, tvRaw, steerIn, k, w), -TRAVEL_MAX, TRAVEL_MAX), 6)   -- + = left of the nose
     inputs.ta = round(clamp((speed2d - TRAVEL_FADE_LO) / (TRAVEL_FADE_HI - TRAVEL_FADE_LO), 0, 1), 2)
     inputs.bal = round(est.balance, 3)   -- -1 understeer .. 0 neutral .. +1 oversteer
+    inputs.bs = est.state                -- the state (see balanceStateOf)
     inputs.dc = (est.balance > 0.01) and round(est.drift, 2) or nil   -- oversteer: 1 = a controlled drift
   else
     mark.init = false   -- hidden: start afresh when it shows again
@@ -1594,6 +1846,16 @@ local function travelDumpStep(dt)
     math.deg(est.ratio or est.lock), est.cal, deg(diag.shown),
     deg(kin.travel), deg(diag.frontHub), deg(diag.frontYaw), deg(kin.rearTravel),
     num(kin.physYaw), kin.yawSign, num(kin.headYaw), num(kin.yawRate), est.balance))
+  local names = { [0] = "neutral", "front near limit", "understeer", "rear near limit", "at the limit", "oversteer" }
+  if gm.m then
+    say(string.format(
+      "[vgs grip]   tyre stiffness front %s rear %s N/rad (%s%s) | how near the limit (1 = at it): front %.2f rear %.2f | state: %s",
+      gm.cf and string.format("%.0f", gm.cf) or "n/a", gm.cr and string.format("%.0f", gm.cr) or "n/a",
+      gm.src == "learnt" and "learnt while driving" or ("BeamNG's " .. tostring(gm.src) .. " calibration"),
+      gm.ready and "" or ", still learning: using slip angles meanwhile", gm.pF or 0, gm.pR or 0, names[est.state or 0] or "?"))
+  else
+    say("[vgs grip]   no grip model for this vehicle (no mass or axles found): using slip angles | state: " .. (names[est.state or 0] or "?"))
+  end
 end
 
 -- ===== Main loop ===========================================================
@@ -1734,6 +1996,7 @@ M.dumpAssists       = function() protect('dumpAssists', dumpAssists) end
 M.watchAssists      = function(on) watch.assists = on ~= false; watch.assistValues = {} end
 M.dumpTravel        = function(seconds) watch.travel, watch.travelNext = tonumber(seconds) or 10, 0 end
 M.travelState       = function() return diag, est.lock, kin.travel, kin.rearTravel, kin.yawRate, est.ratio end   -- for tests
+M.gripState        = function() return gm, est end   -- for tests
 M.onExtensionLoaded = function() protect('load', resetState) end
 M.onReset           = function() protect('reset', resetState) end
 M.updateGFX         = updateGFX

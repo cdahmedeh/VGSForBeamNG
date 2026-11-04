@@ -30,7 +30,8 @@
     panelStroke: 'rgba(255, 255, 255, 0.22)',
     tyreBg:      'rgba(0, 0, 0, 0.5)',
     broken:      'rgba(160, 160, 160, 0.6)',
-    airborne:    'rgb(40, 130, 235)',   // inside of a wheel that's off the ground: a strong blue, unlike the white grip bar and the slide reds
+    airborne:    'rgb(40, 130, 235)',
+    airLight:    [120, 178, 245],       // nearly off the ground: a paler shade of the same blue, so the step to off the ground is natural   // inside of a wheel that's off the ground: a strong blue, unlike the white grip bar and the slide reds
     text:        'rgba(255, 255, 255, 0.88)'
   };
 
@@ -754,6 +755,8 @@
   // The marker shows only when the car is off balance, in one of four states, each with its own
   // strong colour so it reads at a glance:
   //   near   the front nearing its limit (the understeer warning)   yellow
+  //   rnear  the rear nearing its limit (the oversteer warning)      yellow
+  //   limit  both ends at their limit together                       yellow
   //   under  understeer: the front past its peak, running wide       orange-red
   //   over   oversteer: the rear sliding more than the front         pink-magenta
   //   drift  a controlled drift: oversteer, caught (inp.dc; see TUNE.DRIFT_* in vgsTelemetry.lua)
@@ -764,7 +767,7 @@
   // switching between understeer and oversteer, or catching or losing a drift shows at once;
   // easing from understeer back to the warning, or back to neutral, waits STATE_HOLD_MS, so a
   // quick flick stays up long enough to read.
-  var TRAVEL_COLOUR = { neutral: [150, 210, 245], near: [255, 214, 10], under: [255, 96, 24], over: [250, 130, 235], drift: [60, 230, 195] };
+  var TRAVEL_COLOUR = { neutral: [150, 210, 245], near: [255, 214, 10], rnear: [255, 214, 10], limit: [255, 214, 10], under: [255, 96, 24], over: [250, 130, 235], drift: [60, 230, 195] };
   var UNDER_WARN = 0.35;   // must match US_WARN_SHARE in vgsTelemetry.lua
   // The balance counts as neutral between these: the marker is hidden and the balance readout
   // says nothing. Past them it's the front nearing its limit (below) or oversteer (above).
@@ -775,8 +778,19 @@
   var STATE_HOLD_MS = 450;   // a state shown stays at least this long unless something worse comes
   var STATE_BLEND_MS = 80;   // colour change between states
   var MARK_FADE_IN_MS = 30, MARK_FADE_OUT_MS = 120;
+  var STATE_SEVERITY = { near: 1, rnear: 1, limit: 2, under: 3, over: 3, drift: 3 };
+  // The vehicle sends the state itself (inp.bs, see balanceStateOf in vgsTelemetry.lua): 1 the
+  // front near its limit, 2 understeer, 3 the rear near its limit, 4 both at their limit,
+  // 5 oversteer (a controlled drift with inp.dc).
+  var BS_STATE = { 1: 'near', 2: 'under', 3: 'rnear', 4: 'limit', 5: 'over' };
   // The state the balance is in (null = neutral). cur: the state shown now, for the hysteresis.
-  function balanceState(bal, dc, cur) {
+  // bs: the vehicle's own state, when it sends one; otherwise worked out from the balance.
+  function balanceState(bal, dc, cur, bs) {
+    if (bs !== undefined && bs !== null) {
+      var st = BS_STATE[+bs] || null;
+      if (st === 'over') return (+dc || 0) >= (cur === 'drift' ? DRIFT_OFF : DRIFT_ON) ? 'drift' : 'over';
+      return st;
+    }
     if (bal === undefined || bal === null || !isFinite(+bal)) return null;
     bal = +bal; dc = +dc || 0;
     var underSide = cur === 'under' || cur === 'near', overSide = cur === 'over' || cur === 'drift';
@@ -788,7 +802,7 @@
   function stateRgb(st) { return TRAVEL_COLOUR[st] || TRAVEL_COLOUR.neutral; }
   function rgbCss(c) { return 'rgb(' + c.map(Math.round).join(', ') + ')'; }
   // The colour for a balance (no hold: still pictures, tests).
-  function travelColour(bal, drift) { return rgbCss(stateRgb(balanceState(bal, drift, null))); }
+  function travelColour(bal, drift, bs) { return rgbCss(stateRgb(balanceState(bal, drift, null, bs))); }
 
   var INPUT = {
     steer:     'rgb(45, 115, 205)',
@@ -852,7 +866,7 @@
     ctx.save();
     // direction of travel (see above), drawn on top at the end
     var hasTravel = inp.tv !== undefined && inp.tv !== null;
-    if (!mk) { var s0 = balanceState(inp.bal, inp.dc, null); mk = { state: s0, rgb: stateRgb(s0), colour: travelColour(inp.bal, inp.dc), a: s0 ? 1 : 0 }; }
+    if (!mk) { var s0 = balanceState(inp.bal, inp.dc, null, inp.bs); mk = { state: s0, rgb: stateRgb(s0), colour: travelColour(inp.bal, inp.dc, inp.bs), a: s0 ? 1 : 0 }; }
     var tv = hasTravel ? clamp(+inp.tv || 0, -4, 4) : 0, alpha = clamp(inp.ta === undefined ? 1 : +inp.ta, 0, 1) * mk.a;
     ctx.lineWidth = lw; ctx.lineCap = 'butt';
     var sk = +inp.k > 0 ? +inp.k : steerK(+inp.sr);   // the vehicle sends the scale's stretch
@@ -1006,6 +1020,12 @@
         var fh = (sliding || airborne) ? ih : ih * grip;   // grows from the centre outward
         ctx.fillStyle = airborne ? STYLE.airborne : (sliding ? slideColour(wh.ex) : STYLE.gripFill);
         ctx.fillRect(-iw / 2, -fh / 2, iw, fh);
+        // nearly off the ground (wh.lf, 0..1): the inside turns pale blue as the load goes
+        var lf = airborne ? 0 : clamp(+wh.lf || 0, 0, 1);
+        if (lf > 0) {
+          ctx.fillStyle = 'rgba(' + STYLE.airLight.join(', ') + ', ' + (lf * lf * (3 - 2 * lf)).toFixed(3) + ')';
+          ctx.fillRect(-iw / 2, -ih / 2, iw, ih);
+        }
       }
     }
 
@@ -1028,21 +1048,22 @@
   // the hold, its colour (blended briefly when the state changes) and how much of it shows
   // (fading in and out at neutral). { state, rgb, colour, a }
   VGSRenderer.prototype.markerState = function (inp) {
-    var now = nowMs(), m = this.mark, bal = inp ? inp.bal : undefined, dc = inp ? inp.dc : undefined;
+    var now = nowMs(), m = this.mark, bal = inp ? inp.bal : undefined, dc = inp ? inp.dc : undefined, bs = inp ? inp.bs : undefined;
     if (!m) {   // the first picture: straight to where it settles
-      var s0 = balanceState(bal, dc, null);
+      var s0 = balanceState(bal, dc, null, bs);
       m = this.mark = { cur: s0, cand: s0, candT: -Infinity, since: now, t: now, a: s0 ? 1 : 0, rgb: stateRgb(s0).slice(), from: stateRgb(s0).slice(), t0: -Infinity };
     }
     var dt = clamp(now - m.t, 0, 100); m.t = now;
-    var cand = balanceState(bal, dc, m.cur), cur = m.cur;
+    var cand = balanceState(bal, dc, m.cur, bs), cur = m.cur;
     if (cand !== m.cand) { m.cand = cand; m.candT = now; }
     // a drift only counts as caught once it has stayed caught a moment: until then, oversteer
     if (cand === 'drift' && cur !== 'drift' && now - m.candT < DRIFT_CONFIRM_MS) cand = 'over';
     if (cand === cur) m.since = now;
     else {
-      // at once: appearing, getting worse, or a different kind; held: easing to a milder state
-      // of the same kind (understeer to the warning) or back to neutral
-      var at = cand && (!cur || !(cur === 'under' && cand === 'near'));
+      // at once: appearing, getting worse, or switching between understeer, oversteer and a
+      // drift; held: easing to a milder state (understeer or oversteer back to a warning, one
+      // warning to another) or back to neutral
+      var at = cand && (!cur || STATE_SEVERITY[cand] > STATE_SEVERITY[cur] || (STATE_SEVERITY[cand] === 3 && STATE_SEVERITY[cur] === 3));
       if (at || now - m.since >= STATE_HOLD_MS) {
         if (cand) { m.from = m.rgb.slice(); m.t0 = cur ? now : -Infinity; }   // appearing: in its own colour at once
         m.cur = cand; m.since = now;
@@ -1150,8 +1171,9 @@
       var lines = [];
       if (broken) lines.push({ s: 'broken', px: small, w: 600, c: DIM_TEXT });
       else {
-        var gc = sliding ? slideColour(Math.max.apply(null, list.map(function (w) { return +w.ex || 0; })))
-          : (airborne ? STYLE.airborne : STYLE.text);
+        var light = Math.max.apply(null, list.map(function (w) { return +w.lf || 0; }));
+        var gc = airborne ? STYLE.airborne : (light >= 0.5 ? 'rgb(' + STYLE.airLight.join(', ') + ')'
+          : (sliding ? slideColour(Math.max.apply(null, list.map(function (w) { return +w.ex || 0; }))) : STYLE.text));
         lines.push({ s: Math.round(grip * 100) + '%', px: fs, w: 600, c: gc });
         if (load !== undefined && !circle.compact) { var lu = U.load(Math.max(0, load)); lines.push({ s: fmt(lu.v, 0) + ' ' + lu.u, px: small, w: 400, c: DIM_TEXT }); }
       }
@@ -1214,15 +1236,15 @@
   // top, large, and the words under them. Both lines always sit at the same height.
   function balanceFont(rPx) { return clamp(rPx * 0.058, 8.5, 11); }   // the words: about the size of the grip readouts
   function degreeFont(rPx) { return balanceFont(rPx) * 1.15; }       // the degrees, a touch bigger
-  var SHORT_WORD = { 'Understeer': 'Under', 'Front near limit': 'Near limit', 'Oversteer': 'Over', 'Controlled drift': 'Drift', 'Neutral': 'Neutral' };
+  var SHORT_WORD = { 'Understeer': 'Under', 'Front near limit': 'Front near', 'Rear near limit': 'Rear near', 'At the limit': 'At limit', 'Oversteer': 'Over', 'Controlled drift': 'Drift', 'Neutral': 'Neutral' };
   // { word, deg (text, or '' when there's nothing to show), colour }, or null when the marker is hidden
-  var STATE_WORD = { near: 'Front near limit', under: 'Understeer', over: 'Oversteer', drift: 'Controlled drift' };
+  var STATE_WORD = { near: 'Front near limit', rnear: 'Rear near limit', limit: 'At the limit', under: 'Understeer', over: 'Oversteer', drift: 'Controlled drift' };
   // mk: the marker's state this frame (so the words and the marker always agree, and hold together)
   function balanceStatus(m, R, compact, mk) {
     var inp = m.inp || {}, vd = m.vd || {}, bal = inp.bal;
     if (bal === undefined || bal === null) return null;
-    var st = mk ? mk.state : balanceState(bal, inp.dc, null);
-    var word = st ? STATE_WORD[st] : 'Neutral', colour = st ? (mk ? mk.colour : travelColour(bal, inp.dc)) : STYLE.text;
+    var st = mk ? mk.state : balanceState(bal, inp.dc, null, inp.bs);
+    var word = st ? STATE_WORD[st] : 'Neutral', colour = st ? (mk ? mk.colour : travelColour(bal, inp.dc, inp.bs)) : STYLE.text;
     var diff;
     if (vd.af !== undefined && vd.ar !== undefined && vd.af !== null && vd.ar !== null) {
       diff = (vd.af - vd.ar) * 180 / Math.PI;
@@ -1247,7 +1269,7 @@
   }
   function balanceLayoutNow(ctx, rPx, inner, compact) {
     var fs = balanceFont(rPx), dfs = degreeFont(rPx), h1 = dfs * 1.0, h2 = fs * 1.15;
-    var w1 = measure(ctx, '88.8°', dfs, 700), w2 = measure(ctx, compact ? 'Near limit' : 'Front near limit', fs, 600);
+    var w1 = measure(ctx, '88.8°', dfs, 700), w2 = measure(ctx, compact ? 'Front near' : 'Front near limit', fs, 600);
     var drop = Math.max(chordDrop(inner, w1), chordDrop(inner, w2) - h1) + 1;
     return { fs: fs, dfs: dfs, drop: drop, h1: h1, band: drop + h1 + h2 + fs * 0.25 };
   }
