@@ -189,7 +189,7 @@ local wstate = {}       -- [i] = { grip, sliding, severity, fzAvg }
 local out = { w = {}, src = {}, dg = {}, inp = {}, gf = { x = 0, y = 0 } }
 local vdOut = {}        -- the numbers-mode vehicle values (sent as out.vd while numbers mode is on)
 local couplerList = {}
-local DETAIL_KEYS = { "sa", "sr", "ws", "fz", "dq", "bq", "tt", "tc", "tp", "bt" }
+local DETAIL_KEYS = { "fz" }
 
 local function clamp(v, lo, hi)
   if v < lo then return lo elseif v > hi then return hi end
@@ -1381,72 +1381,17 @@ local function updateTravel(dt, fwd, right, ev)
   inputs.p = pedalLevel(ev.parkingbrake)
 end
 
--- Extra values for the app's numbers mode (only while it's on, and only when sending)
-local function fillDetail(fwd, right, ev)
-  local vel, yaw = kin.vel, kin.yawRate
-  local vr0, vf0 = vel:dot(right), vel:dot(fwd)
-  local envP = 101325
-  if obj.getEnvPressure then
-    local okE, p = pcall(obj.getEnvPressure, obj)
-    if okE and type(p) == "number" and p > 1000 then envP = p end
-  end
+-- Extra values for the app's numbers mode (only while it's on, and only when sending): the load
+-- on every wheel, and the front and rear axle slip angles behind the balance readout.
+local function fillDetail()
   for _, o in ipairs(out.w) do
-    local i = o.i
-    local w, L, S = wheels.wheels[i], lay.wheels[i], wstate[i]
-    if w and L and S then
-      -- this wheel's own ground velocity, from the body's velocity and the yaw rate at its spot
-      local vr, vf = vr0 - yaw * L.y, vf0 + yaw * L.x
-      local h = S.steer or 0
-      local vLong = vf * math.cos(h) - vr * math.sin(h)
-      local ground = math.sqrt(vr * vr + vf * vf)
-      if ground > 1 and not (w.isBroken) then
-        local d = h - math.atan2(-vr, vf)
-        o.sa = round(math.atan2(math.sin(d), math.abs(math.cos(d))), 4)   -- slip angle, rad, + = force to the left
-      else o.sa = nil end
-      local ws = tonumber(w.wheelSpeed)
-      if ws and math.abs(vLong) > 1 and not w.isBroken then
-        o.sr = round(clamp((ws - vLong) / math.abs(vLong), -9.99, 9.99), 3)   -- slip ratio, + = spinning
-      else o.sr = nil end
-      o.ws = ws and round(ws, 2) or nil                           -- wheel's own speed, m/s
-      o.fz = math.floor((w.downForce or w.downForceRaw or 0) + 0.5)   -- load, N
-      o.dq = math.floor((w.propulsionTorque or 0) * (w.wheelDir or 1) + 0.5)   -- drive torque, Nm (+ forwards)
-      o.bq = math.floor(math.abs(w.brakingTorque or 0) + 0.5)     -- brake torque, Nm
-      o.tt, o.tc, o.tp, o.bt = nil, nil, nil, nil
-      if L.wheelID and obj.getWheelAvgTemperature and L.pgroup then
-        local okA, ta = pcall(obj.getWheelAvgTemperature, obj, L.wheelID)
-        local okC, tc = pcall(obj.getWheelCoreTemperature, obj, L.wheelID)
-        if okA and type(ta) == "number" and ta > 100 then o.tt = round(ta - 273.15, 1) end   -- tyre tread, deg C
-        if okC and type(tc) == "number" and tc > 100 then o.tc = round(tc - 273.15, 1) end   -- tyre core, deg C
-      end
-      if L.pgroup and obj.getGroupPressure then
-        local okP, p = pcall(obj.getGroupPressure, obj, L.pgroup)
-        if okP and type(p) == "number" and p > 0 then o.tp = round((p - envP) / 1000, 1) end   -- tyre pressure, kPa gauge
-      end
-      if w.enableBrakeThermals and type(w.brakeSurfaceTemperature) == "number" then
-        o.bt = round(w.brakeSurfaceTemperature, 0)                -- brake disc surface, deg C
-      end
-    end
+    local w = wheels.wheels[o.i]
+    o.fz = w and math.floor((w.downForce or w.downForceRaw or 0) + 0.5) or nil   -- load, N
   end
   local vd = vdOut
-  local front, rear = lay.front, lay.rear
-  vd.v = round(kin.speed, 2)                                 -- ground speed, m/s
-  vd.yr = round(yaw, 3)                                      -- yaw rate, rad/s, + = left
-  local bx, by = 0, 0
-  if front and rear then bx, by = (front.x + rear.x) / 2, (front.y + rear.y) / 2 end
-  local vrm, vfm = vr0 - yaw * by, vf0 + yaw * bx
-  vd.beta = (kin.speed > 1) and round(math.atan2(-vrm, vfm), 3) or nil   -- body slip angle mid-wheelbase, + = moving left of the nose
-  vd.fw = est.frontSteer and round(est.frontSteer, 4) or nil -- front road-wheel angle, rad
-  vd.turn = est.shown and round(est.shown, 4) or nil         -- how much the car is turning, as a road-wheel angle
-  local turnSign = yaw >= 0 and 1 or -1
+  local turnSign = kin.yawRate >= 0 and 1 or -1
   vd.af = est.slipF and round(est.slipF * turnSign, 4) or nil   -- front / rear axle slip angle, in the turn's direction
   vd.ar = est.slipR and round(est.slipR * turnSign, 4) or nil
-  vd.rpm = tonumber(ev.rpm) and math.floor(ev.rpm + 0.5) or nil
-  local gear = ev.gear
-  vd.gear = (type(gear) == "string" or type(gear) == "number") and tostring(gear) or nil
-  vd.tf = round(ax.minFactor or 1, 2)                        -- lowest throttle factor (1 = no cut)
-  -- assists fitted (bits: 1 ABS, 2 TCS, 4 ESC) and acting right now
-  vd.asf = (ax.hasABS and 1 or 0) + (ax.hasTCS and 2 or 0) + (ax.hasESC and 4 or 0)
-  vd.asa = (ax.absOn and 1 or 0) + ((ax.anyCut or ax.powerCut or ax.tcsOn) and 2 or 0) + (ax.escOn and 4 or 0)
 end
 
 -- ===== Sending =============================================================
@@ -1524,7 +1469,7 @@ local function send(fwd, right, ev)
   end
   p.inp.tcs = (ax.powerCut or ax.anyCut) and 1 or nil        -- an assist cutting power: the throttle arc pulses
   if detail then
-    fillDetail(fwd, right, ev); p.vd = vdOut; tx.detailSent = true
+    fillDetail(); p.vd = vdOut; tx.detailSent = true
   else
     p.vd = nil
     if tx.detailSent then   -- numbers mode just switched off: drop the extra values

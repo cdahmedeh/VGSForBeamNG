@@ -12,8 +12,8 @@
  *   Rim of the circle : driver inputs — steering (blue) from the top, brake (red)
  *                bottom-left, throttle (green) bottom-right; a quarter turn at full
  *   Yellow dot : G-force felt by the driver (edge = 1.5 g), with a fading trail
- * Click the app for the numbers mode: readouts by every corner (grip, slip angle and ratio,
- * load) and, when the app is wide or tall enough, a panel with the whole vehicle's numbers.
+ * Click the app for the numbers mode: grip and load by every corner, and the understeer /
+ * oversteer balance in words and degrees at the top of the circle.
  *
  * The renderer is plain canvas and has no BeamNG dependencies, so the same file
  * also runs in the browser preview (VGSRenderer on window).
@@ -1000,35 +1000,13 @@
   };
 
   // ===== Numbers mode ======================================================
-  // Click the app to switch it on. Beside every corner: grip in use, slip angle and slip ratio,
-  // and the load on it. Next to the circle (when the app is wide or tall enough): a panel with
-  // the whole vehicle's numbers and how they compare: front against rear, left against right.
+  // Click the app to switch it on. Beside every corner: grip in use and the load on it. At the
+  // top of the circle: the balance in words, in the marker's colour, with how many degrees more
+  // one axle is slipping than the other.
 
-  // Units follow BeamNG's own unit settings, like its other apps.
-  function Units() { this.length = 'metric'; this.temp = 'c'; this.pressure = 'bar'; this.weight = 'kg'; }
-  Units.prototype.set = function (v) {
-    if (!v) return;
-    if (v.uiUnitLength) this.length = v.uiUnitLength;
-    if (v.uiUnitTemperature) this.temp = v.uiUnitTemperature;
-    if (v.uiUnitPressure) this.pressure = v.uiUnitPressure;
-    if (v.uiUnitWeight) this.weight = v.uiUnitWeight;
-  };
-  Units.prototype.speed = function (ms) {
-    return this.length === 'imperial' ? { v: ms * 2.23693629, u: 'mph' } : { v: ms * 3.6, u: 'km/h' };
-  };
-  Units.prototype.temperature = function (c) {
-    if (this.temp === 'f') return { v: c * 1.8 + 32, u: '°F' };
-    if (this.temp === 'k') return { v: c + 273.15, u: 'K' };
-    return { v: c, u: '°C' };
-  };
-  Units.prototype.pressureOf = function (kpa) {
-    switch (this.pressure) {
-      case 'psi':  return { v: kpa * 0.145038, u: 'psi', d: 1 };
-      case 'kPa':  return { v: kpa, u: 'kPa', d: 0 };
-      case 'inHg': return { v: kpa * 0.2953, u: 'inHg', d: 1 };
-      default:     return { v: kpa * 0.01, u: 'bar', d: 2 };
-    }
-  };
+  // Weight units follow BeamNG's own unit settings, like its other apps.
+  function Units() { this.weight = 'kg'; }
+  Units.prototype.set = function (v) { if (v && v.uiUnitWeight) this.weight = v.uiUnitWeight; };
   Units.prototype.load = function (newtons) {
     var kg = newtons / 9.81;
     return this.weight === 'lb' ? { v: kg * 2.20462262, u: 'lb' } : { v: kg, u: 'kg' };
@@ -1036,19 +1014,14 @@
   var DEFAULT_UNITS = new Units();
 
   // Text that changes every frame can't be read, so numbers are averaged over a short window
-  // and refreshed a few times a second; bars use a light running average so they still move
-  // smoothly. The drawing itself shows every update as it arrives.
-  var READ_MS = 150, BAR_TAU_MS = 90;
-  function Readouts() { this.acc = {}; this.val = {}; this.ema = {}; this.t0 = 0; }
-  Readouts.prototype.add = function (key, v, now) {
+  // and refreshed a few times a second. The drawing itself shows every update as it arrives.
+  var READ_MS = 150;
+  function Readouts() { this.acc = {}; this.val = {}; this.t0 = 0; }
+  Readouts.prototype.add = function (key, v) {
     if (v === undefined || v === null || !isFinite(v)) return;
-    v = +v;
     var a = this.acc[key] || (this.acc[key] = { s: 0, n: 0 });
-    a.s += v; a.n++;
-    if (!(key in this.val)) this.val[key] = v;   // the first value at once
-    var e = this.ema[key];
-    if (!e) this.ema[key] = { v: v, t: now };
-    else { e.v += (v - e.v) * (1 - Math.exp(-Math.max(0, now - e.t) / BAR_TAU_MS)); e.t = now; }
+    a.s += +v; a.n++;
+    if (!(key in this.val)) this.val[key] = +v;   // the first value at once
   };
   Readouts.prototype.tick = function (now) {
     if (now - this.t0 < READ_MS) return;
@@ -1056,22 +1029,13 @@
     for (var k in this.acc) {
       var a = this.acc[k];
       if (a.n) { this.val[k] = a.s / a.n; a.s = 0; a.n = 0; }
-      else { delete this.val[k]; delete this.ema[k]; delete this.acc[k]; }   // gone (numbers mode off, wheel lost)
+      else { delete this.val[k]; delete this.acc[k]; }   // gone (numbers mode off, wheel lost)
     }
   };
   Readouts.prototype.get = function (key, fallback) { return key in this.val ? this.val[key] : fallback; };
-  Readouts.prototype.smooth = function (key, fallback) { var e = this.ema[key]; return e ? e.v : fallback; };
-  Readouts.prototype.clear = function () { this.acc = {}; this.val = {}; this.ema = {}; };
+  Readouts.prototype.clear = function () { this.acc = {}; this.val = {}; };
 
-  var PANEL = {
-    label: 'rgba(255, 255, 255, 0.5)', text: 'rgba(255, 255, 255, 0.92)', dim: 'rgba(255, 255, 255, 0.36)',
-    rule: 'rgba(255, 255, 255, 0.08)', track: 'rgba(255, 255, 255, 0.09)', tick: 'rgba(255, 255, 255, 0.8)',
-    load: ['rgba(150, 170, 200, 0.75)', 'rgba(110, 125, 150, 0.6)'],
-    drive: ['rgba(70, 200, 95, 0.8)', 'rgba(50, 140, 70, 0.65)'],
-    brake: ['rgba(235, 75, 65, 0.8)', 'rgba(160, 50, 45, 0.65)'],
-    grip: 'rgba(236, 240, 246, 0.85)',
-    hot: 'rgb(255, 150, 60)', vhot: 'rgb(255, 80, 70)', cold: 'rgb(140, 190, 255)'
-  };
+  var DIM_TEXT = 'rgba(255, 255, 255, 0.55)';
   var FONT = '"Noto Sans", "Segoe UI", "Helvetica Neue", Arial, sans-serif';
   function font(px, weight) { return (weight || 400) + ' ' + px.toFixed(1) + 'px ' + FONT; }
   function fmt(v, d) {
@@ -1080,7 +1044,6 @@
     if (/^-0(\.0+)?$/.test(s)) s = s.slice(1);   // no "-0"
     return s.replace('-', '−');
   }
-  function degOf(rad) { return rad === undefined || rad === null ? undefined : rad * 180 / Math.PI; }
   function text(ctx, s, x, y, px, weight, colour, align) {
     ctx.font = font(px, weight); ctx.fillStyle = colour;
     ctx.textAlign = align || 'left'; ctx.textBaseline = 'alphabetic';
@@ -1089,59 +1052,15 @@
   }
   function measure(ctx, s, px, weight) { ctx.font = font(px, weight); return ctx.measureText(s).width; }
 
-  // Front/rear and left/right comparisons for one body, from its wheels (numbers mode values).
-  function computeSplits(m) {
-    var ws = toArray(m.wheels).filter(function (w) { return !+w.b; });
-    if (ws.length < 2) return null;
-    var minY = Infinity, maxY = -Infinity, minX = Infinity, maxX = -Infinity;
-    ws.forEach(function (w) {
-      minY = Math.min(minY, +w.y); maxY = Math.max(maxY, +w.y);
-      minX = Math.min(minX, +w.x); maxX = Math.max(maxX, +w.x);
-    });
-    var hasFR = maxY - minY > 0.5, hasLR = maxX - minX > 0.3;
-    var midY = (minY + maxY) / 2, midX = (minX + maxX) / 2;
-    var a = { fzF: 0, fzR: 0, fzL: 0, fzRt: 0, yF: 0, nF: 0, yR: 0, nR: 0, xL: 0, nL: 0, xRt: 0, nRt: 0,
-              gF: 0, gR: 0, dF: 0, dR: 0, dL: 0, dRt: 0, bF: 0, bR: 0, drvF: 0, drvR: 0, drvL: 0, drvRt: 0, haveFz: false };
-    ws.forEach(function (w) {
-      var front = +w.y > midY, left = +w.x < midX, fz = +w.fz, drive = Math.max(0, +w.dq || 0), brake = Math.abs(+w.bq || 0);
-      if (isFinite(fz) && w.fz !== undefined) a.haveFz = true; else fz = 0;
-      if (front) { a.fzF += fz; a.yF += +w.y; a.nF++; a.gF += +w.g || 0; a.dF += drive; a.bF += brake; if (+w.d) a.drvF++; if (+w.e) a.sF = true; }
-      else { a.fzR += fz; a.yR += +w.y; a.nR++; a.gR += +w.g || 0; a.dR += drive; a.bR += brake; if (+w.d) a.drvR++; if (+w.e) a.sR = true; }
-      if (left) { a.fzL += fz; a.xL += +w.x; a.nL++; a.dL += drive; if (+w.d) a.drvL++; }
-      else { a.fzRt += fz; a.xRt += +w.x; a.nRt++; a.dRt += drive; if (+w.d) a.drvRt++; }
-    });
-    var r = {};
-    function share(p, q) { return p + q > 1e-6 ? p / (p + q) : undefined; }
-    if (hasFR && a.nF && a.nR) {
-      if (a.haveFz) r.loadF = share(a.fzF, a.fzR);
-      r.gripF = a.gF / a.nF; r.gripR = a.gR / a.nR; r.slideF = a.sF ? 1 : 0; r.slideR = a.sR ? 1 : 0;
-      if (a.drvF && a.drvR && a.dF + a.dR > 20) r.driveF = share(a.dF, a.dR);
-      if (a.bF + a.bR > 50) r.brakeF = share(a.bF, a.bR);
-      var yF = a.yF / a.nF, yR = a.yR / a.nR;
-      if (m.cg && yF - yR > 0.3) r.statF = clamp((+m.cg.y - yR) / (yF - yR), 0, 1);
-    }
-    if (hasLR && a.nL && a.nRt) {
-      if (a.haveFz) r.loadL = share(a.fzL, a.fzRt);
-      if (a.drvL && a.drvRt && a.dL + a.dRt > 20) r.driveL = share(a.dL, a.dRt);
-      var xL = a.xL / a.nL, xR = a.xRt / a.nRt;
-      if (m.cg && xR - xL > 0.3) r.statL = clamp((xR - +m.cg.x) / (xR - xL), 0, 1);
-    }
-    return r;
-  }
-
-  // Readouts beside each corner: grip in use; slip angle (alpha) and slip ratio (kappa); load.
-  // A dual set shows its hardest-working tyre and the load on the whole set.
+  // Readouts beside each corner: grip in use, and the load on it. A dual set shows its
+  // hardest-working tyre and the load on the whole set.
+  function cornerFont(tyreH) { return clamp(tyreH * 0.26, 8, 12); }
   function drawCornerReadouts(ctx, p, dims, circle, opts) {
-    var body = p.body, R = opts.read, U = opts.units || DEFAULT_UNITS, done = {};
+    var body = p.body, R = opts.read, U = opts.units || DEFAULT_UNITS, done = {}, blocks = [];
     function rd(w, f) {
       var raw = w[f];
       if (raw === undefined || raw === null) return undefined;
       return R ? R.get(body.id + ':w' + w.i + '.' + f, +raw) : +raw;
-    }
-    function maxAbs(list, f) {
-      var best;
-      list.forEach(function (w) { var v = rd(w, f); if (v !== undefined && (best === undefined || Math.abs(v) > Math.abs(best))) best = v; });
-      return best;
     }
     body.wheels.forEach(function (wh) {
       if (wh._outer === false) return;
@@ -1150,31 +1069,56 @@
       var key = list.map(function (w) { return w.i; }).join(',');
       if (done[key]) return;
       done[key] = true;
-      var grip = maxAbs(list, 'g') || 0, sliding = list.some(function (w) { return !!+w.e; });
+      var grip = 0, load;
+      list.forEach(function (w) {
+        grip = Math.max(grip, rd(w, 'g') || 0);
+        var f = rd(w, 'fz'); if (f !== undefined) load = (load || 0) + f;
+      });
+      var sliding = list.some(function (w) { return !!+w.e; });
+      var airborne = list.every(function (w) { return !!+w.a; });
       var broken = list.every(function (w) { return !!+w.b; });
-      var sa = maxAbs(list, 'sa'), sr = maxAbs(list, 'sr'), load;
-      list.forEach(function (w) { var f = rd(w, 'fz'); if (f !== undefined) load = (load || 0) + f; });
       var pt = p.wheelPoint(wh), d = dims(wh), onLeft = !!(wh._set && wh._set.side < 0);
-      var fs = clamp(d.h * 0.26, 8, 12), small = fs * 0.82;
+      var fs = cornerFont(d.h), small = fs * 0.85;
       var lines = [];
-      if (broken) lines.push({ s: 'broken', px: small, w: 600, c: PANEL.dim });
+      if (broken) lines.push({ s: 'broken', px: small, w: 600, c: DIM_TEXT });
       else {
-        lines.push({ s: Math.round(grip * 100) + '%', px: fs, w: 600, c: sliding ? slideColour(Math.max.apply(null, list.map(function (w) { return +w.ex || 0; }))) : STYLE.text });
-        if (sa !== undefined || sr !== undefined) {
-          lines.push({ s: 'α ' + fmt(degOf(sa), 1) + '°  κ ' + fmt(sr === undefined ? undefined : sr * 100, 0) + '%', px: small, w: 400, c: STYLE.text });
-        } else if (list[0].sl !== undefined) {
-          lines.push({ s: fmt(maxAbs(list, 'sl'), 1) + ' m/s', px: small, w: 400, c: STYLE.text });
-        }
-        if (load !== undefined) { var lu = U.load(load); lines.push({ s: fmt(lu.v, 0) + ' ' + lu.u, px: small, w: 400, c: PANEL.label }); }
+        var gc = sliding ? slideColour(Math.max.apply(null, list.map(function (w) { return +w.ex || 0; })))
+          : (airborne ? STYLE.airborne : STYLE.text);
+        lines.push({ s: Math.round(grip * 100) + '%', px: fs, w: 600, c: gc });
+        if (load !== undefined && !circle.compact) { var lu = U.load(Math.max(0, load)); lines.push({ s: fmt(lu.v, 0) + ' ' + lu.u, px: small, w: 400, c: DIM_TEXT }); }
       }
       var widest = 0, height = 0;
-      lines.forEach(function (l) { l.width = measure(ctx, l.s, l.px, l.w); widest = Math.max(widest, l.width); height += l.px * 1.18; });
+      lines.forEach(function (l) { l.width = measure(ctx, l.s, l.px, l.w); widest = Math.max(widest, l.width); height += l.px * 1.2; });
+      blocks.push({ wh: wh, pt: pt, d: d, onLeft: onLeft, lines: lines, widest: widest, height: height, y0: pt.y - height / 2 });
+    });
+    // Readouts that would overlap on the same side (a tandem axle) are spread apart, as a group
+    // centred where they would have been.
+    [true, false].forEach(function (left) {
+      var side = blocks.filter(function (b) { return b.onLeft === left; }).sort(function (a, b) { return a.y0 - b.y0; });
+      var groups = [];
+      side.forEach(function (b) {
+        groups.push({ list: [b], h: b.height, mid: b.y0 + b.height / 2, n: 1 });
+        while (groups.length > 1) {
+          var g2 = groups[groups.length - 1], g1 = groups[groups.length - 2];
+          if (g1.mid + g1.h / 2 + 1 <= g2.mid - g2.h / 2) break;
+          g1.mid = (g1.mid * g1.n + g2.mid * g2.n) / (g1.n + g2.n);
+          g1.n += g2.n; g1.h += 1 + g2.h; g1.list = g1.list.concat(g2.list);
+          groups.pop();
+        }
+      });
+      groups.forEach(function (g) {
+        var y = g.mid - g.h / 2;
+        g.list.forEach(function (b) { b.y0 = y; y += b.height + 1; });
+      });
+    });
+    blocks.forEach(function (b) {
+      var wh = b.wh, pt = b.pt, d = b.d, onLeft = b.onLeft, widest = b.widest, height = b.height;
       var r = dotRadius(d.w);
       var clear = d.w / 2 + Math.abs(Math.sin(+wh.s || 0)) * d.h / 2 + Math.max(3, r) + 2 * r + 4;
       var tx = onLeft ? pt.x - clear : pt.x + clear, align = onLeft ? 'right' : 'left';
       // keep the block inside the circle; if that would put it over the tyre, put it on the
       // tyre's inner side instead
-      var y0 = pt.y - height / 2, worst = Math.max(Math.abs(y0 - circle.cy), Math.abs(y0 + height - circle.cy));
+      var y0 = b.y0, worst = Math.max(Math.abs(y0 - circle.cy), Math.abs(y0 + height - circle.cy));
       var half = Math.sqrt(Math.max(0, circle.r * circle.r - worst * worst)) - 3;
       var reachX = d.w / 2 + Math.abs(Math.sin(+wh.s || 0)) * d.h / 2 + 2;
       if (onLeft) {
@@ -1187,303 +1131,65 @@
       var y = y0;
       ctx.save();
       ctx.shadowColor = 'rgba(0, 0, 0, 0.6)'; ctx.shadowBlur = 3;
-      lines.forEach(function (l) {
-        y += l.px * 1.18;
-        text(ctx, l.s, tx, y - l.px * 0.22, l.px, l.w, l.c, align);
+      b.lines.forEach(function (l) {
+        y += l.px * 1.2;
+        text(ctx, l.s, tx, y - l.px * 0.24, l.px, l.w, l.c, align);
       });
       ctx.restore();
     });
   }
 
-  // The panel: rows of the lead vehicle's numbers, fitted to the space by dropping the least
-  // important rows first when it's small.
-  function panelRows(ctx, m, opts) {
-    var vd = m.vd || {}, U = opts.units || DEFAULT_UNITS, R = opts.read, id = m.id, inp = m.inp || {};
-    var sp = opts.splits || computeSplits(m) || {};
-    function rv(key, raw) { if (raw === undefined || raw === null) return undefined; return R ? R.get(id + ':' + key, +raw) : +raw; }
-    function sm(key, raw) { if (raw === undefined || raw === null) return undefined; return R ? R.smooth(id + ':' + key, +raw) : +raw; }
-    var rows = [];
-    function row(h, pri, draw, action) { rows.push({ h: h, pri: pri, draw: draw, action: action }); }
-
-    // speed, gear, rpm
-    row(2.25, 0, function (x, y, w, f) {
-      var sp2 = U.speed(rv('vd.v', vd.v) || 0);
-      var nw = text(ctx, vd.v === undefined ? '–' : fmt(sp2.v, 0), x, y + 1.75 * f, 1.95 * f, 600, PANEL.text);
-      text(ctx, sp2.u, x + nw + 0.35 * f, y + 1.75 * f, 0.78 * f, 400, PANEL.label);
-      var gw = text(ctx, vd.gear !== undefined ? String(vd.gear) : '', x + w, y + 1.75 * f, 1.95 * f, 600, PANEL.text, 'right');
-      if (vd.rpm !== undefined) text(ctx, fmt(rv('vd.rpm', vd.rpm), 0) + ' rpm', x + w - gw - 0.5 * f, y + 1.75 * f, 0.78 * f, 400, PANEL.label, 'right');
-    });
-
-    // understeer / oversteer
-    row(2.75, 1, function (x, y, w, f) {
-      var af = rv('vd.af', vd.af), ar = rv('vd.ar', vd.ar), bal = inp.bal;
-      var diff = (af !== undefined && ar !== undefined) ? degOf(af - ar) : undefined;   // + = front slipping more
-      var status = '–', colour = PANEL.dim;
-      if (bal !== undefined && bal !== null) {
-        colour = travelColour(bal, inp.dc);
-        if (bal <= -UNDER_WARN) status = 'Understeer';
-        else if (bal < -0.04) status = 'Front near limit';
-        else if (bal >= 0.15) status = (+inp.dc >= 0.6) ? 'Drifting, in control' : 'Oversteer';
-        else { status = 'Neutral'; colour = PANEL.text; }
-      }
-      text(ctx, 'BALANCE', x, y + 0.85 * f, 0.72 * f, 600, PANEL.label);
-      text(ctx, status + (diff !== undefined && status !== 'Neutral' && status !== '–' ? '  ' + fmt(Math.abs(diff), 1) + '°' : ''), x + w, y + 0.85 * f, 0.9 * f, 600, colour, 'right');
-      // bar: understeer to the left, oversteer to the right, +-8 deg of difference
-      var by = y + 1.45 * f, bh = Math.max(3, 0.32 * f), cx = x + w / 2;
-      ctx.fillStyle = PANEL.track; ctx.fillRect(x, by - bh / 2, w, bh);
-      var dv = sm('vd.bal', diff);
-      if (dv !== undefined) {
-        var len = clamp(dv / 8, -1, 1) * w / 2;
-        ctx.fillStyle = bal !== undefined ? travelColour(bal, inp.dc) : PANEL.grip;
-        ctx.fillRect(len > 0 ? cx - len : cx, by - bh / 2, Math.abs(len), bh);
-      }
-      ctx.fillStyle = PANEL.tick; ctx.fillRect(cx - 0.5, by - bh, 1, bh * 2);
-      text(ctx, 'US', x, by + 1.0 * f, 0.62 * f, 600, PANEL.dim);
-      text(ctx, 'OS', x + w, by + 1.0 * f, 0.62 * f, 600, PANEL.dim, 'right');
-      text(ctx, 'front α ' + fmt(degOf(af), 1) + '°   rear α ' + fmt(degOf(ar), 1) + '°', cx, by + 1.0 * f, 0.7 * f, 400, PANEL.label, 'center');
-    });
-
-    // G-force now
-    row(1.45, 2, function (x, y, w, f) {
-      var gx = Math.abs(+((m.gf || {}).x) || 0), gy = +((m.gf || {}).y) || 0;
-      gx = rv('gf.x', gx); gy = rv('gf.y', gy);
-      var cols = [
-        ['LAT', fmt(gx, 2)],
-        [gy >= 0 ? 'BRAKE' : 'ACCEL', fmt(Math.abs(gy), 2)],
-        ['TOTAL', fmt(Math.hypot(gx || 0, gy || 0), 2)]
-      ];
-      text(ctx, 'G', x, y + 1.05 * f, 0.72 * f, 600, PANEL.label);
-      var cw = (w - 1.6 * f) / 3;
-      cols.forEach(function (c, k) {
-        var cx2 = x + 1.6 * f + cw * k;
-        var lw = text(ctx, c[0], cx2, y + 1.05 * f, 0.62 * f, 600, PANEL.dim);
-        text(ctx, c[1], cx2 + lw + 0.3 * f, y + 1.05 * f, 0.95 * f, 600, PANEL.text);
-      });
-    });
-
-    // assists fitted and acting
-    if (vd.asf) {
-      row(1.55, 2.5, function (x, y, w, f) {
-        var names = [['ABS', 1, ASSIST[1].colour], ['TCS', 2, ASSIST[2].colour], ['ESC', 4, ASSIST[3].colour]];
-        var cx2 = x, ch = 1.1 * f;
-        names.forEach(function (n) {
-          if (!(vd.asf & n[1])) return;
-          var on = !!(vd.asa & n[1]), tw = measure(ctx, n[0], 0.68 * f, 700), cw = tw + 1.0 * f;
-          roundRect(ctx, cx2, y + 0.2 * f, cw, ch, ch / 2);
-          if (on) { ctx.fillStyle = n[2]; ctx.fill(); }
-          ctx.strokeStyle = on ? n[2] : PANEL.dim; ctx.lineWidth = 1; ctx.stroke();
-          text(ctx, n[0], cx2 + cw / 2, y + 0.2 * f + ch * 0.72, 0.68 * f, 700, on ? 'rgb(12, 14, 18)' : PANEL.label, 'center');
-          cx2 += cw + 0.45 * f;
-        });
-        if (vd.tf !== undefined && vd.tf < 0.995) {
-          text(ctx, 'power −' + fmt((1 - vd.tf) * 100, 0) + '%', x + w, y + 0.2 * f + ch * 0.72, 0.75 * f, 600, ASSIST[2].colour, 'right');
-        }
-      });
+  // The balance in words, at the top of the circle, in the marker's colour: Neutral, Front near
+  // limit (the understeer warning), Understeer, Oversteer or Controlled drift, with how many
+  // degrees more the front (understeer) or rear (oversteer) is slipping than the other axle.
+  // The balance, on two lines at the top of the circle, in the marker's colour: the degrees on
+  // top, large, and the words under them. Both lines always sit at the same height.
+  function balanceFont(rPx) { return clamp(rPx * 0.075, 9, 14); }   // the words
+  function degreeFont(rPx) { return balanceFont(rPx) * 1.35; }       // the degrees
+  var SHORT_WORD = { 'Understeer': 'Under', 'Front near limit': 'Near limit', 'Oversteer': 'Over', 'Controlled drift': 'Drift', 'Neutral': 'Neutral' };
+  // { word, deg (text, or '' when there's nothing to show), colour }, or null when the marker is hidden
+  function balanceStatus(m, R, compact) {
+    var inp = m.inp || {}, vd = m.vd || {}, bal = inp.bal;
+    if (bal === undefined || bal === null) return null;
+    var word, colour = travelColour(bal, inp.dc);
+    if (bal <= -UNDER_WARN) word = 'Understeer';
+    else if (bal < -0.04) word = 'Front near limit';
+    else if (bal >= 0.15) word = (+inp.dc >= 0.6) ? 'Controlled drift' : 'Oversteer';
+    else { word = 'Neutral'; colour = STYLE.text; }
+    var diff;
+    if (vd.af !== undefined && vd.ar !== undefined && vd.af !== null && vd.ar !== null) {
+      diff = (vd.af - vd.ar) * 180 / Math.PI;
+      if (R) diff = R.get(m.id + ':vd.bal', diff);
     }
-
-    // steering and turning
-    row(1.45, 3, function (x, y, w, f) {
-      var yaw = rv('vd.yr', vd.yr);
-      var cols = [
-        ['WHEELS', fmt(degOf(rv('vd.fw', vd.fw)), 1) + '°'],
-        ['TURNING', fmt(degOf(rv('vd.turn', vd.turn)), 1) + '°'],
-        ['YAW', fmt(degOf(yaw), 0) + '°/s']
-      ];
-      var cw = w / 3;
-      cols.forEach(function (c, k) {
-        var cx2 = x + cw * k;
-        var lw = text(ctx, c[0], cx2, y + 1.05 * f, 0.62 * f, 600, PANEL.dim);
-        text(ctx, c[1], cx2 + lw + 0.3 * f, y + 1.05 * f, 0.92 * f, 600, PANEL.text);
-      });
-    });
-
-    // drift angle: the body's slip angle, how far it's travelling sideways
-    row(1.45, 4, function (x, y, w, f) {
-      var b = degOf(rv('vd.beta', vd.beta));
-      var big = b !== undefined && Math.abs(b) >= 3;
-      text(ctx, 'DRIFT ANGLE', x, y + 1.05 * f, 0.62 * f, 600, PANEL.dim);
-      text(ctx, b === undefined ? '–' : fmt(Math.abs(b), 0) + '°', x + w, y + 1.05 * f, (big ? 1.1 : 0.92) * f, 600, big ? TRAVEL_COLOUR_CSS.over : PANEL.text, 'right');
-      if (big) {   // a thin gauge: the slide, up to 60 deg
-        var gw = w * 0.42, gx2 = x + w * 0.33, by = y + 0.72 * f;
-        ctx.fillStyle = PANEL.track; ctx.fillRect(gx2, by, gw, Math.max(2, 0.22 * f));
-        ctx.fillStyle = TRAVEL_COLOUR_CSS.over; ctx.fillRect(gx2, by, gw * clamp(Math.abs(b) / 60, 0, 1), Math.max(2, 0.22 * f));
-      }
-    });
-
-    // front/rear and left/right splits
-    function split(label, key, value, ref, colours, ends) {
-      return function (x, y, w, f) {
-        var lw = 5.2 * f, bx = x + lw, bw = w - lw, by = y + 0.35 * f, bh = 0.95 * f;
-        text(ctx, label, x, y + 1.05 * f, 0.62 * f, 600, PANEL.dim);
-        var v = sm('sp.' + key, value), num = rv('sp.' + key, value);
-        if (v === undefined) {
-          ctx.fillStyle = PANEL.track; ctx.fillRect(bx, by, bw, bh);
-          text(ctx, '–', bx + bw / 2, by + bh * 0.78, 0.72 * f, 600, PANEL.dim, 'center');
-          return;
-        }
-        v = clamp(v, 0, 1);
-        ctx.fillStyle = colours[0]; ctx.fillRect(bx, by, bw * v, bh);
-        ctx.fillStyle = colours[1]; ctx.fillRect(bx + bw * v, by, bw * (1 - v), bh);
-        if (ref !== undefined) {   // the vehicle standing still, for comparison
-          var rx = bx + bw * clamp(ref, 0, 1);
-          ctx.fillStyle = PANEL.tick; ctx.fillRect(rx - 0.75, by - 0.2 * f, 1.5, bh + 0.4 * f);
-        }
-        text(ctx, ends[0] + ' ' + fmt(num * 100, 0), bx + 0.3 * f, by + bh * 0.78, 0.7 * f, 700, 'rgba(10, 12, 16, 0.9)');
-        text(ctx, fmt((1 - num) * 100, 0) + ' ' + ends[1], bx + bw - 0.3 * f, by + bh * 0.78, 0.7 * f, 700, 'rgba(255, 255, 255, 0.9)', 'right');
-      };
-    }
-    row(1.55, 5, split('LOAD F/R', 'loadF', sp.loadF, sp.statF, PANEL.load, ['F', 'R']));
-    row(1.55, 5.5, split('LOAD L/R', 'loadL', sp.loadL, sp.statL, PANEL.load, ['L', 'R']));
-    var drivenF = toArray(m.wheels).some(function (w) { return +w.d && +w.y > 0; });
-    var drivenR = toArray(m.wheels).some(function (w) { return +w.d && +w.y <= 0; });
-    if (drivenF && drivenR) row(1.55, 6, split('DRIVE F/R', 'driveF', sp.driveF, undefined, PANEL.drive, ['F', 'R']));
-    if (toArray(m.wheels).some(function (w) { return +w.d; })) row(1.55, 6.2, split('DRIVE L/R', 'driveL', sp.driveL, undefined, PANEL.drive, ['L', 'R']));
-    row(1.55, 6.4, split('BRAKE F/R', 'brakeF', sp.brakeF, undefined, PANEL.brake, ['F', 'R']));
-    // grip in use, front and rear axle averages
-    row(1.55, 6.6, function (x, y, w, f) {
-      var lw = 5.2 * f, half = (w - lw - 0.6 * f) / 2, by = y + 0.35 * f, bh = 0.95 * f;
-      text(ctx, 'GRIP', x, y + 1.05 * f, 0.62 * f, 600, PANEL.dim);
-      [['F', 'gripF'], ['R', 'gripR']].forEach(function (g, k) {
-        var bx = x + lw + k * (half + 0.6 * f), v = sm('sp.' + g[1], sp[g[1]]), num = rv('sp.' + g[1], sp[g[1]]);
-        ctx.fillStyle = PANEL.track; ctx.fillRect(bx, by, half, bh);
-        // past 100 %: pink, as a tyre just over its limit; red once a tyre on that axle slides
-        var sliding = sp[g[1] === 'gripF' ? 'slideF' : 'slideR'];
-        if (v !== undefined) { ctx.fillStyle = sliding ? slideColour(0.6) : (v > 1 ? slideColour(0) : PANEL.grip); ctx.fillRect(bx, by, half * clamp(v, 0, 1), bh); }
-        var dark = v !== undefined && v > 0.45;
-        text(ctx, g[0] + ' ' + (num === undefined ? '–' : fmt(num * 100, 0) + '%'), bx + 0.3 * f, by + bh * 0.78, 0.7 * f, 700, dark ? 'rgba(10, 12, 16, 0.9)' : PANEL.text);
-      });
-    });
-
-    // tyre temperatures and pressures, brake temperatures: one line per axle, left | right
-    var axles = findAxles(toArray(m.wheels).filter(function (w) { return !+w.b; }));
-    function perAxle(fieldList) {
-      return axles.slice(0, 4).map(function (a) {
-        var left = a.wheels.filter(function (w) { return +w.x < a.cx - 0.01; }), right = a.wheels.filter(function (w) { return +w.x > a.cx + 0.01; });
-        if (!left.length && !right.length) left = a.wheels;
-        function pick(ws, f) {   // the hottest / highest of a dual set
-          var best;
-          ws.forEach(function (w) { var v = w[f]; if (v !== undefined && v !== null) { v = rv('w' + w.i + '.' + f, v); if (best === undefined || v > best) best = v; } });
-          return best;
-        }
-        return { L: fieldList.map(function (f) { return pick(left, f); }), R: fieldList.map(function (f) { return pick(right, f); }) };
-      });
-    }
-    function tempColour(c, warm, hot, cold) {
-      if (c === undefined) return PANEL.dim;
-      if (c >= hot) return PANEL.vhot;
-      if (c >= warm) return PANEL.hot;
-      if (cold !== undefined && c < cold) return PANEL.cold;
-      return PANEL.text;
-    }
-    var hasTyre = toArray(m.wheels).some(function (w) { return w.tt !== undefined || w.tp !== undefined; });
-    if (hasTyre && axles.length) {
-      var tyreRows = perAxle(['tt', 'tp']);
-      var pu = U.pressureOf(0).u, tu = U.temperature(0).u;
-      row(1.2 + 1.2 * tyreRows.length, 8, function (x, y, w, f) {
-        text(ctx, 'TYRES', x, y + 0.9 * f, 0.62 * f, 600, PANEL.dim);
-        text(ctx, tu + '  ·  ' + pu, x + w, y + 0.9 * f, 0.62 * f, 600, PANEL.dim, 'right');
-        tyreRows.forEach(function (r, k) {
-          var yy = y + (2.0 + 1.2 * k) * f;
-          [['L', x + w * 0.02, 'left'], ['R', x + w * 0.98, 'right']].forEach(function (side) {
-            var vals = r[side[0]], t = vals[0], pr = vals[1];
-            var ts = t === undefined ? '–' : fmt(U.temperature(t).v, 0) + '°';
-            var pv = pr === undefined ? undefined : U.pressureOf(pr);
-            var ps = pv ? fmt(pv.v, pv.d) : '–';
-            var s1 = side[0] === 'L' ? ts : ps, s2 = side[0] === 'L' ? ps : ts;
-            var c1 = side[0] === 'L' ? tempColour(t, 110, 130, 40) : PANEL.text, c2 = side[0] === 'L' ? PANEL.text : tempColour(t, 110, 130, 40);
-            var w1 = text(ctx, s1, side[1], yy, 0.88 * f, 600, c1, side[2]);
-            text(ctx, s2, side[2] === 'left' ? side[1] + w1 + 0.7 * f : side[1] - w1 - 0.7 * f, yy, 0.88 * f, 400, c2, side[2]);
-          });
-          text(ctx, axleName(k, tyreRows.length), x + w / 2, yy, 0.62 * f, 600, PANEL.dim, 'center');
-        });
-      });
-    }
-    var hasBrake = toArray(m.wheels).some(function (w) { return w.bt !== undefined; });
-    if (hasBrake && axles.length) {
-      var brakeRows = perAxle(['bt']);
-      row(1.2 + 1.2 * brakeRows.length, 9, function (x, y, w, f) {
-        text(ctx, 'BRAKES', x, y + 0.9 * f, 0.62 * f, 600, PANEL.dim);
-        text(ctx, U.temperature(0).u, x + w, y + 0.9 * f, 0.62 * f, 600, PANEL.dim, 'right');
-        brakeRows.forEach(function (r, k) {
-          var yy = y + (2.0 + 1.2 * k) * f;
-          var l = r.L[0], rr = r.R[0];
-          text(ctx, l === undefined ? '–' : fmt(U.temperature(l).v, 0) + '°', x + w * 0.02, yy, 0.88 * f, 600, tempColour(l, 400, 650), 'left');
-          text(ctx, rr === undefined ? '–' : fmt(U.temperature(rr).v, 0) + '°', x + w * 0.98, yy, 0.88 * f, 600, tempColour(rr, 400, 650), 'right');
-          text(ctx, axleName(k, brakeRows.length), x + w / 2, yy, 0.62 * f, 600, PANEL.dim, 'center');
-        });
-      });
-    }
-
-    // peaks since the vehicle was reset (click the row to clear them)
-    var pk = opts.peaks || {};
-    row(1.3, 7, function (x, y, w, f) {
-      text(ctx, 'PEAK G', x, y + 0.95 * f, 0.62 * f, 600, PANEL.dim);
-      var s = 'lat ' + fmt(pk.lat, 2) + '   brake ' + fmt(pk.brk, 2) + '   accel ' + fmt(pk.acc, 2);
-      text(ctx, s, x + w - 1.4 * f, y + 0.95 * f, 0.72 * f, 600, PANEL.label, 'right');
-      text(ctx, '↺', x + w, y + 0.98 * f, 0.9 * f, 600, PANEL.dim, 'right');
-    }, 'resetPeaks');
-    return rows;
+    var deg = (word !== 'Neutral' && diff !== undefined) ? fmt(Math.abs(diff), 1) + '°' : '';
+    return { word: compact ? SHORT_WORD[word] : word, deg: deg, colour: colour, neutral: word === 'Neutral' };
   }
-  function axleName(k, n) { return n <= 1 ? '' : (k === 0 ? 'FRONT' : (n === 2 ? 'REAR' : 'AXLE ' + (k + 1))); }
-  var TRAVEL_COLOUR_CSS = { over: 'rgb(235, 70, 205)' };
-
-  // Lay the rows out in the panel (one or two columns), largest text that fits, dropping the
-  // least important rows when even small text doesn't.
-  var PANEL_MIN_FONT = 8.5, PANEL_MAX_FONT = 14, PANEL_CHARS = 17;   // a row needs about 17 font sizes of width
-  function drawPanel(ctx, rect, m, opts, hits) {
-    var rows = panelRows(ctx, m, opts);
-    var pad = 8, gap = 0.4;
-    function fit(list, cols) {
-      var colW = (rect.w - pad * 2 - (cols - 1) * pad) / cols;
-      var total = list.reduce(function (s, r) { return s + r.h + gap; }, 0) - gap;
-      var perCol = total / cols + (cols > 1 ? 2.5 : 0);   // a little slack for uneven columns
-      return Math.min((rect.h - pad * 2) / perCol, colW / PANEL_CHARS, PANEL_MAX_FONT);
-    }
-    var list = rows.slice(), cols = 1, f = fit(list, 1);
-    if (f < 11 && rect.w > rect.h * 1.3) { var f2 = fit(list, 2); if (f2 > f) { f = f2; cols = 2; } }
-    while (f < PANEL_MIN_FONT && list.length > 1) {   // drop the least important row
-      var worst = list.reduce(function (a, r) { return r.pri > a.pri ? r : a; }, list[0]);
-      list.splice(list.indexOf(worst), 1);
-      f = fit(list, cols);
-      if (cols === 1 && rect.w > rect.h * 1.3) { var f3 = fit(list, 2); if (f3 > f) { f = f3; cols = 2; } }
-    }
-    if (f < 6) return;
-    // background, the same as the circle's
-    roundRect(ctx, rect.x + 0.5, rect.y + 0.5, rect.w - 1, rect.h - 1, Math.min(10, rect.w * 0.05));
-    ctx.fillStyle = STYLE.panelFill; ctx.fill();
-    ctx.strokeStyle = STYLE.panelStroke; ctx.lineWidth = 1; ctx.stroke();
-    var colW = (rect.w - pad * 2 - (cols - 1) * pad) / cols;
-    var total = list.reduce(function (s, r) { return s + r.h + gap; }, 0) - gap, target = total / cols;
-    var col = 0, y = rect.y + pad, used = 0;
-    // spread leftover height evenly between rows of the column
-    var spare = cols === 1 ? Math.max(0, (rect.h - pad * 2) / f - total) : 0, extra = list.length > 1 ? Math.min(spare / (list.length - 1), 0.9) : 0;
+  // How far down from the top of the inner circle a line of text this wide has to sit so its
+  // corners stay inside it (clear of the marker on the rim).
+  function chordDrop(inner, width) {
+    var half = width / 2 + 4;
+    return half >= inner ? inner : inner - Math.sqrt(inner * inner - half * half);
+  }
+  // Where the two lines go, worked out for the longest text so nothing moves as it changes.
+  function balanceLayout(ctx, rPx, inner, compact) {
+    var fs = balanceFont(rPx), dfs = degreeFont(rPx), h1 = dfs * 1.05, h2 = fs * 1.2;
+    var w1 = measure(ctx, '88.8°', dfs, 700), w2 = measure(ctx, compact ? 'Near limit' : 'Front near limit', fs, 600);
+    var drop = Math.max(chordDrop(inner, w1), chordDrop(inner, w2) - h1) + 1;
+    return { fs: fs, dfs: dfs, drop: drop, h1: h1, band: drop + h1 + h2 + fs * 0.4 };
+  }
+  // the band at the top of the circle the balance needs
+  function balanceBand(ctx, rPx, inner, compact) { return balanceLayout(ctx, rPx, inner, compact).band; }
+  function drawBalance(ctx, m, cx, cy, inner, rPx, opts, compact) {
+    var st = balanceStatus(m, opts.read, compact);
+    if (!st || st.neutral) return;   // nothing to say while the car is balanced
+    var L = balanceLayout(ctx, rPx, inner, compact), top = cy - inner + L.drop;
     ctx.save();
-    list.forEach(function (r, k) {
-      if (cols > 1 && col < cols - 1 && used > 0 && used + r.h / 2 > target) { col++; y = rect.y + pad; used = 0; }
-      var x = rect.x + pad + col * (colW + pad);
-      if (used > 0) {   // a faint rule between rows
-        ctx.fillStyle = PANEL.rule; ctx.fillRect(x, y - (gap + extra) * f / 2, colW, 1);
-      }
-      r.draw(x, y, colW, f);
-      if (r.action && hits) hits.push({ x: x, y: y, w: colW, h: r.h * f, action: r.action });
-      y += (r.h + gap + extra) * f; used += r.h + gap;
-    });
+    ctx.shadowColor = 'rgba(0, 0, 0, 0.7)'; ctx.shadowBlur = 3;
+    if (st.deg) text(ctx, st.deg, cx, top + L.dfs * 0.9, L.dfs, 700, st.colour, 'center');
+    text(ctx, st.word, cx, top + L.h1 + L.fs, L.fs, 600, st.colour, 'center');
     ctx.restore();
   }
 
-  // Where the circle and the panel go. Without the panel, the circle fills the app. With it, the
-  // panel takes the space beside the circle along the app's longer side (at least
-  // PANEL_SHARE of it); in a small app there's no panel, only the readouts by the wheels.
-  var PANEL_SHARE = 0.4;
-  function layoutRegions(W, H, withPanel) {
-    var full = { cx: W / 2, cy: H / 2, r: Math.max(4, Math.min(W, H) / 2 - 2), panel: null };
-    if (!withPanel) return full;
-    var landscape = W >= H, long = landscape ? W : H, short = landscape ? H : W;
-    var d = Math.min(short, long * (1 - PANEL_SHARE)), gap = 6;
-    if (long - d - gap < 130 || short < 150) return full;
-    if (landscape) return { cx: d / 2, cy: H / 2, r: d / 2 - 2, panel: { x: d + gap, y: 0, w: W - d - gap, h: H } };
-    return { cx: W / 2, cy: d / 2, r: d / 2 - 2, panel: { x: 0, y: d + gap, w: W, h: H - d - gap } };
-  }
 
   // ===== Renderer ==========================================================
   function prepareBodies(data) {
@@ -1503,27 +1209,30 @@
   }
 
   // draw(data, opts): data = { bodies: [...] } (lead vehicle first); opts.numbers switches the
-  // numbers mode on. Returns the clickable regions it drew ({ x, y, w, h, action }).
+  // numbers mode on (opts.read: averaged readouts, opts.units: weight units).
   VGSRenderer.prototype.draw = function (data, opts) {
     opts = opts || {};
     var size = this.fit(), ctx = this.ctx, W = size.w, H = size.h;
-    var trail = this.gTrail, hits = [];
-    this.hits = hits;
+    var trail = this.gTrail;
     ctx.clearRect(0, 0, W, H);
     var bodies = prepareBodies(data);
-    if (!bodies.length) { trail.length = 0; this.leadId = undefined; drawEmpty(ctx, W, H); return hits; }
+    if (!bodies.length) { trail.length = 0; this.leadId = undefined; drawEmpty(ctx, W, H); return; }
     // a different vehicle: no trail from the old one
     if (!bodies[0].gf || (this.leadId !== undefined && bodies[0].id !== this.leadId)) trail.length = 0;
     this.leadId = bodies[0].id;
     // every vehicle is laid out from its real footprint when the vehicle reports one
     bodies.forEach(function (b) { b.geo = bodyGeometry(b.wheels, b.sources, b.ext); });
 
-    var region = layoutRegions(W, H, !!opts.numbers);
     var scale, placements = [];
-    // The big circle is always the same size; vehicles are scaled to fit inside it, clear of
-    // the input arcs on its rim.
-    var rPx = region.r, ccx = region.cx, ccy = region.cy;
+    // The big circle always fills the app; vehicles are scaled to fit inside it, clear of the
+    // input arcs on its rim.
+    var rPx = Math.max(4, Math.min(W, H) / 2 - 2), ccx = W / 2, ccy = H / 2;
     var inner = rPx - clamp(rPx * 0.05, 3, 7) - markerSize(rPx) - 2;
+    // numbers mode: a band at the top of the circle for the balance
+    // In a very small app (under about 125 px) the readouts are just the grip, and the balance
+    // words are shortened.
+    var compact = rPx < COMPACT_BELOW;
+    var band = opts.numbers ? balanceBand(ctx, rPx, inner, compact) : 0;
     ctx.beginPath(); ctx.arc(ccx, ccy, rPx, 0, Math.PI * 2);
     ctx.fillStyle = STYLE.panelFill; ctx.fill();
     ctx.strokeStyle = STYLE.panelStroke; ctx.lineWidth = 1.5; ctx.stroke();
@@ -1535,20 +1244,21 @@
       ctx.strokeStyle = STYLE.panelStroke; ctx.lineWidth = 1; ctx.stroke();
     }
 
-    // in numbers mode the vehicle is drawn a little smaller, to make room for the readouts
-    var shrink = opts.numbers ? NUMBERS_SHRINK : 1;
+    // in numbers mode the vehicle is drawn a little smaller, to make room for the readouts and
+    // the balance at the top
     if (bodies.length === 1) {
       // centred on the vehicle's body, one scale for everything (true proportions)
       scale = inner / fitRadius(bodies[0]);
-      if (opts.numbers) scale *= readoutShrink(ctx, bodies[0], scale, inner);
+      if (opts.numbers) scale *= readoutShrink(ctx, bodies[0], scale, inner, band, compact);
       if (bodies[0].geo.hasExt) outline(bodies[0], ccx, ccy);
       placements.push({ body: bodies[0], ox: ccx, oy: ccy });
     } else {
-      // tractor + trailer, articulated sections: stacked front to back, one shared scale
+      // tractor + trailer, articulated sections: stacked front to back, one shared scale (in
+      // numbers mode a little smaller, and moved down clear of the balance)
       var maxHalfW = 0, totalH = BODY_GAP * (bodies.length - 1);
       bodies.forEach(function (b) { maxHalfW = Math.max(maxHalfW, b.geo.halfW); totalH += b.geo.halfH * 2; });
-      scale = inner / Math.hypot(maxHalfW, totalH / 2) * shrink;
-      var y = ccy - totalH * scale / 2, prevBottom = null;
+      scale = (inner - band) / Math.hypot(maxHalfW, totalH / 2) * (opts.numbers ? NUMBERS_SHRINK : 1);
+      var y = ccy + band / 2 - totalH * scale / 2, prevBottom = null;
       bodies.forEach(function (b) {
         var hh = b.geo.halfH * scale, oy = y + hh;
         if (prevBottom !== null) {           // hitch
@@ -1563,7 +1273,7 @@
     }
 
     // Pass 1: drivetrains. Then the G-force dot (centred on the circle, from the lead vehicle).
-    // Pass 2: tyres and assist dots on top. Pass 3 (numbers mode): readouts and the panel.
+    // Pass 2: tyres and assist dots on top. Pass 3 (numbers mode): readouts and the balance.
     var dims = function (wh) {
       return { w: Math.max(wh._wd * scale, MIN_TYRE_W), h: Math.max(wh._len * scale, MIN_TYRE_L) };
     };
@@ -1601,32 +1311,33 @@
     });
 
     if (opts.numbers) {
-      var circle = { cx: ccx, cy: ccy, r: inner };
+      var circle = { cx: ccx, cy: ccy, r: inner, compact: compact };
       placements.forEach(function (p) { drawCornerReadouts(ctx, p, dims, circle, opts); });
-      if (region.panel) drawPanel(ctx, region.panel, bodies[0], opts, hits);
+      drawBalance(ctx, bodies[0], ccx, ccy, inner, rPx, opts, compact);
     }
-    return hits;
   };
   var NUMBERS_SHRINK = 0.86;   // stacked vehicles in numbers mode
+  var COMPACT_BELOW = 62;      // circle radius (px) below which the numbers go compact
 
   // How much smaller to draw a lone vehicle in numbers mode so every corner's readout fits
-  // beside its tyre, inside the circle.
-  function readoutShrink(ctx, body, scale, inner) {
-    var g = body.geo, sample = '\u03b1 10.0\u00b0  \u03ba 10%';
-    for (var k = 1; k >= 0.5; k -= 0.025) {
-      var s2 = scale * k, ok = true;
+  // beside its tyre inside the circle, and the vehicle stays clear of the balance band at the top.
+  function readoutShrink(ctx, body, scale, inner, band, compact) {
+    var g = body.geo, sample = compact ? '100%' : '1888 kg', nLines = compact ? 1 : 2;
+    for (var k = 1; k >= 0.35; k -= 0.025) {
+      var s2 = scale * k, ok = g.boxHalfH * s2 <= inner - band - 2;
       for (var i = 0; i < body.wheels.length && ok; i++) {
         var w = body.wheels[i];
         if (w._outer === false) continue;
         var tw = Math.max(w._wd * s2, MIN_TYRE_W), th = Math.max(w._len * s2, MIN_TYRE_L);
-        var fs = clamp(th * 0.26, 8, 12), textW = measure(ctx, sample, fs * 0.82, 400), textH = fs * 1.18 * 3;
+        var fs = cornerFont(th), textW = measure(ctx, sample, compact ? fs : fs * 0.85, compact ? 600 : 400), textH = fs * 1.2 * nLines;
         var x = Math.abs(w._mx - g.cx) * s2 + tw / 2 + dotRadius(tw) * 3 + 7 + textW;
         var y = Math.abs(+w.y - g.cy) * s2 + textH / 2;
         if (x * x + y * y > (inner - 3) * (inner - 3)) ok = false;
+        if (+w.y > g.cy && (+w.y - g.cy) * s2 + textH / 2 > inner - band - 2) ok = false;   // a front readout under the band
       }
       if (ok) return k;
     }
-    return 0.5;
+    return 0.35;
   }
 
   // ===== Data from the game ================================================
@@ -1636,16 +1347,13 @@
   // live values into the shape the renderer draws.
   // layout fields a live update never overwrites (everything else it sends is copied as is)
   var STATIC_KEYS = { i: 1, n: 1, nt: 1, rd: 1, wd: 1, x: 1, y: 1 };
-  var READ_WHEEL = ['g', 'sa', 'sr', 'fz', 'tt', 'tc', 'tp', 'bt', 'sl'];
-  var READ_VD = ['v', 'yr', 'beta', 'fw', 'turn', 'af', 'ar', 'rpm'];
+  var READ_WHEEL = ['g', 'fz'];
   var STALE_MS = 1500;   // a coupled body this far behind the lead vehicle's updates is dropped
 
   function VGSStore() {
     this.bodies = {};      // id -> { id, st, lv, d (latest update), t (ms), merged }
     this.chain = null;     // { p: player vehicle id (-1 = none), ch: [ids] }
     this.read = new Readouts();
-    this.peaks = { lat: undefined, brk: undefined, acc: undefined };
-    this.peakKey = null;
     this.layoutAsked = {}; // id -> ms of the last layout request
   }
   VGSStore.prototype.leadId = function () {
@@ -1672,25 +1380,13 @@
     var m = mergeBody(b), R = this.read, id = p.id;
     if (p.vd) {   // numbers mode: feed the readouts
       toArray(m.wheels).forEach(function (w) {
-        READ_WHEEL.forEach(function (f) { if (w[f] !== undefined && w[f] !== null) R.add(id + ':w' + w.i + '.' + f, w[f], now); });
+        READ_WHEEL.forEach(function (f) { if (w[f] !== undefined && w[f] !== null) R.add(id + ':w' + w.i + '.' + f, w[f]); });
       });
-      READ_VD.forEach(function (f) { if (p.vd[f] !== undefined && p.vd[f] !== null) R.add(id + ':vd.' + f, p.vd[f], now); });
-      if (p.vd.af !== undefined && p.vd.ar !== undefined) R.add(id + ':vd.bal', (p.vd.af - p.vd.ar) * 180 / Math.PI, now);
-      if (p.gf) { R.add(id + ':gf.x', Math.abs(+p.gf.x || 0), now); R.add(id + ':gf.y', +p.gf.y || 0, now); }
-      var sp = b.splits = computeSplits(m);
-      if (sp) for (var k in sp) R.add(id + ':sp.' + k, sp[k], now);
+      if (p.vd.af !== undefined && p.vd.ar !== undefined) R.add(id + ':vd.bal', (p.vd.af - p.vd.ar) * 180 / Math.PI);
       R.tick(now);
-    } else b.splits = null;
-    if (id === this.leadId() && p.gf) {   // peak G since the vehicle was (re)loaded or reset
-      var key = id + ':' + p.lv;
-      if (key !== this.peakKey) { this.peakKey = key; this.resetPeaks(); }
-      var gx = Math.abs(+p.gf.x || 0), gy = +p.gf.y || 0, pk = this.peaks;
-      pk.lat = Math.max(pk.lat || 0, gx);
-      if (gy > 0) pk.brk = Math.max(pk.brk || 0, gy); else pk.acc = Math.max(pk.acc || 0, -gy);
     }
     return null;
   };
-  VGSStore.prototype.resetPeaks = function () { this.peaks.lat = this.peaks.brk = this.peaks.acc = undefined; };
   // true when it changed what's shown
   VGSStore.prototype.setChain = function (c) {
     if (!c || typeof c.p !== 'number') return false;
@@ -1758,7 +1454,7 @@
     var ref = lead.d, hl = Math.hypot(+ref.hx || 0, +ref.hy || 0) || 1, hx = (+ref.hx || 0) / hl, hy = (+ref.hy || 1) / hl;
     list.forEach(function (b) { b.along = b === lead ? 0 : (b.d.px - ref.px) * hx + (b.d.py - ref.py) * hy; });
     list.sort(function (a, b) { return b.along - a.along; });
-    return { bodies: list.map(mergeBody), splits: lead.splits };
+    return { bodies: list.map(mergeBody) };
   };
 
   VGSRenderer.synthDrivetrain = synthDrivetrain;   // used by the browser preview
@@ -1771,7 +1467,7 @@
   };
   VGSRenderer.Store = VGSStore;
   VGSRenderer.Units = Units;
-  VGSRenderer.computeSplits = computeSplits;
+  VGSRenderer.balanceStatus = balanceStatus;
   window.VGSRenderer = VGSRenderer;
 
   // ----- BeamNG app directive (skipped when running in a plain browser) -----
@@ -1804,7 +1500,7 @@
         var renderer = new VGSRenderer(canvas);
         var store = new VGSStore();
         var units = new Units();
-        var me = { opts: { numbers: loadPref(), units: units, read: store.read, peaks: store.peaks } };
+        var me = { opts: { numbers: loadPref(), units: units, read: store.read } };
         var opts = me.opts;
         instances.push(me);
         var pending = false, alive = true, lastData = 0, lastChain = 0;
@@ -1814,10 +1510,7 @@
         function render() {
           pending = false;
           if (!alive) return;
-          var f = store.frame();
-          opts.splits = f.splits;
-          opts.peaks = store.peaks;
-          try { renderer.draw(f, opts); } catch (e) { if (window.console) console.error('VGS Display:', e); }
+          try { renderer.draw(store.frame(), opts); } catch (e) { if (window.console) console.error('VGS Display:', e); }
         }
         function schedule() { if (!pending && alive) { pending = true; raf(render); } }
         function enableHub() {
@@ -1851,10 +1544,7 @@
           if (t - lastData > 6000 && t - lastChain > 6000 && store.hasData()) { store.clear(); schedule(); }
         }, 1000);
 
-        element.on('click', function (ev) {
-          var r = canvas.getBoundingClientRect(), x = ev.clientX - r.left, y = ev.clientY - r.top;
-          var hit = (renderer.hits || []).filter(function (h) { return x >= h.x && x <= h.x + h.w && y >= h.y && y <= h.y + h.h; })[0];
-          if (hit && hit.action === 'resetPeaks') { store.resetPeaks(); schedule(); return; }
+        element.on('click', function () {
           opts.numbers = !opts.numbers;
           savePref(opts.numbers);
           pushDetail();
