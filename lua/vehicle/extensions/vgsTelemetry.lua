@@ -51,14 +51,9 @@ local LOAD_SMOOTH_HZ   = 0.5   -- low-pass on the wheel load used to scale drive
 local STANDSTILL_SPEED = 0.5   -- m/s; a held brake at standstill isn't counted as tyre force
 -- G-force dot. The acceleration is the least-squares slope of the velocity over GF_WINDOW
 -- (which averages out the body's vibration far better than a difference between two samples),
--- then a "One Euro" filter: strong smoothing while the force holds steady, so the dot sits
--- still, opening up as the force changes, so it doesn't trail behind. In a simulated test with
--- body vibration it's as steady as a plain 0.12 s window with a 12 Hz low-pass, with less than
--- half the delay (about 50 ms instead of 120).
+-- then smoothed (TUNE.GF_*): strongly while the force holds steady, so the dot sits still,
+-- opening up as it changes quickly, so it doesn't trail far behind.
 local GF_WINDOW        = 0.10  -- s of velocity history in each slope
-local GF_MIN_CUTOFF    = 1.5   -- Hz: smoothing while steady (lower = stiller)
-local GF_BETA          = 4     -- Hz per g/s: how much it opens up as the force changes
-local GF_D_CUTOFF      = 1     -- Hz: smoothing of the rate of change itself
 -- Direction marker: how much the car is actually turning, on the steering arc's scale
 -- (see updateTravel). It can run on past a quarter, all the way round, in slides and spins.
 local TRAVEL_SMOOTH_HZ = 15    -- low-pass on each axle's direction of travel
@@ -175,6 +170,17 @@ TUNE.CAL_TAU          = 40    -- s of such driving the estimate averages over
 TUNE.CAL_PRIOR_BNG    = 20    -- s of driving BeamNG's own calibration counts as
 TUNE.CAL_READY        = 2.5   -- s of such cornering before a learnt (not BeamNG's) value is trusted ...
 TUNE.CAL_SPREAD       = 0.0015 -- rad (~0.1 deg): ... over at least this spread of front slip
+-- G-force dot smoothing (see GF_WINDOW). The dot is there to show the weight shifting, which
+-- the car's suspension itself spreads over a good part of a second, so it's smoothed hard: two
+-- stages at a cutoff that's low while the force holds and opens only for changes faster than a
+-- rough road's shaking (a turn-in, a stab of the brakes). In a simulated test against the
+-- earlier single stage: 8x steadier with body vibration, 22x on a rough road, for about 85 ms
+-- more delay into a corner.
+TUNE.GF_MIN_CUTOFF    = 0.6   -- Hz: smoothing while steady (lower = stiller)
+TUNE.GF_BETA          = 3     -- Hz per g/s (above GF_D_FLOOR): how much it opens up as the force changes
+TUNE.GF_D_CUTOFF      = 0.5   -- Hz: smoothing of the rate of change itself
+TUNE.GF_STAGES        = 2     -- smoothing stages
+TUNE.GF_D_FLOOR       = 2     -- g/s of change that doesn't open it (a rough road's shaking)
 -- tests can override any of the TUNE values
 if type(VGS_TUNE_OVERRIDE) == "table" then for k2, v2 in pairs(VGS_TUNE_OVERRIDE) do TUNE[k2] = v2 end end
 -- ===========================================================================
@@ -901,7 +907,7 @@ end
 local function resetState()
   lay.wheels, lay.static, lay.drivetrain, lay.front, lay.rear, lay.wait = nil, nil, nil, nil, nil, 0
   everDriven, nodeCidByName, wstate = {}, nil, {}
-  kin.latAccel, kin.gx, kin.gy, kin.gdx, kin.gdy, kin.gInit = 0, 0, 0, 0, 0, false
+  kin.latAccel, kin.gx, kin.gy, kin.gdx, kin.gdy, kin.gInit, kin.g1x, kin.g1y = 0, 0, 0, 0, 0, false, 0, 0
   kin.yawRate, kin.yawCheck, kin.lastFwd, kin.lastRight, kin.travel, kin.rearTravel = 0, 0, nil, nil, 0, 0
   kin.yawFast, mark.init = 0, false
   kin.vring = newRing(128)
@@ -949,13 +955,19 @@ local function updateAccel(dt, vel, fwd, right)
   kin.latAccel = kin.latAccel + (aLat - kin.latAccel) * clamp(dt * ACCEL_SMOOTH_HZ, 0, 1)
   kin.aLatRaw = aLat   -- the grip model's own, less smoothed (see gripStep)
   local x, y = aLat / G, aLon / G
-  if not kin.gInit then kin.gx, kin.gy, kin.gInit = x, y, true return end
-  local ad = lpAlpha(GF_D_CUTOFF, dt)
-  kin.gdx = kin.gdx + ((x - kin.gx) / dt - kin.gdx) * ad
-  kin.gdy = kin.gdy + ((y - kin.gy) / dt - kin.gdy) * ad
-  local a = lpAlpha(GF_MIN_CUTOFF + GF_BETA * math.sqrt(kin.gdx * kin.gdx + kin.gdy * kin.gdy), dt)
-  kin.gx = kin.gx + (x - kin.gx) * a
-  kin.gy = kin.gy + (y - kin.gy) * a
+  if not kin.gInit then kin.gx, kin.gy, kin.g1x, kin.g1y, kin.gInit = x, y, x, y, true return end
+  -- the cutoff opens with how fast the (smoothed) force is changing; two stages at that cutoff
+  local ad = lpAlpha(TUNE.GF_D_CUTOFF, dt)
+  kin.gdx = kin.gdx + ((x - kin.g1x) / dt - kin.gdx) * ad
+  kin.gdy = kin.gdy + ((y - kin.g1y) / dt - kin.gdy) * ad
+  local rate = math.max(0, math.sqrt(kin.gdx * kin.gdx + kin.gdy * kin.gdy) - TUNE.GF_D_FLOOR)   -- faster than bumps shake it
+  local a = lpAlpha(TUNE.GF_MIN_CUTOFF + TUNE.GF_BETA * rate, dt)
+  kin.g1x = kin.g1x + (x - kin.g1x) * a
+  kin.g1y = kin.g1y + (y - kin.g1y) * a
+  if TUNE.GF_STAGES >= 2 then
+    kin.gx = kin.gx + (kin.g1x - kin.gx) * a
+    kin.gy = kin.gy + (kin.g1y - kin.gy) * a
+  else kin.gx, kin.gy = kin.g1x, kin.g1y end
 end
 
 -- Yaw rate (+ = turning left) from the physics (the value BeamNG's own ESC uses), checked

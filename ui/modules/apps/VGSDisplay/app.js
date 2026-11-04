@@ -918,8 +918,9 @@
   var TRAIL_MS = 1300;       // how long a ghost takes to fade out completely
   var TRAIL_STEP_MS = 12;    // at most one trail point this often, however fast the screen refreshes
   var GF_COLOUR = [240, 215, 130];   // soft butter yellow, to sit with the muted drivetrain colours
-  var GF_ALPHA = 0.5;                 // see-through, so the part underneath still shows
-  var GF_RIM_ALPHA = 0.65;            // the rim is a little stronger so the dot keeps its shape
+  var GF_ALPHA = 0.68;                // a little see-through, so the part underneath still shows
+  var GF_RIM_ALPHA = 0.95;            // the rim is stronger so the dot keeps its shape
+  var GF_HALO = 'rgba(8, 10, 14, 0.55)';   // a thin dark ring outside it, so it stands out on the grip bars and arcs
 
   function drawGForce(ctx, trail, cx, cy, R, gf) {
     var now = (window.performance && performance.now) ? performance.now() : Date.now();
@@ -931,7 +932,7 @@
     else trail.push({ x: gx / GF_MAX, y: -gy / GF_MAX, t: now });
     while (trail.length && now - trail[0].t > TRAIL_MS) trail.shift();
 
-    var dotR = clamp(R * 0.05, 3, 7.5), reach = R - dotR - 2;
+    var dotR = clamp(R * 0.058, 3.5, 8.5), reach = R - dotR - 2;
     var rgb = GF_COLOUR.join(', ');
     var head = trail[trail.length - 1];
     ctx.save();
@@ -945,14 +946,17 @@
       if (Math.hypot(tk.x - lastX, tk.y - lastY) < minStep) continue;
       lastX = tk.x; lastY = tk.y;
       var life = 1 - (now - tk.t) / TRAIL_MS;
-      ctx.fillStyle = 'rgba(' + rgb + ', ' + (GF_ALPHA * 0.8 * life * life).toFixed(3) + ')';
+      ctx.fillStyle = 'rgba(' + rgb + ', ' + (0.42 * life * life).toFixed(3) + ')';
       ctx.beginPath();
       ctx.arc(cx + tk.x * reach, cy + tk.y * reach, dotR * (0.7 + 0.3 * life), 0, Math.PI * 2);
       ctx.fill();
     }
-    ctx.beginPath(); ctx.arc(cx + head.x * reach, cy + head.y * reach, dotR, 0, Math.PI * 2);
+    var hx = cx + head.x * reach, hy = cy + head.y * reach;
+    ctx.beginPath(); ctx.arc(hx, hy, dotR + 1.2, 0, Math.PI * 2);
+    ctx.strokeStyle = GF_HALO; ctx.lineWidth = 1.5; ctx.stroke();                                   // dark halo
+    ctx.beginPath(); ctx.arc(hx, hy, dotR, 0, Math.PI * 2);
     ctx.fillStyle = 'rgba(' + rgb + ', ' + GF_ALPHA + ')'; ctx.fill();
-    ctx.strokeStyle = 'rgba(' + rgb + ', ' + GF_RIM_ALPHA + ')'; ctx.lineWidth = 1; ctx.stroke();   // thin rim
+    ctx.strokeStyle = 'rgba(' + rgb + ', ' + GF_RIM_ALPHA + ')'; ctx.lineWidth = 1.25; ctx.stroke();   // rim
     ctx.restore();
   }
 
