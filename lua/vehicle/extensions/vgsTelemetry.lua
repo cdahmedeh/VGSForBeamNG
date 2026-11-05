@@ -129,6 +129,20 @@ TUNE.DRIFT_GROW_OK    = 0.35  -- rad/s (~20 deg/s) the slide can grow and still 
 TUNE.DRIFT_GROW_OFF   = 1.0   -- rad/s (~57 deg/s): spinning away
 TUNE.DRIFT_MAX_ANGLE  = 1.57  -- rad (90 deg) of slide: past this it's a spin, whatever the steering
 TUNE.DRIFT_RATE_HZ    = 4     -- Hz: smoothing of the slide's growth rate
+-- A powerslide (all-wheel drive): the car sliding on all four tyres under power, you steering
+-- into the corner and the driven front tyres pulling it round, rather than catching the rear
+-- with opposite lock as in a drift. The front slides nearly as much as the rear, so the
+-- oversteer test (the rear slipping more than the front) doesn't see it, and the drift test
+-- (the front nearly gripping) rejects it. It needs both axles driven, the rear sliding out, the
+-- front sliding into the turn too (but not far more than the rear, or it's understeer) and the
+-- throttle on; it's controlled when the slide holds, as for a drift (DRIFT_GROW_*, DRIFT_MAX_ANGLE).
+TUNE.PS_REAR_START    = 0.10  -- rad (~6 deg) of rear slide where it starts to count ...
+TUNE.PS_REAR_FULL     = 0.17  -- rad (~10 deg) ... and fully
+TUNE.PS_FRONT_START   = 0.035 -- rad (~2 deg) of front slip into the turn where it starts to count ...
+TUNE.PS_FRONT_FULL    = 0.07  -- rad (~4 deg) ... and fully
+TUNE.PS_PLOUGH_START  = 0.09  -- rad (~5 deg) more front slip than rear: starting to plough (understeer) ...
+TUNE.PS_PLOUGH_FULL   = 0.17  -- rad (~10 deg): ploughing, not a powerslide
+TUNE.PS_THROTTLE      = 0.2   -- throttle from which it's under power (fully from 0.2 more)
 -- Understeer comes in two stages (0 .. -US_WARN_SHARE, then on to -1):
 --  1. a warning as the front tyres approach their limit: front slip on its way to a road tyre's
 --     peak, together with the front slipping more than the rear;
@@ -914,6 +928,7 @@ local function resetState()
   est.kn, est.kd, est.cal, est.rn, est.rd, est.ratio, est.lock = 0, 0, 1, 0, 0, nil, LOCK_DEFAULT
   est.balance, est.frontSteer, est.rearSteer, est.slipF, est.slipR, est.shown = 0, nil, 0, nil, nil, nil
   est.drift, est.slideRate, est.prevSlide, est.state = 0, 0, nil, 0
+  est.ps, est.psCtl, est.psOn, est.psCtlOn = 0, 0, false, false
   for k in pairs(gm) do gm[k] = nil end
   out.inp, out.vd = {}, nil
   for k in pairs(vdOut) do vdOut[k] = nil end
@@ -1148,6 +1163,7 @@ local function updateWheels(dt, fwd, right, speed, ev, hasGraph)
   local fSum, fN, rSum, rN = 0, 0, 0, 0
   for k in pairs(tcBraked) do tcBraked[k] = nil end
   local front, rear = lay.front, lay.rear
+  est.drvF, est.drvR = false, false   -- an axle driven right now (front, rear): both = all-wheel drive
   for _, o in ipairs(out.w) do
     local i = o.i
     local w, L, S = wheels.wheels[i], lay.wheels[i], wstate[i]
@@ -1258,6 +1274,7 @@ local function updateWheels(dt, fwd, right, speed, ev, hasGraph)
       end
 
       o.d  = driven and 1 or 0                         -- connected to a power source
+      if driven and rear then if L.y > rear.cut then est.drvF = true else est.drvR = true end end
       o.s  = round(steer, 4)                           -- steering angle, rad, + = left
       o.g  = round(S.grip, 3)                          -- grip used, 1 = 100 %
       o.e  = S.sliding and 1 or 0                      -- sliding
@@ -1467,10 +1484,11 @@ end
 
 -- The balance as a state, for the marker and the numbers mode: 0 neutral, 1 front near its
 -- limit, 2 understeer, 3 rear near its limit, 4 both at their limit, 5 oversteer (a controlled
--- drift is oversteer with inp.dc). The warnings for the rear and for both come from the grip
+-- drift is oversteer with inp.dc), 6 a controlled powerslide (all-wheel drive). The warnings for the rear and for both come from the grip
 -- model, so only once the tyres' stiffness is known; before that the states follow the balance.
 local function balanceStateOf(prev, bal, measured, rearSliding)
   if not measured then return 0 end
+  if est.psOn then return est.psCtlOn and 6 or 5 end   -- an all-wheel-drive powerslide: controlled, or getting away
   if bal >= (prev == 5 and 0.12 or 0.15) then return 5 end
   if rearSliding then return 0 end   -- a slide that isn't oversteer (yet): no warnings, they'd mean nothing
   if not gm.ready then
@@ -1564,7 +1582,7 @@ local function updateTravel(dt, fwd, right, ev)
   if not warn or est.state == 2 or est.state == 5 or est.candT >= TUNE.WARN_HOLD or (est.state ~= 0 and (cand == 1 or cand == 3 or cand == 4)) then est.state = cand end
 
   -- how controlled a slide is (see TUNE.DRIFT_STEER_OK): 1 = a controlled drift
-  local control = 0
+  local control, holdingAll = 0, 0
   if est.slipF and rear then
     local slide = wrapAngle(est.rearSteer - kin.rearTravel)   -- the rear's true sliding angle
     local rate = est.prevSlide and wrapAngle(slide - est.prevSlide) / dt or 0
@@ -1574,10 +1592,28 @@ local function updateTravel(dt, fwd, right, ev)
     local steerOk = 1 - smoothstep((math.abs(est.slipF) - TUNE.DRIFT_STEER_OK) / (TUNE.DRIFT_STEER_OFF - TUNE.DRIFT_STEER_OK))
     local holding = 1 - smoothstep((growing - TUNE.DRIFT_GROW_OK) / (TUNE.DRIFT_GROW_OFF - TUNE.DRIFT_GROW_OK))
     control = (math.abs(slide) > TUNE.DRIFT_MAX_ANGLE) and 0 or steerOk * holding
+    holdingAll = (math.abs(slide) > TUNE.DRIFT_MAX_ANGLE) and 0 or holding
   else
     est.prevSlide = nil
   end
   est.drift = est.drift + (control - est.drift) * clamp(TRAVEL_SMOOTH_HZ * dt, 0, 1)
+  -- an all-wheel-drive powerslide (see TUNE.PS_REAR_START), and how controlled it is
+  local ps = 0
+  if est.drvF and est.drvR and est.slipF and est.slipR and rear then
+    local turn = kin.yawRate >= 0 and 1 or -1
+    local aF, aR = est.slipF * turn, est.slipR * turn
+    local rearOut = smoothstep((aR - TUNE.PS_REAR_START) / (TUNE.PS_REAR_FULL - TUNE.PS_REAR_START))
+    local frontIn = smoothstep((aF - TUNE.PS_FRONT_START) / (TUNE.PS_FRONT_FULL - TUNE.PS_FRONT_START))
+    local plough = smoothstep((aF - aR - TUNE.PS_PLOUGH_START) / (TUNE.PS_PLOUGH_FULL - TUNE.PS_PLOUGH_START))
+    local power = smoothstep(((ev.throttle or 0) - TUNE.PS_THROTTLE) / 0.2)
+    ps = rearOut * frontIn * (1 - plough) * power * clamp(((kin.speed or 0) - 5) / 4, 0, 1)
+      * clamp(math.abs(kin.yawRate) / TUNE.BAL_MIN_YAW, 0, 1)
+  end
+  local kps = clamp(TRAVEL_SMOOTH_HZ * dt, 0, 1)
+  est.ps = (est.ps or 0) + (ps - (est.ps or 0)) * kps
+  est.psCtl = (est.psCtl or 0) + (holdingAll - (est.psCtl or 0)) * kps
+  est.psOn = est.ps >= (est.psOn and 0.3 or 0.5)
+  est.psCtlOn = est.psOn and est.psCtl >= (est.psCtlOn and 0.45 or 0.6)
 
   -- Shown whenever the car is moving, including sliding backwards in a spin, but not when
   -- reversing on purpose (reverse gear and rolling backwards).
@@ -1666,6 +1702,7 @@ local function fillDetail()
   local turnSign = kin.yawRate >= 0 and 1 or -1
   vd.af = est.slipF and round(est.slipF * turnSign, 4) or nil   -- front / rear axle slip angle, in the turn's direction
   vd.ar = est.slipR and round(est.slipR * turnSign, 4) or nil
+  vd.sl = (est.state == 6 and est.slipR) and round(math.abs(est.slipR), 4) or nil   -- a powerslide: how far the rear is sliding
 end
 
 -- ===== Sending =============================================================

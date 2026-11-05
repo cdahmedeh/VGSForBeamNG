@@ -761,13 +761,15 @@
   //   over   oversteer: the rear sliding more than the front         pink-magenta
   //   drift  a controlled drift: oversteer, caught (inp.dc; see TUNE.DRIFT_* in vgsTelemetry.lua)
   //                                                                  aquamarine
+  //   pslide a controlled powerslide: all-wheel drive, all four sliding under power, held
+  //          (see TUNE.PS_* in vgsTelemetry.lua)                     aquamarine
   // The colours were picked by simulation to stay distinct from each other and from the rim's
   // arcs with the common kinds of colour blindness, and differ in lightness as well as hue.
   // Neutral: no marker. Each state has a little hysteresis at its edges. Getting worse,
   // switching between understeer and oversteer, or catching or losing a drift shows at once;
   // easing from understeer back to the warning, or back to neutral, waits STATE_HOLD_MS, so a
   // quick flick stays up long enough to read.
-  var TRAVEL_COLOUR = { neutral: [150, 210, 245], near: [255, 214, 10], rnear: [255, 214, 10], limit: [255, 214, 10], under: [255, 96, 24], over: [250, 130, 235], drift: [60, 230, 195] };
+  var TRAVEL_COLOUR = { neutral: [150, 210, 245], near: [255, 214, 10], rnear: [255, 214, 10], limit: [255, 214, 10], under: [255, 96, 24], over: [250, 130, 235], drift: [60, 230, 195], pslide: [60, 230, 195] };
   var UNDER_WARN = 0.35;   // must match US_WARN_SHARE in vgsTelemetry.lua
   // The balance counts as neutral between these: the marker is hidden and the balance readout
   // says nothing. Past them it's the front nearing its limit (below) or oversteer (above).
@@ -778,11 +780,11 @@
   var STATE_HOLD_MS = 450;   // a state shown stays at least this long unless something worse comes
   var STATE_BLEND_MS = 80;   // colour change between states
   var MARK_FADE_IN_MS = 30, MARK_FADE_OUT_MS = 120;
-  var STATE_SEVERITY = { near: 1, rnear: 1, limit: 2, under: 3, over: 3, drift: 3 };
+  var STATE_SEVERITY = { near: 1, rnear: 1, limit: 2, under: 3, over: 3, drift: 3, pslide: 3 };
   // The vehicle sends the state itself (inp.bs, see balanceStateOf in vgsTelemetry.lua): 1 the
   // front near its limit, 2 understeer, 3 the rear near its limit, 4 both at their limit,
-  // 5 oversteer (a controlled drift with inp.dc).
-  var BS_STATE = { 1: 'near', 2: 'under', 3: 'rnear', 4: 'limit', 5: 'over' };
+  // 5 oversteer (a controlled drift with inp.dc), 6 a controlled powerslide (all-wheel drive).
+  var BS_STATE = { 1: 'near', 2: 'under', 3: 'rnear', 4: 'limit', 5: 'over', 6: 'pslide' };
   // The state the balance is in (null = neutral). cur: the state shown now, for the hysteresis.
   // bs: the vehicle's own state, when it sends one; otherwise worked out from the balance.
   function balanceState(bal, dc, cur, bs) {
@@ -831,6 +833,10 @@
   // the steering a 1 g corner needs (inp.sr) fills STEER_TARGET of the quarter, never below
   // STEER_EXPAND.
   var STEER_EXPAND = 20, STEER_TARGET = 0.6, STEER_K_MAX = 400;
+  // The steering arc is hidden below this many degrees of rim and fully shown from the second
+  // (about 0.55-1.2 % of steering in town, and 0.25-0.55 % from about 80 km/h up)
+  var STEER_HIDE_DEG = 8 / 3, STEER_SHOW_DEG = 6;
+  var STEER_VIS_K = 60;   // the stretch the visibility is judged on, at most (reached at about 80 km/h)
   function asinhNorm(x, k) {
     return Math.log(k * x + Math.sqrt(k * k * x * x + 1)) / Math.log(k + Math.sqrt(k * k + 1));
   }
@@ -873,8 +879,19 @@
     // sd, tvd: the steering and the marker already on the scale, as they are this very frame
     // (see Motion); without them (still pictures), from the raw values
     var steerShown = inp.sd !== undefined ? clamp(+inp.sd, -1, 1) : steerScale(steer, sk);
-    if (steerShown > 0) arc(INPUT.steer, TOP - steerShown * Q, TOP);        // left: counter-clockwise from the top
-    else if (steerShown < 0) arc(INPUT.steer, TOP, TOP - steerShown * Q);   // right: clockwise from the top
+    // A steering arc only a few degrees of rim long is the small corrections of driving straight:
+    // it fades in from STEER_HIDE_DEG to STEER_SHOW_DEG of rim, so the rim stays clear on a straight.
+    // Judged on the scale as stretched at about 80 km/h at most (STEER_VIS_K): at higher speed the
+    // stretch magnifies the smallest jitter, so the threshold stays put in steering terms there.
+    var steerDeg = steerScale(Math.abs(steer), Math.min(sk, STEER_VIS_K)) * 90;
+    var steerVis = clamp((steerDeg - STEER_HIDE_DEG) / (STEER_SHOW_DEG - STEER_HIDE_DEG), 0, 1);
+    steerVis = steerVis * steerVis * (3 - 2 * steerVis);
+    if (steerVis > 0) {
+      ctx.globalAlpha = steerVis;
+      if (steerShown > 0) arc(INPUT.steer, TOP - steerShown * Q, TOP);        // left: counter-clockwise from the top
+      else arc(INPUT.steer, TOP, TOP - steerShown * Q);                      // right: clockwise from the top
+      ctx.globalAlpha = 1;
+    }
     // ABS working: the brake arc pulses; traction control working: the throttle arc pulses
     var pulse = 0.5 + 0.5 * Math.sin(nowMs() / 1000 * 2 * Math.PI * PULSE_HZ);
     arc(+inp.abs ? mixRgb(INPUT.brake, INPUT.brakePulse, pulse) : INPUT.brake, BOTTOM, BOTTOM + brk * Q);
@@ -1060,8 +1077,8 @@
     var dt = clamp(now - m.t, 0, 100); m.t = now;
     var cand = balanceState(bal, dc, m.cur, bs), cur = m.cur;
     if (cand !== m.cand) { m.cand = cand; m.candT = now; }
-    // a drift only counts as caught once it has stayed caught a moment: until then, oversteer
-    if (cand === 'drift' && cur !== 'drift' && now - m.candT < DRIFT_CONFIRM_MS) cand = 'over';
+    // a drift or powerslide only counts as caught once it has stayed caught a moment: until then, oversteer
+    if ((cand === 'drift' || cand === 'pslide') && cur !== cand && now - m.candT < DRIFT_CONFIRM_MS) cand = 'over';
     if (cand === cur) m.since = now;
     else {
       // at once: appearing, getting worse, or switching between understeer, oversteer and a
@@ -1240,9 +1257,9 @@
   // top, large, and the words under them. Both lines always sit at the same height.
   function balanceFont(rPx) { return clamp(rPx * 0.058, 8.5, 11); }   // the words: about the size of the grip readouts
   function degreeFont(rPx) { return balanceFont(rPx) * 1.15; }       // the degrees, a touch bigger
-  var SHORT_WORD = { 'Understeer': 'Under', 'Front near limit': 'Front near', 'Rear near limit': 'Rear near', 'At the limit': 'At limit', 'Oversteer': 'Over', 'Controlled drift': 'Drift', 'Neutral': 'Neutral' };
+  var SHORT_WORD = { 'Understeer': 'Under', 'Front near limit': 'Front near', 'Rear near limit': 'Rear near', 'At the limit': 'At limit', 'Oversteer': 'Over', 'Controlled drift': 'Drift', 'Controlled powerslide': 'Powerslide', 'Neutral': 'Neutral' };
   // { word, deg (text, or '' when there's nothing to show), colour }, or null when the marker is hidden
-  var STATE_WORD = { near: 'Front near limit', rnear: 'Rear near limit', limit: 'At the limit', under: 'Understeer', over: 'Oversteer', drift: 'Controlled drift' };
+  var STATE_WORD = { near: 'Front near limit', rnear: 'Rear near limit', limit: 'At the limit', under: 'Understeer', over: 'Oversteer', drift: 'Controlled drift', pslide: 'Controlled powerslide' };
   // mk: the marker's state this frame (so the words and the marker always agree, and hold together)
   function balanceStatus(m, R, compact, mk) {
     var inp = m.inp || {}, vd = m.vd || {}, bal = inp.bal;
@@ -1253,6 +1270,10 @@
     if (vd.af !== undefined && vd.ar !== undefined && vd.af !== null && vd.ar !== null) {
       diff = (vd.af - vd.ar) * 180 / Math.PI;
       if (R) diff = R.get(m.id + ':vd.bal', diff);
+    }
+    if (st === 'pslide' && vd.sl !== undefined && vd.sl !== null) {   // a powerslide: how far it's sliding
+      diff = vd.sl * 180 / Math.PI;
+      if (R) diff = R.get(m.id + ':vd.sl', diff);
     }
     var deg = (word !== 'Neutral' && diff !== undefined) ? fmt(Math.abs(diff), 1) + '°' : '';
     return { word: compact ? SHORT_WORD[word] : word, deg: deg, colour: colour, neutral: word === 'Neutral' };
@@ -1273,7 +1294,7 @@
   }
   function balanceLayoutNow(ctx, rPx, inner, compact) {
     var fs = balanceFont(rPx), dfs = degreeFont(rPx), h1 = dfs * 1.0, h2 = fs * 1.15;
-    var w1 = measure(ctx, '88.8°', dfs, 700), w2 = measure(ctx, compact ? 'Front near' : 'Front near limit', fs, 600);
+    var w1 = measure(ctx, '88.8°', dfs, 700), w2 = measure(ctx, compact ? 'Powerslide' : 'Controlled powerslide', fs, 600);
     var drop = Math.max(chordDrop(inner, w1), chordDrop(inner, w2) - h1) + 1;
     return { fs: fs, dfs: dfs, drop: drop, h1: h1, band: drop + h1 + h2 + fs * 0.25 };
   }
@@ -1615,6 +1636,7 @@
         READ_WHEEL.forEach(function (f) { if (w[f] !== undefined && w[f] !== null) R.add(id + ':w' + w.i + '.' + f, w[f]); });
       });
       if (p.vd.af !== undefined && p.vd.ar !== undefined) R.add(id + ':vd.bal', (p.vd.af - p.vd.ar) * 180 / Math.PI);
+      if (p.vd.sl !== undefined && p.vd.sl !== null) R.add(id + ':vd.sl', p.vd.sl * 180 / Math.PI);
       R.tick(now);
     }
     return null;
