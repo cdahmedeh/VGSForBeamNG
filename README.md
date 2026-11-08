@@ -14,7 +14,7 @@ Every wheel is drawn where it sits on the vehicle, with its grip in use, its sli
 - **Understeer and oversteer you can see.** A direction marker by the steering arc shows how much the car is really turning, and how near each end is to its limit, judged against the car's own tyres: BeamNG's stability-control calibration where the car has one, learnt while you drive where it doesn't. It warns in yellow before the front runs wide or the rear lets go, turns orange-red in real understeer, and swings out to the countersteer target in pink-magenta when the rear slides. A drift you're holding in control turns aquamarine instead. A band shows the gap to your steering, and each colour is held long enough to read. It's readable at highway and track speeds too.
 - **Driver assists.** ABS, ESC and traction control per wheel and per engine, for both BeamNG's classic assist script and its newer driving-dynamics electronics.
 - **The drivetrain, live.** Engines, motors, gearbox and differentials where they sit, shafts tinted by torque, diff lock state, disconnectable shafts, part-time 4WD, broken driveshafts.
-- **A numbers mode.** Click it for each corner's grip in use and the weight on it, and, whenever the car is off balance, *Front near limit*, *Understeer*, *Oversteer* or *Controlled drift* with how many degrees it's out by, all inside the circle.
+- **A numbers mode.** Click it for each corner's grip in use and the weight on it, and, whenever the car is off balance, *Front near limit*, *Understeer* or *Oversteer* with how many degrees it's out by, or *Drift* with the drift angle, all inside the circle.
 - **Low latency.** Each vehicle sends its data straight to the app, exactly once per UI frame, using the same handshake BeamNG's own gauges use. The app draws once per screen refresh.
 
 ## Contents
@@ -427,7 +427,7 @@ A dual set shares one numeric readout per corner, which shows the harder-working
 
 ## Numbers mode
 
-![Numbers mode while cornering, in a controlled drift, and at the default size](docs/numbers.png)
+![Numbers mode while cornering, in a drift with its drift angle, and at the default size](docs/numbers.png)
 
 Click the app to switch the numbers on, and click again to switch them off. The choice is remembered. Everything stays inside the circle; there's no extra window.
 
@@ -447,7 +447,7 @@ While the car is balanced nothing shows there. Otherwise the words follow the ma
 | *Understeer* | orange | the same, once the front is clearly past its grip |
 | *Oversteer* | pink-magenta | how much more the rear is slipping than the front |
 | *Controlled powerslide* | aquamarine | how far the rear is sliding |
-| *Controlled drift* | aquamarine | the same, while you're holding the slide |
+| *Drift* (a controlled drift) | aquamarine | the drift angle: how far the rear is sliding, as on the AC version and Drift Scoring's angle meter. |
 
 A dual set shows its hardest-working tyre and the weight on the whole set. Readouts that would overlap, such as a trailer's tandem axles, are spaced apart around where they belong. In an app smaller than about 125 pixels there's only room for the grip, and the balance words are shortened (*Under*, *Front near*, *Rear near*, *At limit*, *Over*, *Drift*, *Powerslide*).
 
@@ -745,6 +745,10 @@ Outside the game, against BeamNG 0.40's own scripts:
   - End-to-end rendering of the vehicle script's real output at five app sizes, with kg and lb.
 
 ## Changelog
+
+**2.5.1**
+
+- Drifts display as in the AC version: numbers mode shows *Drift* (it was *Controlled drift*) with the drift angle, how far the rear is sliding, instead of the difference between front and rear slip. The marker and band stay aquamarine. How a drift is detected is unchanged: the rear sliding, the steering catching it, and the slide held for 0.2 s.
 
 **2.5**
 

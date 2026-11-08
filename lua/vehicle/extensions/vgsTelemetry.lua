@@ -1585,6 +1585,7 @@ local function updateTravel(dt, fwd, right, ev)
   local control, holdingAll = 0, 0
   if est.slipF and rear then
     local slide = wrapAngle(est.rearSteer - kin.rearTravel)   -- the rear's true sliding angle
+    est.slide = slide
     local rate = est.prevSlide and wrapAngle(slide - est.prevSlide) / dt or 0
     est.prevSlide = slide
     est.slideRate = est.slideRate + (rate - est.slideRate) * lpAlpha(TUNE.DRIFT_RATE_HZ, dt)
@@ -1594,7 +1595,7 @@ local function updateTravel(dt, fwd, right, ev)
     control = (math.abs(slide) > TUNE.DRIFT_MAX_ANGLE) and 0 or steerOk * holding
     holdingAll = (math.abs(slide) > TUNE.DRIFT_MAX_ANGLE) and 0 or holding
   else
-    est.prevSlide = nil
+    est.prevSlide, est.slide = nil, nil
   end
   est.drift = est.drift + (control - est.drift) * clamp(TRAVEL_SMOOTH_HZ * dt, 0, 1)
   -- an all-wheel-drive powerslide (see TUNE.PS_REAR_START), and how controlled it is
@@ -1703,6 +1704,9 @@ local function fillDetail()
   vd.af = est.slipF and round(est.slipF * turnSign, 4) or nil   -- front / rear axle slip angle, in the turn's direction
   vd.ar = est.slipR and round(est.slipR * turnSign, 4) or nil
   vd.sl = (est.state == 6 and est.slipR) and round(math.abs(est.slipR), 4) or nil   -- a powerslide: how far the rear is sliding
+  -- oversteer (a drift, when it's controlled): the drift angle, degrees, how far the rear is
+  -- sliding (0-180, so going backwards it's measured from the other end, as drift-scoring meters do)
+  vd.da = (est.state == 5 and est.slide) and round(math.deg(math.abs(est.slide)), 1) or nil
 end
 
 -- ===== Sending =============================================================

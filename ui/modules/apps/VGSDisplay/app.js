@@ -1251,15 +1251,15 @@
   }
 
   // The balance in words, at the top of the circle, in the marker's colour: Neutral, Front near
-  // limit (the understeer warning), Understeer, Oversteer or Controlled drift, with how many
+  // limit (the understeer warning), Understeer, Oversteer or Drift, with how many
   // degrees more the front (understeer) or rear (oversteer) is slipping than the other axle.
   // The balance, on two lines at the top of the circle, in the marker's colour: the degrees on
   // top, large, and the words under them. Both lines always sit at the same height.
   function balanceFont(rPx) { return clamp(rPx * 0.058, 8.5, 11); }   // the words: about the size of the grip readouts
   function degreeFont(rPx) { return balanceFont(rPx) * 1.15; }       // the degrees, a touch bigger
-  var SHORT_WORD = { 'Understeer': 'Under', 'Front near limit': 'Front near', 'Rear near limit': 'Rear near', 'At the limit': 'At limit', 'Oversteer': 'Over', 'Controlled drift': 'Drift', 'Controlled powerslide': 'Powerslide', 'Neutral': 'Neutral' };
+  var SHORT_WORD = { 'Understeer': 'Under', 'Front near limit': 'Front near', 'Rear near limit': 'Rear near', 'At the limit': 'At limit', 'Oversteer': 'Over', 'Drift': 'Drift', 'Controlled powerslide': 'Powerslide', 'Neutral': 'Neutral' };
   // { word, deg (text, or '' when there's nothing to show), colour }, or null when the marker is hidden
-  var STATE_WORD = { near: 'Front near limit', rnear: 'Rear near limit', limit: 'At the limit', under: 'Understeer', over: 'Oversteer', drift: 'Controlled drift', pslide: 'Controlled powerslide' };
+  var STATE_WORD = { near: 'Front near limit', rnear: 'Rear near limit', limit: 'At the limit', under: 'Understeer', over: 'Oversteer', drift: 'Drift', pslide: 'Controlled powerslide' };
   // mk: the marker's state this frame (so the words and the marker always agree, and hold together)
   function balanceStatus(m, R, compact, mk) {
     var inp = m.inp || {}, vd = m.vd || {}, bal = inp.bal;
@@ -1274,6 +1274,10 @@
     if (st === 'pslide' && vd.sl !== undefined && vd.sl !== null) {   // a powerslide: how far it's sliding
       diff = vd.sl * 180 / Math.PI;
       if (R) diff = R.get(m.id + ':vd.sl', diff);
+    }
+    if (st === 'drift' && vd.da !== undefined && vd.da !== null) {   // a drift: the drift angle, like a drift-scoring meter
+      diff = +vd.da;
+      if (R) diff = R.get(m.id + ':vd.da', diff);
     }
     var deg = (word !== 'Neutral' && diff !== undefined) ? fmt(Math.abs(diff), 1) + '°' : '';
     return { word: compact ? SHORT_WORD[word] : word, deg: deg, colour: colour, neutral: word === 'Neutral' };
@@ -1637,6 +1641,7 @@
       });
       if (p.vd.af !== undefined && p.vd.ar !== undefined) R.add(id + ':vd.bal', (p.vd.af - p.vd.ar) * 180 / Math.PI);
       if (p.vd.sl !== undefined && p.vd.sl !== null) R.add(id + ':vd.sl', p.vd.sl * 180 / Math.PI);
+      if (p.vd.da !== undefined && p.vd.da !== null) R.add(id + ':vd.da', +p.vd.da);
       R.tick(now);
     }
     return null;
