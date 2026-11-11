@@ -47,7 +47,7 @@ local AIR_SHOW_AFTER   = 0.25  -- s a wheel must be unloaded before it's shown o
 local LIGHT_FRAC       = 0.25  -- a wheel carrying less than this share of its normal load is nearly off the ground
 local LIGHT_HZ         = 2     -- smoothing of the load for that (a bump doesn't flash it)
 local LIGHT_REF_TAU    = 2     -- s: how slowly the normal load is followed
-local GRIP_SMOOTHING   = 0.4   -- share of the gap closed every 1/30 s (higher = snappier)
+local GRIP_SMOOTHING   = 0.65  -- share of the gap closed every 1/30 s (higher = snappier)
 local ACCEL_SMOOTH_HZ  = 6     -- low-pass on the lateral acceleration the grip estimate uses
 local LOAD_SMOOTH_HZ   = 0.5   -- low-pass on the wheel load used to scale drive torque
 local STANDSTILL_SPEED = 0.5   -- m/s; a held brake at standstill isn't counted as tyre force
@@ -55,7 +55,6 @@ local STANDSTILL_SPEED = 0.5   -- m/s; a held brake at standstill isn't counted 
 -- (which averages out the body's vibration far better than a difference between two samples),
 -- then smoothed (TUNE.GF_*): strongly while the force holds steady, so the dot sits still,
 -- opening up as it changes quickly, so it doesn't trail far behind.
-local GF_WINDOW        = 0.10  -- s of velocity history in each slope
 -- Direction marker: how much the car is actually turning, on the steering arc's scale
 -- (see updateTravel). It can run on past a quarter, all the way round, in slides and spins.
 local TRAVEL_SMOOTH_HZ = 15    -- low-pass on each axle's direction of travel
@@ -101,9 +100,9 @@ TUNE.STEER_K_MAX      = 400
 -- smoothing: about twice as steady on a straight at highway speed, three to four times in a
 -- curve, and the delay behind the real turn of the car cut from 60-84 ms to 26-36 ms.
 TUNE.MARK_MIN_CUTOFF  = 0.3   -- Hz while still (lower = stiller)
-TUNE.MARK_BETA        = 0.005 -- Hz per deg/s of its own movement (slides, the car settling)
+TUNE.MARK_BETA        = 0.01  -- Hz per deg/s of its own movement (slides, the car settling)
 TUNE.MARK_D_CUTOFF    = 0.5   -- Hz: smoothing of that movement estimate
-TUNE.MARK_STEER_GAIN  = 0.06  -- Hz per deg/s of steering movement (on the same scale)
+TUNE.MARK_STEER_GAIN  = 0.12  -- Hz per deg/s of steering movement (on the same scale)
 TUNE.MARK_STEER_CUTOFF = 8    -- Hz: smoothing of the steering's movement
 -- Big, fast swings (a slide, a spin) open it almost at once: a second, quicker estimate of its
 -- movement opens it with the square of the speed above MARK_FAST_FROM, a speed noise doesn't
@@ -112,7 +111,7 @@ TUNE.MARK_STEER_CUTOFF = 8    -- Hz: smoothing of the steering's movement
 TUNE.MARK_FAST_FROM   = 180   -- deg/s of rim
 TUNE.MARK_BETA2       = 0.002 -- Hz per (deg/s)^2 above that
 TUNE.MARK_D_FAST_CUTOFF = 2   -- Hz: smoothing of that quicker estimate
-TUNE.MARK_YAW_HZ      = 10    -- light low-pass on the yaw rate the marker uses, Hz (0 = none)
+TUNE.MARK_YAW_HZ      = 0     -- light low-pass on the yaw rate the marker uses, Hz (0 = none)
 -- Understeer / oversteer (the marker's colour): rear slip angle minus front, in the direction
 -- the car is rotating. + = rear sliding more (oversteer), - = front (understeer).
 -- Once the tyres' stiffness is known (the grip model, below: BeamNG's own calibration, or
@@ -172,6 +171,7 @@ TUNE.US_MIN_YAW       = 0.10  -- rad/s of rotation before it's shown at full str
 -- at the peak whatever the tyre (a stiff race tyre or a soft off-road one), so the limit is
 -- found for each car without fixed angles. Proximity: 0 = linear, 1 = at the peak.
 TUNE.GRIP_RATIO_PEAK  = 0.42  -- force / (stiffness x slip) at a tyre's peak
+TUNE.GRIP_BAR_HZ      = 12    -- smoothing of the quicker forces behind the grip bars
 TUNE.GRIP_HZ          = 6     -- smoothing of the sideways acceleration behind the force
 TUNE.GRIP_SLIP_HZ     = 2.8   -- smoothing of the slip, to lag as much as the force does
 TUNE.GRIP_RD_HZ       = 2.7   -- smoothing of the change of rotation, likewise
@@ -201,8 +201,11 @@ TUNE.CAL_SPREAD       = 0.0015 -- rad (~0.1 deg): ... over at least this spread 
 -- rough road's shaking (a turn-in, a stab of the brakes). In a simulated test against the
 -- earlier single stage: 8x steadier with body vibration, 22x on a rough road, for about 85 ms
 -- more delay into a corner.
-TUNE.GF_MIN_CUTOFF    = 0.6   -- Hz: smoothing while steady (lower = stiller)
-TUNE.GF_BETA          = 3     -- Hz per g/s (above GF_D_FLOOR): how much it opens up as the force changes
+TUNE.GF_WINDOW        = 0.10  -- s of velocity history in each slope (half of it is delay)
+TUNE.GF_TURN_HZ       = 2     -- Hz: sideways, the turn (speed x yaw rate) at once, the rest of the slope through this
+TUNE.GF_BLEND         = 0     -- 0..1: share of the slope taken at the newest sample (no delay, more noise)
+TUNE.GF_MIN_CUTOFF    = 1.0   -- Hz: smoothing while steady (lower = stiller)
+TUNE.GF_BETA          = 6     -- Hz per g/s (above GF_D_FLOOR): how much it opens up as the force changes
 TUNE.GF_D_CUTOFF      = 0.5   -- Hz: smoothing of the rate of change itself
 TUNE.GF_STAGES        = 2     -- smoothing stages
 TUNE.GF_D_FLOOR       = 2     -- g/s of change that doesn't open it (a rough road's shaking)
@@ -932,6 +935,7 @@ local function resetState()
   lay.wheels, lay.static, lay.drivetrain, lay.front, lay.rear, lay.wait = nil, nil, nil, nil, nil, 0
   everDriven, nodeCidByName, wstate = {}, nil, {}
   kin.latAccel, kin.gx, kin.gy, kin.gdx, kin.gdy, kin.gInit, kin.g1x, kin.g1y = 0, 0, 0, 0, 0, false, 0, 0
+  kin.gCorr, kin.yawRaw, kin.aLatFast = 0, nil, nil
   kin.yawRate, kin.yawCheck, kin.lastFwd, kin.lastRight, kin.travel, kin.rearTravel = 0, 0, nil, nil, 0, 0
   kin.yawFast, mark.init = 0, false
   kin.vring = newRing(128)
@@ -953,14 +957,17 @@ local function updateAccel(dt, vel, fwd, right)
   local r = kin.vring
   local s = ringNext(r)
   s.t, s.x, s.y, s.z = clock, vel.x, vel.y, vel.z
+  -- the sideways acceleration of the turn itself (forward speed x yaw rate, + = to the right)
+  local turnNow = kin.yawRaw and -(vel.x * fwd.x + vel.y * fwd.y + vel.z * fwd.z) * kin.yawRaw or nil
+  s.k = turnNow or 0
   -- least-squares slope of each velocity component against time over the window
-  local t0 = clock - GF_WINDOW
-  local n, st, sx, sy, sz = 0, 0, 0, 0, 0
+  local t0 = clock - TUNE.GF_WINDOW
+  local n, st, sx, sy, sz, sk = 0, 0, 0, 0, 0, 0
   local idx = r.head
   for _ = 1, r.count do
     local q = r.s[idx]
     if q.t < t0 - 1e-9 then break end
-    n, st, sx, sy, sz = n + 1, st + q.t, sx + q.x, sy + q.y, sz + q.z
+    n, st, sx, sy, sz, sk = n + 1, st + q.t, sx + q.x, sy + q.y, sz + q.z, sk + (q.k or 0)
     idx = (idx - 2) % r.n + 1
   end
   if n < 3 then return end
@@ -975,11 +982,52 @@ local function updateAccel(dt, vel, fwd, right)
   end
   if stt < 1e-9 then return end
   local ax, ay, az = stx / stt, sty / stt, stz / stt
+  if TUNE.GF_BLEND > 0 and n >= 5 then
+    -- The straight-line slope is the acceleration at the middle of the window, half a window
+    -- ago. A curve through the same points gives it at the newest sample instead, without that
+    -- delay but with more noise; GF_BLEND mixes it in. (Fit v = c0 + c1 d + c2 d^2, d = time
+    -- from the window's middle; the slope at the newest sample is c1 + 2 c2 dEnd.)
+    local s3, s4, sdx2, sdy2, sdz2 = 0, 0, 0, 0, 0
+    idx = r.head
+    for _ = 1, n do
+      local q = r.s[idx]
+      local d = q.t - tm
+      local d2 = d * d
+      s3, s4 = s3 + d2 * d, s4 + d2 * d2
+      sdx2, sdy2, sdz2 = sdx2 + d2 * (q.x - xm), sdy2 + d2 * (q.y - ym), sdz2 + d2 * (q.z - zm)
+      idx = (idx - 2) % r.n + 1
+    end
+    -- normal equations in (c1, c2), with c0 absorbed by the means: [stt s3; s3 s4 - stt^2/n]
+    local m22 = s4 - stt * stt / n
+    local det = stt * m22 - s3 * s3
+    if math.abs(det) > 1e-18 then
+      local dEnd = clock - tm
+      local function endSlope(sxv, sxv2)
+        local c1 = (sxv * m22 - s3 * sxv2) / det
+        local c2 = (stt * sxv2 - s3 * sxv) / det
+        return c1 + 2 * c2 * dEnd
+      end
+      local w = TUNE.GF_BLEND
+      ax = ax + (endSlope(stx, sdx2) - ax) * w
+      ay = ay + (endSlope(sty, sdy2) - ay) * w
+      az = az + (endSlope(stz, sdz2) - az) * w
+    end
+  end
   local aLat = ax * right.x + ay * right.y + az * right.z
   local aLon = ax * fwd.x + ay * fwd.y + az * fwd.z
   kin.latAccel = kin.latAccel + (aLat - kin.latAccel) * clamp(dt * ACCEL_SMOOTH_HZ, 0, 1)
   kin.aLatRaw = aLat   -- the grip model's own, less smoothed (see gripStep)
-  local x, y = aLat / G, aLon / G
+  -- For what's drawn: most of the sideways acceleration is the turn, which the physics gives
+  -- at once and smoothly (forward speed x yaw rate). The slope above only supplies the rest
+  -- (a slide's sideways speed changing), compared with the turn as it was at the window's
+  -- middle (its mean), so the slope's half-window delay doesn't come along with it.
+  local aLatShow = aLat
+  if turnNow and TUNE.GF_TURN_HZ > 0 then
+    kin.gCorr = (kin.gCorr or 0) + ((aLat - sk / n) - (kin.gCorr or 0)) * lpAlpha(TUNE.GF_TURN_HZ, dt)
+    aLatShow = turnNow + kin.gCorr
+  end
+  kin.aLatFast = aLatShow
+  local x, y = aLatShow / G, aLon / G
   if not kin.gInit then kin.gx, kin.gy, kin.g1x, kin.g1y, kin.gInit = x, y, x, y, true return end
   -- the cutoff opens with how fast the (smoothed) force is changing; two stages at that cutoff
   local ad = lpAlpha(TUNE.GF_D_CUTOFF, dt)
@@ -1015,6 +1063,7 @@ local function updateYaw(dt, fwd, right)
     raw = kin.yawSign * physYaw
   end
   if raw then
+    kin.yawRaw = raw
     kin.yawRate = kin.yawRate + (raw - kin.yawRate) * clamp(dt * YAW_SMOOTH_HZ, 0, 1)
     if TUNE.MARK_YAW_HZ > 0 then kin.yawFast = kin.yawFast + (raw - kin.yawFast) * lpAlpha(TUNE.MARK_YAW_HZ, dt)
     else kin.yawFast = raw end
@@ -1225,6 +1274,7 @@ local function updateWheels(dt, fwd, right, speed, ev, hasGraph)
       local fxCap = 1.3 * math.max(fz, 0)
       S.fx = airborne and 0 or clamp(tq / radius, -fxCap, fxCap)
       S.fzG = S.fzG and (S.fzG + (math.max(fz, 0) - S.fzG) * lpAlpha(TUNE.GRIP_HZ, dt)) or math.max(fz, 0)
+      S.fzB = S.fzB and (S.fzB + (math.max(fz, 0) - S.fzB) * lpAlpha(TUNE.GRIP_BAR_HZ, dt)) or math.max(fz, 0)   -- for the bar
       -- this wheel's load driving straight and steadily (its share of the car's weight)
       if not S.fz0 then S.fz0 = math.max(fz, MIN_LOAD * 4)
       elseif math.abs(kin.latAccel) < 0.6 and math.abs(kin.gy) < 0.06 and fz > MIN_LOAD then
@@ -1239,10 +1289,10 @@ local function updateWheels(dt, fwd, right, speed, ev, hasGraph)
       local use = 0
       if not airborne then
         local ax2 = (front and L.y > front.y - 0.3) and "F" or ((rear and L.y < rear.cut) and "R" or nil)
-        local fzU = math.max(S.fzG, MIN_LOAD)
+        local fzU = math.max(S.fzB, MIN_LOAD)
         local fy, mu = nil, MU_NOMINAL
         if ax2 and gm.m and (gm["e" .. ax2] or 0) > 0 then
-          fy = math.abs(gm["n" .. ax2] or 0) * math.max(S.fzG, 0) ^ TUNE.GRIP_LOAD_EXP / gm["e" .. ax2]
+          fy = math.abs(gm["n" .. ax2 .. "B"] or gm["n" .. ax2] or 0) * math.max(S.fzB, 0) ^ TUNE.GRIP_LOAD_EXP / gm["e" .. ax2]
           mu = gm["mu" .. ax2] or MU_NOMINAL
         else
           fy = fzU * math.abs(kin.latAccel) / G
@@ -1568,6 +1618,14 @@ local function gripStep(dt, slipF, slipR, turn, rearSliding, steady, steerF, ste
   -- the axle forces a rigid car needs for this sideways acceleration and change of rotation
   local Ff = (gm.m * gm.ay * gm.b + gm.Iz * gm.rdot - gm.mz) / gm.L - gm.sideF
   local Fr = (gm.m * gm.ay * gm.a - gm.Iz * gm.rdot + gm.mz) / gm.L - gm.sideR
+  -- The same forces, quicker, for the grip bars only: the sideways acceleration as the G dot
+  -- has it (the turn at once, see updateAccel) and the change of rotation lightly smoothed. The
+  -- limit test above keeps its slower, matched forces.
+  local kb = lpAlpha(TUNE.GRIP_BAR_HZ, dt)
+  gm.ayB = (gm.ayB or 0) + ((-(kin.aLatFast or kin.aLatRaw or kin.latAccel)) - (gm.ayB or 0)) * kb
+  gm.rdB = (gm.rdB or 0) + (rd - (gm.rdB or 0)) * kb
+  gm.nFB = (gm.m * gm.ayB * gm.b + gm.Iz * gm.rdB - gm.mz) / gm.L - gm.sideF
+  gm.nRB = (gm.m * gm.ayB * gm.a - gm.Iz * gm.rdB + gm.mz) / gm.L - gm.sideR
   gm.nF, gm.dF = Ff, gm.dF + (slipF - gm.dF) * ks
   gm.nR, gm.dR = Fr, gm.dR + (slipR - gm.dR) * ks
   -- learn while driving gently and steadily (straight running counts: it pins the offset)
@@ -1604,7 +1662,7 @@ local function gripStep(dt, slipF, slipR, turn, rearSliding, steady, steerF, ste
     local S = wstate[i]
     if S and S.fzG then
       local z = math.max(S.fzG, 0)
-      local e = z ^ TUNE.GRIP_LOAD_EXP
+      local e = math.max(S.fzB or z, 0) ^ TUNE.GRIP_LOAD_EXP   -- the bars' share (their quicker loads)
       if front and L.y > front.y - 0.3 then zF, eF, xF = zF + z, eF + e, xF + (S.fx or 0)
       elseif rear and L.y < rear.cut then zR, eR, xR = zR + z, eR + e, xR + (S.fx or 0) end
     end
@@ -2070,8 +2128,8 @@ local function step(dt)
   local fwd, right = basis()
   local vel = obj:getVelocity()
   kin.vel, kin.speed = vel, vel:length()
-  updateAccel(dt, vel, fwd, right)
   updateYaw(dt, fwd, right)
+  updateAccel(dt, vel, fwd, right)
   local k = clamp(dt * TRAVEL_SMOOTH_HZ, 0, 1)
   local origin = obj:getPosition()
   if lay.front then kin.travel = axleTravel(lay.front, kin.travel, "front", vel, origin, fwd, right, k) end

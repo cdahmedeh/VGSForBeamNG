@@ -1,6 +1,6 @@
 # VGS Display for BeamNG.drive
 
-*Version 1.10*
+*Version 1.20*
 
 A live grip display for BeamNG.drive, inspired by the VGS (Vehicle Gravity System) in Enthusia Professional Racing. It shows what a simulator can't let you feel: how hard each tyre is working, when one lets go and how badly, where the car is really going against where you're steering, and whether it's the front or the rear that's giving up.
 
@@ -113,7 +113,7 @@ BeamNG doesn't report a "friction used" figure per tyre, so the bar is an estima
 
 Before 1.0 every tyre took the same share of the car's sideways acceleration, against a fixed grip of 1.0, so a front tyre at its limit in understeer could read 70 % and a race tyre read high all the time. In the simulation (see [How it was tested](#how-it-was-tested)) the bar's average error fell by about a quarter across the test fleet, from 7.7 % to 5.9 % of the tyre's grip. Tyres far from a road tyre's grip (slicks, gravel) still read off until the car has been near its limit and the grip has been learnt.
 
-The result is smoothed a little (`GRIP_SMOOTHING`) so it doesn't jitter. A held brake at a standstill doesn't count as tyre force. A wheel shown off the ground reads empty at once.
+Since 1.20 the bar uses quicker inputs than the limit test does: the sideways acceleration as the G-force dot has it (the turn at once), the change of rotation and the wheel loads smoothed only lightly (`GRIP_BAR_HZ`), and less smoothing at the end (`GRIP_SMOOTHING`). In the simulation it trails the tyre's true grip use by under 10 ms, against about 100 ms in 1.10. The limit test keeps its own slower, matched inputs, so the warnings are unchanged. A held brake at a standstill doesn't count as tyre force. A wheel shown off the ground reads empty at once.
 
 ### Sliding, and how far past the limit
 
@@ -194,11 +194,12 @@ The **yellow dot** is the G-force you feel, from the vehicle you're driving:
 - The edge of the circle is 1.5 g (`GF_MAX`). A road car's limit of about 1 g reaches two-thirds of the way out. Anything past 1.5 g is pinned to the edge.
 - Where it's been over the last 1.3 s (`TRAIL_MS`) is drawn as a trail of fading copies. Copies that would sit on top of the dot, or on top of each other, are skipped, so the dot stays see-through when it's holding still.
 - It's a little see-through (`GF_ALPHA`), so the part underneath still shows, with a firm rim and a thin dark ring around it so it stands out against the grip bars, the arcs and the car.
-- It's there to show the **weight shifting**, which you can't feel in a simulator: forward onto the front tyres under braking, back under power, across in a corner. It's measured from the change in the vehicle's velocity, so it reads zero when parked on a hill. BeamNG's physics is very fast and precise, so the body's vibration and every bump in the road show up in the raw acceleration as jitter. It's smoothed hard, because the weight itself shifts over a good part of a second as the suspension takes it:
-  1. The acceleration is the least-squares slope of the velocity over the last 0.1 s (`GF_WINDOW`). That averages out vibration much better than the difference between two samples.
-  2. Two smoothing stages follow, at a cutoff that's low while the force holds steady (`GF_MIN_CUTOFF`), so the dot sits still, and opens up only for changes faster than a rough road shakes it (`GF_D_FLOOR`, `GF_BETA`): a turn-in, a stab of the brakes.
+- It's there to show the **weight shifting**, which you can't feel in a simulator: forward onto the front tyres under braking, back under power, across in a corner. It's measured from the change in the vehicle's velocity, so it reads zero when parked on a hill. BeamNG's physics is very fast and precise, so the body's vibration and every bump in the road show up in the raw acceleration as jitter. So it's measured in a way that keeps it steady without trailing behind:
+  1. **Sideways, most of it is the turn itself:** forward speed × yaw rate. The physics gives the yaw rate at once and smoothly (it's the value BeamNG's own stability control uses), so that part comes with no delay.
+  2. **The rest** (a slide's sideways speed changing, and all of the forward and backward force) comes from the least-squares slope of the velocity over the last 0.1 s (`GF_WINDOW`), which averages out vibration much better than the difference between two samples. Sideways, it's compared with the turn as it was in the middle of that window, so the slope's half-window delay doesn't come along, and only what's left goes through a slow filter (`GF_TURN_HZ`).
+  3. **Two smoothing stages** follow, at a cutoff that's low while the force holds steady (`GF_MIN_CUTOFF`), so the dot sits still, and opens up for changes faster than a rough road shakes it (`GF_D_FLOOR`, `GF_BETA`): a turn-in, a stab of the brakes.
 
-  In a simulated test, against 2.4's single adaptive stage: 8 times steadier with ordinary body vibration (0.9 against 7.1 mg of movement per frame), and 22 times steadier on a rough road (2.1 against 47 mg per frame, where the single stage let the bumps straight through). It trails the true force by about 85 ms into a corner and 170 ms out of it, about as long as the car's own weight transfer takes.
+  In a simulated test, with body vibration, a rough road and noise on the yaw rate, it follows a turn-in about 35 ms behind the true force and a straightening-up about 15 ms behind. Before 1.20 that was 85 ms and 170 ms. It wobbles about 1–2 mg per frame, as before.
 
 ### Direction of travel: understeer and oversteer
 
@@ -282,7 +283,7 @@ How it's worked out:
   - **When the marker moves:** it opens up as the marker itself moves (`MARK_BETA`), and a little as you turn the steering (`MARK_STEER_GAIN`), which is a clean, delay-free signal. Only a little, because the car hardly responds to small quick corrections.
   - **Big, fast swings:** movement faster than noise can produce (`MARK_FAST_FROM`) opens it almost at once (`MARK_BETA2`).
   - **Once the rear slides:** the smoothing fades out, because the marker then comes from the hubs' measurement, which is already smoothed and moving a long way.
-  - **What feeds it:** the yaw rate the marker starts from has only a light filter of its own (`MARK_YAW_HZ`).
+  - **What feeds it:** the yaw rate straight from the physics, unfiltered since 1.20 (`MARK_YAW_HZ` 0). The marker's own filter is enough, and it opens up twice as readily as before when the marker or the steering moves (`MARK_BETA`, `MARK_STEER_GAIN`). In the simulation the marker now trails the car's turn by about 10 ms, against about 30 ms before; the extra movement while it holds still is a few hundredths of a degree of rim.
 
   In the simulation, with yaw-rate noise and hub vibration, against the earlier fixed smoothing:
 
@@ -454,11 +455,21 @@ The display is built to add as little delay as possible between the physics and 
 
 - **One hop.** Each vehicle sends its data straight to the app as a UI hook from its own Lua. Before 2.0 it went through the game-engine Lua first, which added a frame and a second round of encoding.
 - **No backlog.** BeamNG's UI acknowledges each frame it has drawn, and BeamNG's own gauges only send when it has (`obj:getUpdateUIflag()`). The display does the same, so every update it sends is drawn straight away. When the game runs faster than the UI there's no queue of stale updates building up, and when the game runs slower every frame still gets an update. If the UI stops asking for a while, a keep-alive update goes out four times a second.
+- **No filter delay that can be avoided.** Each readout is measured from the quickest clean signal there is, and only smoothed where noise would otherwise show (see the G-force dot, the direction marker and the grip bar). In the simulation, through a slalom and a sine-with-dwell:
+
+  | Readout | Trailing the truth, 1.10 → 1.20 |
+  |---|---|
+  | Direction marker, as drawn | 32 → 10 ms |
+  | G-force dot (sideways) | 62 → 0 ms |
+  | Grip bars | 102 → 8 ms |
+  | Steering arc | 0 → 0 ms |
+
+  (The state colours still wait a moment before changing, on purpose: a warning has to last 0.12 s and a drift 0.2 s, so a flicker of a few frames doesn't flash a wrong colour.)
 - **Drawn at the screen's own rate.** While updates are coming in, the app draws on every screen refresh (60, 144 Hz or whatever your screen runs at), never more than once per refresh. When the game is paused or the vehicle is gone, it stops after the G-force trail has faded and draws only when something changes. In a browser test, an update was on screen at the next refresh: 15 ms median at 60 Hz.
-- **Smooth motion between updates.** Updates rarely line up with the screen: game frames vary, the UI may run slower than the screen, and messages can arrive in clumps. Every moving part (the direction marker, the steering and pedal arcs, the G-force dot, the tyres' steering) is drawn where it is at that refresh. Each update carries the moment the game produced it, so the app knows how fast each value was moving. Between updates it carries that motion on, for at most about two updates' time. When the next update lands, any small difference is blended out over a few milliseconds rather than jumped. A sudden jump (a key press, a reset) isn't carried on past where it really is. Nothing waits for a later update, so this adds no delay. It actually makes up for the time the message spent getting to the app.
+- **Smooth motion between updates.** Updates rarely line up with the screen: game frames vary, the UI may run slower than the screen, and messages can arrive in clumps. Every moving part (the direction marker, the steering and pedal arcs, the G-force dot, the tyres' steering) is drawn where it is at that refresh. Each update carries the moment the game produced it, so the app knows how fast each value was moving. Between updates it carries that motion on, for at most about two updates' time. When the next update lands, any small difference is blended out over a few milliseconds rather than jumped. A sudden jump (a key press, a reset) isn't carried on past where it really is. Nothing waits for a later update, so this adds no delay. It actually makes up for the time the message spent getting to the app, and since 1.20 it carries the moving values 8 ms further on (`MOTION_LEAD`), for the moment even the quickest delivery takes and the screen's own refresh. A value that turns round overshoots by at most 8 ms of its movement, blended out at once.
 - **Fine values.** The steering and the marker are sent with enough decimals that the stretched centre of the steering scale moves smoothly. Before 2.4 the steering was rounded coarsely enough that one rounding step could move the arc by several degrees at speed.
-- **Small updates.** The layout (wheel positions, tyre sizes, the drivetrain) is sent only when it changes, every 2 s, or when the app asks for it, for example after a UI reload. A normal update for a car is about 0.5 KB; numbers mode adds about 70 bytes.
-- **Cheap frames.** The vehicle's layout, the readouts' fit and the text measurements are worked out once and reused until the layout or the app's size changes, so a frame only draws. Before 2.0 everything went every frame, twice.
+- **Small updates.** The layout (wheel positions, tyre sizes, the drivetrain) is sent only when it changes, every 2 s, or when the app asks for it, for example after a UI reload. A normal update for a car is about 0.5 KB; the balance's degrees add about 50 bytes.
+- **Cheap frames.** The vehicle's layout, its fit below the balance and the text measurements are worked out once and reused until the layout or the app's size changes, so a frame only draws. Before 2.0 everything went every frame, twice.
 - **Filters on real time.** Every smoothing filter runs every frame on the actual frame time, so the display behaves the same at 30 or 200 frames per second.
 
 What it costs, measured outside the game (LuaJIT for the vehicle script, Chromium for the app):
@@ -469,15 +480,17 @@ What it costs, measured outside the game (LuaJIT for the vehicle script, Chromiu
 | App, per draw | about 0.04 ms on the test machine (2.5.1 there: 0.03 ms, or 0.11 ms with its numbers mode) |
 | App, per update received | about 0.015 ms |
 
-In a simulation of frame pacing (uneven game frames, the UI's update gate, delivery delays and clumps, 60 and 144 Hz screens), the marker's frame-to-frame unevenness fell to between a quarter and a thirteenth of what drawing each update as it landed gave. Its delay behind the car fell by roughly half:
+In a simulation of frame pacing (uneven game frames, the UI's update gate, delivery delays and clumps, 60 and 144 Hz screens), the marker's frame-to-frame unevenness fell to between a quarter and a thirteenth of what drawing each update as it landed gave, and its delay between the message and the screen's refresh fell to about nothing at 45 fps and up:
 
-| Situation | Unevenness, before → now | Delay, before → now |
+| Situation | Unevenness, each update as it lands → now | Delay, each update as it lands → 1.10 → 1.20 |
 |---|---|---|
-| 60 fps game, 60 Hz screen | 2.4° → 0.5° | 13 → 6 ms |
-| 60 fps game, 144 Hz screen | 2.8° → 0.2° | 13 → 6 ms |
-| 45 fps game, uneven, 144 Hz screen | 3.2° → 0.3° | 16 → 8 ms |
-| UI at 30 Hz, 144 Hz screen | 3.9° → 0.3° | 21 → 13 ms |
-| 30 fps game, 60 Hz screen | 5.9° → 0.9° | 20 → 13 ms |
+| 60 fps game, 60 Hz screen | 2.4° → 0.6° | 13 → 6 → −1 ms |
+| 60 fps game, 144 Hz screen | 2.8° → 0.3° | 13 → 6 → −1 ms |
+| 45 fps game, uneven, 144 Hz screen | 3.2° → 0.3° | 16 → 8 → 2 ms |
+| UI at 30 Hz, 144 Hz screen | 3.9° → 0.3° | 21 → 13 → 7 ms |
+| 30 fps game, 60 Hz screen | 5.9° → 1.0° | 20 → 13 → 7 ms |
+
+(A slightly negative delay means it's a millisecond ahead at the refresh; the screen then takes its own moment to show it.)
 
 (Unevenness: the root-mean-square change in the marker's movement from one refresh to the next, in degrees of rim, beyond what the car's real motion accounts for, for a marker swinging briskly across the centre of the scale.)
 
@@ -536,11 +549,14 @@ All of these are plain constants at the top of their file. After changing the ve
 | `AIR_SHOW_AFTER` | 0.25 s | ... for this long (so bumps on a rough road don't turn wheels blue) |
 | `LIGHT_FRAC` | 0.25 | Below this share of its normal load a wheel starts to turn pale blue (nearly off the ground) |
 | `LIGHT_HZ` | 2 Hz | Smoothing of the load for that, so bumps don't flash it |
-| `GRIP_SMOOTHING` | 0.4 | How quickly the grip bar and slide colour follow changes: the share of the gap closed every 1/30 s (0–1; higher is snappier). It's set per time, not per frame, so the frame rate doesn't change how it feels |
+| `GRIP_SMOOTHING` | 0.65 | How quickly the grip bar and slide colour follow changes: the share of the gap closed every 1/30 s (0–1; higher is snappier). It's set per time, not per frame, so the frame rate doesn't change how it feels |
+| `GRIP_BAR_HZ` | 12 Hz | Smoothing of the quicker sideways force and wheel loads behind the grip bars (the limit test uses its own, slower) |
 | `ACCEL_SMOOTH_HZ` | 6 | Smoothing of the measured acceleration used for the grip estimate |
 | `GF_WINDOW` | 0.10 s | G-force dot: how long a stretch of velocity the acceleration's slope is fitted across. Longer is steadier |
-| `GF_MIN_CUTOFF` | 0.6 Hz | G-force dot: smoothing while the force holds steady. Lower is stiller |
-| `GF_BETA` | 3 | G-force dot: how much the smoothing opens up as the force changes quickly. Higher keeps up better in quick changes |
+| `GF_TURN_HZ` | 2 Hz | G-force dot: sideways, the turn (speed × yaw rate) is taken at once and only the rest of the slope goes through this filter (0: the slope alone, as before 1.20) |
+| `GF_BLEND` | 0 | G-force dot: share of the slope taken at the newest sample instead of the window's middle (no delay, much more noise) |
+| `GF_MIN_CUTOFF` | 1.0 Hz | G-force dot: smoothing while the force holds steady. Lower is stiller |
+| `GF_BETA` | 6 | G-force dot: how much the smoothing opens up as the force changes quickly. Higher keeps up better in quick changes |
 | `GF_D_FLOOR` | 2 g/s | G-force dot: changes slower than this (a rough road's shaking) don't open it up |
 | `GF_D_CUTOFF` | 0.5 Hz | G-force dot: smoothing of the rate of change the filter reacts to |
 | `GF_STAGES` | 2 | G-force dot: smoothing stages |
@@ -552,14 +568,14 @@ All of these are plain constants at the top of their file. After changing the ve
 | `STEER_TARGET` | 0.6 | Share of the quarter turn that a 1 g corner's steering fills at any speed; sets how much the stretch grows with speed. 0 for a fixed stretch |
 | `STEER_K_MAX` | 400 | Most stretch allowed at very high speed |
 | `MARK_MIN_CUTOFF` | 0.3 Hz | Marker smoothing while it holds still. Lower is stiller |
-| `MARK_BETA` | 0.005 | How much the smoothing opens up as the marker moves (Hz per degree of rim per second) |
+| `MARK_BETA` | 0.01 | How much the smoothing opens up as the marker moves (Hz per degree of rim per second) |
 | `MARK_D_CUTOFF` | 0.5 Hz | Smoothing of that movement estimate |
-| `MARK_STEER_GAIN` | 0.06 | How much turning the steering opens the smoothing (Hz per degree of rim per second) |
+| `MARK_STEER_GAIN` | 0.12 | How much turning the steering opens the smoothing (Hz per degree of rim per second) |
 | `MARK_STEER_CUTOFF` | 8 Hz | Smoothing of the steering's movement |
 | `MARK_FAST_FROM` | 180 °/s | Marker movement (degrees of rim per second) above which the smoothing opens fast; above what noise produces |
 | `MARK_BETA2` | 0.002 | How fast it opens above that (Hz per (°/s)²) |
 | `MARK_D_FAST_CUTOFF` | 2 Hz | Smoothing of that quicker movement estimate |
-| `MARK_YAW_HZ` | 10 Hz | Light smoothing of the yaw rate the marker uses (0 for none) |
+| `MARK_YAW_HZ` | 0 | Light smoothing of the yaw rate the marker uses (0 for none) |
 | `REAR_GRIP_SLIP` | 0.14 rad | Rear slip angle (about 8°) up to which the marker is measured against the rear axle's path |
 | `REAR_SLIDE_SLIP` | 0.35 rad | Rear slip angle (about 20°) from which it's the front axle's direction against the body |
 | `TURN_CAL_TAU` | 5 s | History the yaw-rate turn angle's calibration against the hubs uses |
@@ -632,6 +648,7 @@ All of these are plain constants at the top of their file. After changing the ve
 | `TRAIL_MS` | 1300 ms | How long the G-force trail lasts |
 | `GF_ALPHA` | 0.68 | Opacity of the G-force dot |
 | `GF_COLOUR` | 240, 215, 130 | Colour of the G-force dot (red, green, blue) |
+| `MOTION_LEAD` | 8 ms | How far ahead of the newest update the moving parts are shown, carried on at their speed |
 | `TRAVEL_COLOUR` | yellow, orange-red, pink-magenta, aquamarine | Direction marker colours: the warnings (front near limit, rear near limit, at the limit), understeer, oversteer, controlled drift |
 | `STATE_HOLD_MS` | 450 ms | How long the marker holds a state before easing to a milder one or hiding |
 | `DRIFT_CONFIRM_MS` | 200 ms | How long a slide must stay caught before it shows as a controlled drift |
@@ -788,6 +805,16 @@ What still trips it, in the simulation: very tall, heavy vehicles on grippy tyre
   - End-to-end rendering of the vehicle script's real output at five app sizes.
 
 ## Changelog
+
+**1.20**
+
+Quicker everywhere, with every readout measured against the simulation:
+
+- **G-force dot:** its sideways part is now forward speed × yaw rate, which the physics gives at once and smoothly, plus the slope of the velocity for the rest. It follows a turn-in about 35 ms behind the true force and straightening up about 15 ms behind, against 85 and 170 ms before, and it's as steady.
+- **Grip bars:** fed by the same quick sideways force, lightly smoothed loads and less smoothing at the end. They trail the true grip use by under 10 ms, against about 100 ms.
+- **Direction marker:** the yaw rate is no longer filtered before the marker's own filter, which now opens up twice as readily when the marker or the steering moves. It trails the car's turn by about 10 ms, against about 30 ms.
+- **The app shows moving values 8 ms ahead** of the newest update (`MOTION_LEAD`), for the moment even the quickest delivery and the screen's refresh take. At 60 fps the marker is now on time at each refresh, where it was 6 ms behind.
+- The understeer, oversteer and drift detection is unchanged: the same 97.6 % across the test fleet.
 
 **1.10**
 

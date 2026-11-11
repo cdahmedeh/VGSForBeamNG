@@ -1383,16 +1383,20 @@
   var MOTION_BLEND = 1.2, MOTION_BLEND_MIN = 6, MOTION_BLEND_MAX = 40;    // how fast a difference is blended out: updates' spacing x, limits in ms
   var MOTION_JUMP = 3;        // a step this many times the one before counts as a jump
   var CLOCK_DRIFT = 0.01;     // how fast (ms per ms) the clock match may move to later deliveries
+  // Even the quickest delivery takes a moment (the game's frame, the UI's, then the screen's), so
+  // moving values are shown this far ahead of the newest update, carried on at their speed. A
+  // value that turns round overshoots by at most this much of its movement, blended out at once.
+  var MOTION_LEAD = 8;        // ms
 
   // One moving value. Times are the app's own clock (ms); snap: a jump bigger than this is shown
   // at once (a reset, a vehicle switch); lo/hi: limits.
   function Channel(snap, lo, hi) { this.t = null; this.snap = snap; this.lo = lo; this.hi = hi; }
   Channel.prototype.reset = function () { this.t = null; };
   Channel.prototype.base = function (now, ahead) {
-    var age = now - this.t, x;
+    var age = now + MOTION_LEAD - this.t, x;
     if (age <= 0) x = this.v;   // stamped a touch after 'now' (clock jitter): as is
-    else if (age <= ahead) x = this.v + this.vel * age;
-    else x = this.v + this.vel * ahead;   // no update for a while (a hitch, paused): stop there
+    else if (age <= ahead + MOTION_LEAD) x = this.v + this.vel * age;
+    else x = this.v + this.vel * (ahead + MOTION_LEAD);   // no update for a while (a hitch, paused): stop there
     return x;
   };
   Channel.prototype.at = function (now, m) {

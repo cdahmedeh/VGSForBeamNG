@@ -3,7 +3,7 @@
   "directive": "vgsDisplay",
   "name": "VGS Display",
   "author": "Ahmed",
-  "version": "1.10",
+  "version": "1.20",
   "description": "Live grip, slides, torque, steering, direction of travel, understeer and oversteer, per wheel and laid out like the vehicle. Inspired by Enthusia's VGS. When the car is off balance, the top of the circle says how, and by how many degrees.",
   "css": {
     "width": "240px",
