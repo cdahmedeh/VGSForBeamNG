@@ -67,6 +67,9 @@ local TRAVEL_MAX       = 4     -- furthest the marker goes, in quarter turns (4 
 local LOCK_DEFAULT     = 0.6   -- rad; road-wheel angle at full lock until it's been measured
 local CENTRE_INPUT     = 0.004 -- steering input below which the steering counts as centred (~0.1 deg of road wheel)
 local ESC_BRAKE_MARGIN = 50    -- Nm of brake request beyond the pedals' share that counts as assist braking
+local TC_SPIN_MIN      = 0.5   -- m/s a braked, driven wheel must spin faster than the road to count as traction control ...
+local TC_SPIN_SHARE    = 0.05  -- ... or this share of the road speed, if more
+local TC_DOT_HOLD      = 0.3   -- s a wheel's traction-control dot stays after the brake lets go
 -- Marker and balance-colour tuning. In a table because LuaJIT allows a function at most 60
 -- outside local variables.
 local TUNE = {}
@@ -1301,9 +1304,23 @@ local function updateWheels(dt, fwd, right, speed, ev, hasGraph)
       local parkReq = (w.parkingTorque or 0) * ax.parkIn * usage
       local added = math.abs(w.desiredBrakingTorque or 0) - math.max(mainReq, parkReq)
       local assistBrake = added > math.max(ESC_BRAKE_MARGIN, brakeMax * 0.03)
-      if ax.escBraking and assistBrake then iv = 3 end
-      if ax.tcBraking and assistBrake then tcBraked[i] = true end
+      -- Braked beyond the pedals while it's driven, on the throttle, and spinning faster than the
+      -- road: that's traction control, whatever the flags say. BeamNG's brake controller only
+      -- says it's acting as traction control for the last group of wheels it checked, so with a
+      -- front and a rear group its flag is mostly false while it brakes the other axle's wheels,
+      -- and the stability-control light flashes too.
+      local roadSpeed = kin.vel and kin.vel:dot(fwd) or 0
+      local spinning = wsp - roadSpeed > math.max(TC_SPIN_MIN, TC_SPIN_SHARE * math.abs(roadSpeed))
+      local tcLike = assistBrake and ax.hasTCS and driven and ax.throttleOn and spinning
+      if ax.escBraking and assistBrake and not tcLike then iv = 3 end
+      if (ax.tcBraking and assistBrake) or tcLike then tcBraked[i] = true end
       if not iv and ax.drivingDynamics and (tcBraked[i] or cutWheel[i]) then iv = 2 end
+      -- traction control pulses the brake on and off: hold its dot a moment, so it reads steadily
+      if iv == 2 then S.tcHold = TC_DOT_HOLD
+      elseif S.tcHold and S.tcHold > 0 then
+        S.tcHold = S.tcHold - dt
+        if not iv and ax.drivingDynamics and ax.throttleOn then iv = 2 end
+      end
       if not iv and ax.hasABS and ax.brakeOn then
         local bIn = (tonumber(ev[w.brakeElectricsName or "brake"]) or ax.brakeIn) * usage
         local split = w.brakeInputSplit or 1

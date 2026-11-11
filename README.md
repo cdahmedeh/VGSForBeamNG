@@ -1,6 +1,6 @@
 # VGS Display for BeamNG.drive
 
-*Version 1.0*
+*Version 1.01*
 
 A live grip display for BeamNG.drive, inspired by the VGS (Vehicle Gravity System) in Enthusia Professional Racing. It shows what a simulator can't let you feel: how hard each tyre is working, when one lets go and how badly, where the car is really going against where you're steering, and whether it's the front or the rear that's giving up.
 
@@ -320,7 +320,7 @@ How each assist is shown:
 - **ABS** (only with `hasABS`, and only while the brake is applied): the brake arc pulses while ABS is acting on any wheel. A wheel gets a red dot when BeamNG's own brake numbers for it show ABS at work: its `absActive` flag (classic ABS), or the pedal's share of its braking (`desiredMainBrakingTorque`) cut below 90 % of what the pedal asks for, worked out the way BeamNG's wheel code does, including any front/rear brake split. The second check is what catches the driving-dynamics ABS, which sets neither flag.
 - **Traction control** (only with `hasTCS`): a green dot. Where it goes depends on the system, because the newer one works per wheel:
   - **Classic script: on the engine.** A green dot in the centre of each engine or motor it's intervening on, by either of its two methods. Usually that's braking a spinning wheel: it handles a single spinning wheel (say the inside wheel in a corner) by braking it, and only cuts engine power once every driven wheel spins. The braking is measured exactly, like ESC's: the wheel is asked for more braking (`desiredBrakingTorque`) than the pedal's and handbrake's share, while `tcsActive` is up and ESC isn't acting (with both, its brakes hold and ESC's take over). The dot goes on the engine or motor that drives that wheel. The other method is cutting power, counted only while you're on the throttle: the engine's throttle factor drops below 1.
-  - **Driving-dynamics cars: beside each wheel it acts on.** A green dot by each wheel its brake part is braking for traction control (measured the same way), and by each wheel driven by a motor it's cutting. ESC's blue dot wins if both act on the same wheel.
+  - **Driving-dynamics cars: beside each wheel it acts on.** A green dot by each wheel it's braking, and by each wheel driven by a motor it's cutting. A wheel counts as braked by traction control when it's asked for more braking than the pedals' share (measured the same way) while it's driven, you're on the throttle and it's spinning faster than the road: at least 0.5 m/s or 5 % of the road speed faster (`TC_SPIN_MIN`, `TC_SPIN_SHARE`). That's read from the wheel itself, not from BeamNG's flags. Its brake part only reports whether it's acting for traction control for the last group of wheels it checked, so with a front and a rear group the flag is mostly off while it brakes the other axle's wheels, and the stability-control light flashes as well. A braked wheel that isn't spinning, or one braked off the throttle, gets ESC's blue dot. The dot stays 0.3 s after the brake lets go (`TC_DOT_HOLD`), since traction control pulses the brake on and off.
   - **How a power cut is read:** from that engine's own throttle factor, exactly as the engine reads it (BeamNG's `combustionEngine.lua` and `electricMotor.lua`: the electrics value it names, normally `throttleFactor`, or its own `throttleFactor`). A modded motor that doesn't name an electrics value uses only its own factor, so it isn't confused with the main engine's. Some hybrid mods apply traction control to their gearbox's factor instead, and that counts for the engine feeding it. Only traction control and ESC ever lower it. The classic script snaps it back to exactly 1 once the cut is under 5 %, so any value below 1 is a real cut, including the moment it takes to hand power back. On driving-dynamics cars the engine part sets it to the lower of its traction-control and ESC limits, so a cut only counts while that part (or the traction-control supervisor) says it's acting for traction control: a cut that's purely ESC doesn't. On a car with more than one motor, only the ones being cut count.
 - **Throttle arc pulse** (with `hasTCS` or `hasESC`): the throttle arc pulses darker while traction control is acting (`tcsActive`, or the `tractionControl` supervisor), while any engine has a traction-control dot, or while ESC is cutting the engine (the engine part acting for ESC). The `tcs` value isn't used: it's the dashboard light, which blinks while traction control works.
 - **ESC braking** (only with `hasESC`): a blue dot by each wheel ESC is braking, while ESC is acting and (on driving-dynamics cars) its brake part is braking for ESC. Both kinds of ESC brake a wheel by raising what it's asked for (`desiredBrakingTorque`) above the pedal's share (`desiredMainBrakingTorque`) and the handbrake's, so that difference is exactly ESC's braking. It counts once it's more than 50 Nm or 3 % of the brake's strength (`ESC_BRAKE_MARGIN`). The brake pressure lag after you change the pedal no longer counts, and when you brake evenly yourself no wheel gets a dot.
@@ -623,6 +623,8 @@ All of these are plain constants at the top of their file. After changing the ve
 | `DRIFT_MAX_ANGLE` | 1.57 rad | Slide angle (90°) past which it's a spin, whatever the steering |
 | `DRIFT_RATE_HZ` | 4 Hz | Smoothing of the slide's growth rate |
 | `ESC_BRAKE_MARGIN` | 50 Nm | Braking beyond the pedal's and handbrake's share that counts as ESC braking a wheel (or 3 % of the brake's strength, if more) |
+| `TC_SPIN_MIN` / `TC_SPIN_SHARE` | 0.5 m/s / 0.05 | A driven wheel braked beyond the pedals, on the throttle, spinning this much faster than the road (or this share of the road speed, if more) is traction control braking it |
+| `TC_DOT_HOLD` | 0.3 s | How long a wheel's traction-control dot stays after the brake lets go |
 | `DUAL_WIDTH_RATIO` | 1.0 | Tyre width ÷ radius above which a big wheel counts as a dual pair |
 | `DUAL_MIN_RADIUS` | 0.42 m | Only wheels at least this big can count as a pair by width |
 
@@ -801,6 +803,10 @@ What still trips it, in the simulation: very tall, heavy vehicles on grippy tyre
   - End-to-end rendering of the vehicle script's real output at five app sizes, with kg and lb.
 
 ## Changelog
+
+**1.01**
+
+- Per-wheel traction control shows again on driving-dynamics cars (the Vivace and others). Holding full lock and full throttle until the car stops moving, the throttle arc pulsed and the dashboard's stability light flashed, but the green wheel dots rarely appeared. BeamNG's brake part only says it's acting for traction control for the last group of wheels it checked, so with a front and a rear group its flag is mostly off while it brakes the other axle's wheels. A wheel now counts as braked by traction control when it's braked beyond the pedals while it's driven, you're on the throttle and it's spinning faster than the road, whatever the flags say. A wheel braked but not spinning still gets ESC's blue dot. The dot also stays 0.3 s after each pulse of the brake, so it reads steadily.
 
 **1.0**
 
