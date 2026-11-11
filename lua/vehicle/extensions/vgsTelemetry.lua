@@ -1632,7 +1632,7 @@ end
 
 -- The balance as a state, for the marker and the numbers mode: 0 neutral, 1 front near its
 -- limit, 2 understeer, 3 rear near its limit, 4 both at their limit, 5 oversteer (a controlled
--- drift is oversteer with inp.dc), 6 a controlled powerslide (all-wheel drive). The warnings for the rear and for both come from the grip
+-- drift is oversteer with inp.dc), 6 a powerslide (all-wheel drive, held). The warnings for the rear and for both come from the grip
 -- model, so only once the tyres' stiffness is known; before that the states follow the balance.
 local function balanceStateOf(prev, bal, measured, rearSliding)
   if not measured then return 0 end
@@ -2058,7 +2058,7 @@ local function travelDumpStep(dt)
     math.deg(est.ratio or est.lock), est.cal, deg(diag.shown),
     deg(kin.travel), deg(diag.frontHub), deg(diag.frontYaw), deg(kin.rearTravel),
     num(kin.physYaw), kin.yawSign, num(kin.headYaw), num(kin.yawRate), est.balance))
-  local names = { [0] = "neutral", "front near limit", "understeer", "rear near limit", "at the limit", "oversteer", "controlled powerslide" }
+  local names = { [0] = "neutral", "front near limit", "understeer", "rear near limit", "at the limit", "oversteer", "powerslide" }
   if gm.m then
     say(string.format(
       "[vgs grip]   tyre stiffness front %s rear %s N/rad (%s%s) | how near the limit (1 = at it): front %.2f rear %.2f | tyre grip (friction) front %.2f rear %.2f | state: %s",

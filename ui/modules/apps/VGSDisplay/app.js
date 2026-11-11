@@ -761,7 +761,7 @@
   //   over   oversteer: the rear sliding more than the front         pink-magenta
   //   drift  a controlled drift: oversteer, caught (inp.dc; see TUNE.DRIFT_* in vgsTelemetry.lua)
   //                                                                  aquamarine
-  //   pslide a controlled powerslide: all-wheel drive, all four sliding under power, held
+  //   pslide a powerslide: all-wheel drive, all four sliding under power, held
   //          (see TUNE.PS_* in vgsTelemetry.lua)                     aquamarine
   // The colours were picked by simulation to stay distinct from each other and from the rim's
   // arcs with the common kinds of colour blindness, and differ in lightness as well as hue.
@@ -783,7 +783,7 @@
   var STATE_SEVERITY = { near: 1, rnear: 1, limit: 2, under: 3, over: 3, drift: 3, pslide: 3 };
   // The vehicle sends the state itself (inp.bs, see balanceStateOf in vgsTelemetry.lua): 1 the
   // front near its limit, 2 understeer, 3 the rear near its limit, 4 both at their limit,
-  // 5 oversteer (a controlled drift with inp.dc), 6 a controlled powerslide (all-wheel drive).
+  // 5 oversteer (a controlled drift with inp.dc), 6 a powerslide (all-wheel drive).
   var BS_STATE = { 1: 'near', 2: 'under', 3: 'rnear', 4: 'limit', 5: 'over', 6: 'pslide' };
   // The state the balance is in (null = neutral). cur: the state shown now, for the hysteresis.
   // bs: the vehicle's own state, when it sends one; otherwise worked out from the balance.
@@ -1257,9 +1257,9 @@
   // top, large, and the words under them. Both lines always sit at the same height.
   function balanceFont(rPx) { return clamp(rPx * 0.058, 8.5, 11); }   // the words: about the size of the grip readouts
   function degreeFont(rPx) { return balanceFont(rPx) * 1.15; }       // the degrees, a touch bigger
-  var SHORT_WORD = { 'Understeer': 'Under', 'Front near limit': 'Front near', 'Rear near limit': 'Rear near', 'At the limit': 'At limit', 'Oversteer': 'Over', 'Drift': 'Drift', 'Controlled powerslide': 'Powerslide', 'Neutral': 'Neutral' };
+  var SHORT_WORD = { 'Understeer': 'Under', 'Front near limit': 'Front near', 'Rear near limit': 'Rear near', 'At the limit': 'At limit', 'Oversteer': 'Over', 'Drift': 'Drift', 'Powerslide': 'Powerslide', 'Neutral': 'Neutral' };
   // { word, deg (text, or '' when there's nothing to show), colour }, or null when the marker is hidden
-  var STATE_WORD = { near: 'Front near limit', rnear: 'Rear near limit', limit: 'At the limit', under: 'Understeer', over: 'Oversteer', drift: 'Drift', pslide: 'Controlled powerslide' };
+  var STATE_WORD = { near: 'Front near limit', rnear: 'Rear near limit', limit: 'At the limit', under: 'Understeer', over: 'Oversteer', drift: 'Drift', pslide: 'Powerslide' };
   // mk: the marker's state this frame (so the words and the marker always agree, and hold together)
   function balanceStatus(m, R, compact, mk) {
     var inp = m.inp || {}, vd = m.vd || {}, bal = inp.bal;
@@ -1298,7 +1298,12 @@
   }
   function balanceLayoutNow(ctx, rPx, inner, compact) {
     var fs = balanceFont(rPx), dfs = degreeFont(rPx), h1 = dfs * 1.0, h2 = fs * 1.15;
-    var w1 = measure(ctx, '88.8°', dfs, 700), w2 = measure(ctx, compact ? 'Powerslide' : 'Controlled powerslide', fs, 600);
+    // room for the widest of the words
+    var w1 = measure(ctx, '88.8°', dfs, 700), w2 = 0;
+    Object.keys(STATE_WORD).forEach(function (k) {
+      var word = STATE_WORD[k];
+      w2 = Math.max(w2, measure(ctx, compact ? (SHORT_WORD[word] || word) : word, fs, 600));
+    });
     var drop = Math.max(chordDrop(inner, w1), chordDrop(inner, w2) - h1) + 1;
     return { fs: fs, dfs: dfs, drop: drop, h1: h1, band: drop + h1 + h2 + fs * 0.25 };
   }

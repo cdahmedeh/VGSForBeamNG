@@ -1,6 +1,6 @@
 # VGS Display for BeamNG.drive
 
-*Version 1.01*
+*Version 1.02*
 
 A live grip display for BeamNG.drive, inspired by the VGS (Vehicle Gravity System) in Enthusia Professional Racing. It shows what a simulator can't let you feel: how hard each tyre is working, when one lets go and how badly, where the car is really going against where you're steering, and whether it's the front or the rear that's giving up.
 
@@ -230,7 +230,7 @@ The marker only shows when the car is off balance; while it's neutral it's hidde
 | Understeer | orange-red |
 | Oversteer | pink-magenta |
 | Controlled drift | aquamarine |
-| Controlled powerslide (all-wheel drive) | aquamarine |
+| Powerslide (all-wheel drive) | aquamarine |
 
 To make it easy to read at speed:
 
@@ -269,13 +269,13 @@ How it's worked out:
     Past 90° of slide it's a spin, whatever the steering (`DRIFT_MAX_ANGLE`). The vehicle's drift-control value moves smoothly; the marker turns aquamarine once it's past 0.6 for 0.2 s, and back to pink-magenta as soon as it drops below 0.45. It's usually aquamarine within about half a second of the slide holding.
 
     In the simulation, held drifts at 30° and 40° with matching countersteer came out aquamarine. A drift with the steering 20° off, a slide growing into a spin, and lift-off and power oversteer spins all stayed pink-magenta.
-  - **A controlled powerslide (aquamarine)** is the all-wheel-drive way of sliding: all four tyres sliding under power, you steering into the corner and the driven front tyres pulling the car round, rather than catching the rear with opposite lock. The front slides nearly as much as the rear, so the oversteer test doesn't see it and the drift test (the front nearly gripping) rejects it; before 2.5 it showed as oversteer, or as nothing at all when the front slid as much as the rear. It needs:
+  - **A powerslide (aquamarine)** is the all-wheel-drive way of sliding: all four tyres sliding under power, you steering into the corner and the driven front tyres pulling the car round, rather than catching the rear with opposite lock. The front slides nearly as much as the rear, so the oversteer test doesn't see it and the drift test (the front nearly gripping) rejects it; before 2.5 it showed as oversteer, or as nothing at all when the front slid as much as the rear. It needs:
     - both axles driven right now (so it follows a 4WD switch or transfer case);
     - the rear sliding out, from about 6° to 10° (`PS_REAR_START`, `PS_REAR_FULL`);
     - the front sliding into the turn too, from about 2° to 4° (`PS_FRONT_START`, `PS_FRONT_FULL`), but not far more than the rear: 5° to 10° more is ploughing (`PS_PLOUGH_START`, `PS_PLOUGH_FULL`), which is understeer;
     - the throttle on, from 20 % (`PS_THROTTLE`), above walking pace.
 
-    It's controlled when the slide holds, as for a drift (not growing faster than about 20°/s, never past 90°). It turns aquamarine once it has held for 0.2 s, and pink-magenta (oversteer) the moment it gets away. In numbers mode the degrees are how far the rear is sliding. In the simulation, three all-wheel-drive powerslides (20° to 35°, the front sliding 10° to 18°) all read *Controlled powerslide*. The same slide with rear-wheel drive, a lift-off slide, a slide growing into a spin, a plough, a classic opposite-lock drift and ordinary cornering read as before.
+    It's controlled when the slide holds, as for a drift (not growing faster than about 20°/s, never past 90°). It turns aquamarine once it has held for 0.2 s, and pink-magenta (oversteer) the moment it gets away. In numbers mode the degrees are how far the rear is sliding. In the simulation, three all-wheel-drive powerslides (20° to 35°, the front sliding 10° to 18°) all read *Powerslide*. The same slide with rear-wheel drive, a lift-off slide, a slide growing into a spin, a plough, a classic opposite-lock drift and ordinary cornering read as before.
   - Both go back to neutral (no marker) when the car is barely rotating (below 0.1 rad/s for understeer, `US_MIN_YAW`, and 0.15 rad/s for oversteer, `BAL_MIN_YAW`), so straight-line driving stays clear. At a crawl (both axles under about 1.5–3 m/s) the directions of travel mean nothing, so a car stopping or pulling away shows nothing either, but a donut, where the rear is moving fast though the middle of the car hardly moves, still counts.
 - **Spins and donuts:** an axle sliding backwards counts as rolling backwards, not as sliding the other way, so a spin stays pink-magenta instead of flipping to understeer. The direction of rotation comes from the yaw rate, which keeps its sign through a drift or a spin. The marker is also kept continuous past 180°: in a spin it stays on the side it started, and only comes round to the other side once the car has really rotated about three-quarters of a turn.
 - **Smoothing:** at highway speed the stretched scale magnifies the smallest movement, so the marker's smoothing is designed to be steady without trailing. There's one adaptive ("One Euro") filter, applied in the vehicle at full game rate to where the marker is drawn (degrees round the rim, after the scale's magnification, so noise is judged as you'd see it).
@@ -450,7 +450,7 @@ While the car is balanced nothing shows there. Otherwise the words follow the ma
 | *At the limit* | yellow | the difference between front and rear slip |
 | *Understeer* | orange | the same, once the front is clearly past its grip |
 | *Oversteer* | pink-magenta | how much more the rear is slipping than the front |
-| *Controlled powerslide* | aquamarine | how far the rear is sliding |
+| *Powerslide* | aquamarine | how far the rear is sliding |
 | *Drift* (a controlled drift) | aquamarine | the drift angle: how far the rear is sliding, as on the AC version and Drift Scoring's angle meter. |
 
 A dual set shows its hardest-working tyre and the weight on the whole set. Readouts that would overlap, such as a trailer's tandem axles, are spaced apart around where they belong. In an app smaller than about 125 pixels there's only room for the grip, and the balance words are shortened (*Under*, *Front near*, *Rear near*, *At limit*, *Over*, *Drift*, *Powerslide*).
@@ -803,6 +803,10 @@ What still trips it, in the simulation: very tall, heavy vehicles on grippy tyre
   - End-to-end rendering of the vehicle script's real output at five app sizes, with kg and lb.
 
 ## Changelog
+
+**1.02**
+
+- *Controlled powerslide* is now just *Powerslide*, in numbers mode and in `dumpTravel`. It still shows only while the slide is held: one that gets away is *Oversteer*. With the long word gone, numbers mode keeps a little less room at the top of the circle for the words, so the vehicle is drawn a little bigger.
 
 **1.01**
 
