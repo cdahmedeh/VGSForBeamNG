@@ -12,8 +12,8 @@
 -- Whenever the UI is ready for a new frame (the same handshake BeamNG's own gauges use) it
 -- sends the latest values straight to the VGS Display app as the 'VGSData' UI hook. The layout
 -- (wheel positions, tyre sizes, drivetrain) goes in a separate block, only when it changes and
--- every couple of seconds. The extra numbers for the app's numbers mode are only worked out
--- while that mode is on.
+-- every couple of seconds. The balance's degrees (vd) are only worked out while the app is
+-- open.
 --
 -- Loaded and switched on by the vgsHub game-engine extension; idle until setActive(true).
 -- ---------------------------------------------------------------------------
@@ -254,9 +254,8 @@ local watch = { travel = 0, travelNext = 0, assists = false, assistValues = {} }
 -- What's sent, reused every frame (nothing new is allocated per frame in steady state)
 local wstate = {}       -- [i] = { grip, sliding, severity, fzAvg }
 local out = { w = {}, src = {}, dg = {}, inp = {}, gf = { x = 0, y = 0 } }
-local vdOut = {}        -- the numbers-mode vehicle values (sent as out.vd while numbers mode is on)
+local vdOut = {}        -- the balance's degrees (sent as out.vd while the app is open)
 local couplerList = {}
-local DETAIL_KEYS = { "fz" }
 
 local function clamp(v, lo, hi)
   if v < lo then return lo elseif v > hi then return hi end
@@ -1630,7 +1629,7 @@ local function gripStep(dt, slipF, slipR, turn, rearSliding, steady, steerF, ste
   gm.linR = gm.cr and (gm.nR / gm.cr + (gm.offR or 0)) / math.max(gm.kR, 0.05) * turn or 0
 end
 
--- The balance as a state, for the marker and the numbers mode: 0 neutral, 1 front near its
+-- The balance as a state, for the marker and the words: 0 neutral, 1 front near its
 -- limit, 2 understeer, 3 rear near its limit, 4 both at their limit, 5 oversteer (a controlled
 -- drift is oversteer with inp.dc), 6 a powerslide (all-wheel drive, held). The warnings for the rear and for both come from the grip
 -- model, so only once the tyres' stiffness is known; before that the states follow the balance.
@@ -1851,13 +1850,9 @@ local function updateTravel(dt, fwd, right, ev)
   inputs.p = pedalLevel(ev.parkingbrake)
 end
 
--- Extra values for the app's numbers mode (only while it's on, and only when sending): the load
--- on every wheel, and the front and rear axle slip angles behind the balance readout.
+-- The values behind the balance's degrees (only while the app is open, and only when sending):
+-- the front and rear axle slip angles, a powerslide's slide and a drift's angle.
 local function fillDetail()
-  for _, o in ipairs(out.w) do
-    local w = wheels.wheels[o.i]
-    o.fz = w and math.floor((w.downForce or w.downForceRaw or 0) + 0.5) or nil   -- load, N
-  end
   local vd = vdOut
   local turnSign = kin.yawRate >= 0 and 1 or -1
   vd.af = est.slipF and round(est.slipF * turnSign, 4) or nil   -- front / rear axle slip angle, in the turn's direction
@@ -1945,15 +1940,7 @@ local function send(fwd, right, ev)
     sc.tf = (cut.factor < 0.999) and round(cut.factor, 2) or nil
   end
   p.inp.tcs = (ax.powerCut or ax.anyCut) and 1 or nil        -- an assist cutting power: the throttle arc pulses
-  if detail then
-    fillDetail(); p.vd = vdOut; tx.detailSent = true
-  else
-    p.vd = nil
-    if tx.detailSent then   -- numbers mode just switched off: drop the extra values
-      for _, o in ipairs(out.w) do for _, key in ipairs(DETAIL_KEYS) do o[key] = nil end end
-      tx.detailSent = false
-    end
-  end
+  if detail then fillDetail(); p.vd = vdOut else p.vd = nil end
   -- the layout: when it changes, on request, and every STATIC_EVERY seconds
   local withStatic = tx.staticDue or tx.keyFrames > 0 or tx.sinceStatic >= STATIC_EVERY
   p.st = withStatic and lay.static or nil

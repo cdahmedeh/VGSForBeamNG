@@ -12,8 +12,8 @@
  *   Rim of the circle : driver inputs — steering (blue) from the top, brake (red)
  *                bottom-left, throttle (green) bottom-right; a quarter turn at full
  *   Yellow dot : G-force felt by the driver (edge = 1.5 g), with a fading trail
- * Click the app for the numbers mode: grip and load by every corner, and the understeer /
- * oversteer balance in words and degrees at the top of the circle.
+ * Top of the circle: the understeer / oversteer balance in degrees and words, in the
+ *                marker's colour (nothing while the car is balanced).
  *
  * The renderer is plain canvas and has no BeamNG dependencies, so the same file
  * also runs in the browser preview (VGSRenderer on window).
@@ -1109,19 +1109,9 @@
     return { w: w, h: h };
   };
 
-  // ===== Numbers mode ======================================================
-  // Click the app to switch it on. Beside every corner: grip in use and the load on it. At the
-  // top of the circle: the balance in words, in the marker's colour, with how many degrees more
-  // one axle is slipping than the other.
-
-  // Weight units follow BeamNG's own unit settings, like its other apps.
-  function Units() { this.weight = 'kg'; }
-  Units.prototype.set = function (v) { if (v && v.uiUnitWeight) this.weight = v.uiUnitWeight; };
-  Units.prototype.load = function (newtons) {
-    var kg = newtons / 9.81;
-    return this.weight === 'lb' ? { v: kg * 2.20462262, u: 'lb' } : { v: kg, u: 'kg' };
-  };
-  var DEFAULT_UNITS = new Units();
+  // ===== The balance ======================================================
+  // At the top of the circle: the balance in words, in the marker's colour, with its degrees
+  // (how many more one axle is slipping than the other, or the drift angle).
 
   // Text that changes every frame can't be read, so numbers are averaged over a short window
   // and refreshed a few times a second. The drawing itself shows every update as it arrives.
@@ -1139,13 +1129,12 @@
     for (var k in this.acc) {
       var a = this.acc[k];
       if (a.n) { this.val[k] = a.s / a.n; a.s = 0; a.n = 0; }
-      else { delete this.val[k]; delete this.acc[k]; }   // gone (numbers mode off, wheel lost)
+      else { delete this.val[k]; delete this.acc[k]; }   // gone (no longer sent)
     }
   };
   Readouts.prototype.get = function (key, fallback) { return key in this.val ? this.val[key] : fallback; };
   Readouts.prototype.clear = function () { this.acc = {}; this.val = {}; };
 
-  var DIM_TEXT = 'rgba(255, 255, 255, 0.55)';
   var FONT = '"Noto Sans", "Segoe UI", "Helvetica Neue", Arial, sans-serif';
   function font(px, weight) { return (weight || 400) + ' ' + px.toFixed(1) + 'px ' + FONT; }
   function fmt(v, d) {
@@ -1162,100 +1151,9 @@
   }
   function measure(ctx, s, px, weight) { ctx.font = font(px, weight); return ctx.measureText(s).width; }
 
-  // Readouts beside each corner: grip in use, and the load on it. A dual set shows its
-  // hardest-working tyre and the load on the whole set.
-  function cornerFont(tyreH) { return clamp(tyreH * 0.33, 10, 15); }
-  function drawCornerReadouts(ctx, p, dims, circle, opts) {
-    var body = p.body, R = opts.read, U = opts.units || DEFAULT_UNITS, done = {}, blocks = [];
-    function rd(w, f) {
-      var raw = w[f];
-      if (raw === undefined || raw === null) return undefined;
-      return R ? R.get(body.id + ':w' + w.i + '.' + f, +raw) : +raw;
-    }
-    body.wheels.forEach(function (wh) {
-      if (wh._outer === false) return;
-      var set = wh._set ? wh._set.wheels : [wh], seen = {}, list = [];
-      set.forEach(function (w) { if (!seen[w.i]) { seen[w.i] = true; list.push(w); } });
-      var key = list.map(function (w) { return w.i; }).join(',');
-      if (done[key]) return;
-      done[key] = true;
-      var grip = 0, load;
-      list.forEach(function (w) {
-        grip = Math.max(grip, rd(w, 'g') || 0);
-        var f = rd(w, 'fz'); if (f !== undefined) load = (load || 0) + f;
-      });
-      var sliding = list.some(function (w) { return !!+w.e; });
-      var airborne = list.every(function (w) { return !!+w.a; });
-      var broken = list.every(function (w) { return !!+w.b; });
-      var pt = p.wheelPoint(wh), d = dims(wh), onLeft = !!(wh._set && wh._set.side < 0);
-      var fs = cornerFont(d.h), small = fs * 0.88;
-      var lines = [];
-      if (broken) lines.push({ s: 'broken', px: small, w: 600, c: DIM_TEXT });
-      else {
-        var light = Math.max.apply(null, list.map(function (w) { return +w.lf || 0; }));
-        var gc = airborne ? STYLE.airborne : (light >= 0.5 ? 'rgb(' + STYLE.airLight.join(', ') + ')'
-          : (sliding ? slideColour(Math.max.apply(null, list.map(function (w) { return +w.ex || 0; }))) : STYLE.text));
-        lines.push({ s: Math.round(grip * 100) + '%', px: fs, w: 600, c: gc });
-        if (load !== undefined && !circle.compact) { var lu = U.load(Math.max(0, load)); lines.push({ s: fmt(lu.v, 0) + ' ' + lu.u, px: small, w: 400, c: DIM_TEXT }); }
-      }
-      var widest = 0, height = 0;
-      lines.forEach(function (l) { l.width = measure(ctx, l.s, l.px, l.w); widest = Math.max(widest, l.width); height += l.px * 1.2; });
-      blocks.push({ wh: wh, pt: pt, d: d, onLeft: onLeft, lines: lines, widest: widest, height: height, y0: pt.y - height / 2 });
-    });
-    // Readouts that would overlap on the same side (a tandem axle) are spread apart, as a group
-    // centred where they would have been.
-    [true, false].forEach(function (left) {
-      var side = blocks.filter(function (b) { return b.onLeft === left; }).sort(function (a, b) { return a.y0 - b.y0; });
-      var groups = [];
-      side.forEach(function (b) {
-        groups.push({ list: [b], h: b.height, mid: b.y0 + b.height / 2, n: 1 });
-        while (groups.length > 1) {
-          var g2 = groups[groups.length - 1], g1 = groups[groups.length - 2];
-          if (g1.mid + g1.h / 2 + 1 <= g2.mid - g2.h / 2) break;
-          g1.mid = (g1.mid * g1.n + g2.mid * g2.n) / (g1.n + g2.n);
-          g1.n += g2.n; g1.h += 1 + g2.h; g1.list = g1.list.concat(g2.list);
-          groups.pop();
-        }
-      });
-      groups.forEach(function (g) {
-        var y = g.mid - g.h / 2;
-        g.list.forEach(function (b) { b.y0 = y; y += b.height + 1; });
-      });
-    });
-    blocks.forEach(function (b) {
-      var wh = b.wh, pt = b.pt, d = b.d, onLeft = b.onLeft, widest = b.widest, height = b.height;
-      var r = dotRadius(d.w);
-      var clear = d.w / 2 + Math.abs(Math.sin(+wh.s || 0)) * d.h / 2 + Math.max(3, r) + 2 * r + 4;
-      var tx = onLeft ? pt.x - clear : pt.x + clear, align = onLeft ? 'right' : 'left';
-      // keep the block inside the circle; if that would put it over the tyre, put it on the
-      // tyre's inner side instead
-      var y0 = b.y0, worst = Math.max(Math.abs(y0 - circle.cy), Math.abs(y0 + height - circle.cy));
-      var half = Math.sqrt(Math.max(0, circle.r * circle.r - worst * worst)) - 3;
-      var reachX = d.w / 2 + Math.abs(Math.sin(+wh.s || 0)) * d.h / 2 + 2;
-      if (onLeft) {
-        tx = Math.max(tx, circle.cx - half + widest);
-        if (tx > pt.x - reachX) { tx = pt.x + reachX + 2; align = 'left'; }
-      } else {
-        tx = Math.min(tx, circle.cx + half - widest);
-        if (tx < pt.x + reachX) { tx = pt.x - reachX - 2; align = 'right'; }
-      }
-      var y = y0;
-      ctx.save();
-      ctx.shadowColor = 'rgba(0, 0, 0, 0.6)'; ctx.shadowBlur = 3;
-      b.lines.forEach(function (l) {
-        y += l.px * 1.2;
-        text(ctx, l.s, tx, y - l.px * 0.24, l.px, l.w, l.c, align);
-      });
-      ctx.restore();
-    });
-  }
-
-  // The balance in words, at the top of the circle, in the marker's colour: Neutral, Front near
-  // limit (the understeer warning), Understeer, Oversteer or Drift, with how many
-  // degrees more the front (understeer) or rear (oversteer) is slipping than the other axle.
   // The balance, on two lines at the top of the circle, in the marker's colour: the degrees on
   // top, large, and the words under them. Both lines always sit at the same height.
-  function balanceFont(rPx) { return clamp(rPx * 0.058, 8.5, 11); }   // the words: about the size of the grip readouts
+  function balanceFont(rPx) { return clamp(rPx * 0.058, 8.5, 11); }   // the words
   function degreeFont(rPx) { return balanceFont(rPx) * 1.15; }       // the degrees, a touch bigger
   var SHORT_WORD = { 'Understeer': 'Under', 'Front near limit': 'Front near', 'Rear near limit': 'Rear near', 'At the limit': 'At limit', 'Oversteer': 'Over', 'Drift': 'Drift', 'Powerslide': 'Powerslide', 'Neutral': 'Neutral' };
   // { word, deg (text, or '' when there's nothing to show), colour }, or null when the marker is hidden
@@ -1349,8 +1247,8 @@
       .filter(function (b) { return b.wheels.length > 0; });
   }
 
-  // draw(data, opts): data = { bodies: [...] } (lead vehicle first); opts.numbers switches the
-  // numbers mode on (opts.read: averaged readouts, opts.units: weight units).
+  // draw(data, opts): data = { bodies: [...] } (lead vehicle first); opts.read: the averaged
+  // readouts (the balance's degrees).
   VGSRenderer.prototype.draw = function (data, opts) {
     opts = opts || {};
     var size = this.fit(), ctx = this.ctx, W = size.w, H = size.h;
@@ -1369,11 +1267,10 @@
     // input arcs on its rim.
     var rPx = Math.max(4, Math.min(W, H) / 2 - 2), ccx = W / 2, ccy = H / 2;
     var inner = rPx - clamp(rPx * 0.05, 3, 7) - markerSize(rPx) - 2;
-    // numbers mode: a band at the top of the circle for the balance
-    // In a very small app (under about 125 px) the readouts are just the grip, and the balance
-    // words are shortened.
+    // a band at the top of the circle for the balance; in a very small app (under about 125 px)
+    // its words are shortened
     var compact = rPx < COMPACT_BELOW;
-    var band = opts.numbers ? balanceBand(ctx, rPx, inner, compact) : 0;
+    var band = balanceBand(ctx, rPx, inner, compact);
     ctx.beginPath(); ctx.arc(ccx, ccy, rPx, 0, Math.PI * 2);
     ctx.fillStyle = STYLE.panelFill; ctx.fill();
     ctx.strokeStyle = STYLE.panelStroke; ctx.lineWidth = 1.5; ctx.stroke();
@@ -1386,24 +1283,21 @@
       ctx.strokeStyle = STYLE.panelStroke; ctx.lineWidth = 1; ctx.stroke();
     }
 
-    // in numbers mode the vehicle is drawn a little smaller, to make room for the readouts and
-    // the balance at the top
     if (bodies.length === 1) {
-      // centred on the vehicle's body, one scale for everything (true proportions)
+      // centred on the vehicle's body, one scale for everything (true proportions), drawn smaller
+      // only as far as it takes to keep it clear of the balance at the top
       scale = inner / fitRadius(bodies[0]);
-      if (opts.numbers) {   // worked out once per layout and size
-        var sk = [scale.toFixed(4), inner.toFixed(2), band.toFixed(2), compact].join('|'), sc = this.shrinkCache;
-        if (!sc || sc.geo !== bodies[0].geo || sc.key !== sk) sc = this.shrinkCache = { geo: bodies[0].geo, key: sk, k: readoutShrink(ctx, bodies[0], scale, inner, band, compact) };
-        scale *= sc.k;
-      }
+      var sk = [scale.toFixed(4), inner.toFixed(2), band.toFixed(2)].join('|'), sc = this.shrinkCache;
+      if (!sc || sc.geo !== bodies[0].geo || sc.key !== sk) sc = this.shrinkCache = { geo: bodies[0].geo, key: sk, k: bandShrink(bodies[0], scale, inner, band) };
+      scale *= sc.k;
       if (bodies[0].geo.hasExt) outline(bodies[0], ccx, ccy);
       placements.push({ body: bodies[0], ox: ccx, oy: ccy });
     } else {
-      // tractor + trailer, articulated sections: stacked front to back, one shared scale (in
-      // numbers mode a little smaller, and moved down clear of the balance)
+      // tractor + trailer, articulated sections: stacked front to back, one shared scale, moved
+      // down clear of the balance
       var maxHalfW = 0, totalH = BODY_GAP * (bodies.length - 1);
       bodies.forEach(function (b) { maxHalfW = Math.max(maxHalfW, b.geo.halfW); totalH += b.geo.halfH * 2; });
-      scale = (inner - band) / Math.hypot(maxHalfW, totalH / 2) * (opts.numbers ? NUMBERS_SHRINK : 1);
+      scale = (inner - band) / Math.hypot(maxHalfW, totalH / 2);
       var y = ccy + band / 2 - totalH * scale / 2, prevBottom = null;
       bodies.forEach(function (b) {
         var hh = b.geo.halfH * scale, oy = y + hh;
@@ -1419,7 +1313,7 @@
     }
 
     // Pass 1: drivetrains. Then the G-force dot (centred on the circle, from the lead vehicle).
-    // Pass 2: tyres and assist dots on top. Pass 3 (numbers mode): readouts and the balance.
+    // Pass 2: tyres and assist dots on top. Pass 3: the balance.
     var dims = function (wh) {
       return { w: Math.max(wh._wd * scale, MIN_TYRE_W), h: Math.max(wh._len * scale, MIN_TYRE_L) };
     };
@@ -1456,30 +1350,19 @@
       drawAssistDots(ctx, p.body, wheelPoint, dims);
     });
 
-    if (opts.numbers) {
-      var circle = { cx: ccx, cy: ccy, r: inner, compact: compact };
-      placements.forEach(function (p) { drawCornerReadouts(ctx, p, dims, circle, opts); });
-      drawBalance(ctx, bodies[0], ccx, ccy, inner, rPx, opts, compact, mk);
-    }
+    drawBalance(ctx, bodies[0], ccx, ccy, inner, rPx, opts, compact, mk);
   };
-  var NUMBERS_SHRINK = 0.86;   // stacked vehicles in numbers mode
-  var COMPACT_BELOW = 62;      // circle radius (px) below which the numbers go compact
+  var COMPACT_BELOW = 62;      // circle radius (px) below which the balance's words are shortened
 
-  // How much smaller to draw a lone vehicle in numbers mode so every corner's readout fits
-  // beside its tyre inside the circle, and the vehicle stays clear of the balance band at the top.
-  function readoutShrink(ctx, body, scale, inner, band, compact) {
-    var g = body.geo, sample = compact ? '100%' : '1888 kg', nLines = compact ? 1 : 2;
-    for (var k = 1; k >= 0.35; k -= 0.025) {
-      var s2 = scale * k, ok = g.boxHalfH * s2 <= inner - band - 2;
+  // How much smaller to draw a lone vehicle so it stays clear of the balance band at the top:
+  // its body and its front tyres below the band.
+  function bandShrink(body, scale, inner, band) {
+    var g = body.geo, room = inner - band - 2;
+    for (var k = 1; k >= 0.35; k -= 0.01) {
+      var s2 = scale * k, ok = g.boxHalfH * s2 <= room;
       for (var i = 0; i < body.wheels.length && ok; i++) {
-        var w = body.wheels[i];
-        if (w._outer === false) continue;
-        var tw = Math.max(w._wd * s2, MIN_TYRE_W), th = Math.max(w._len * s2, MIN_TYRE_L);
-        var fs = cornerFont(th), textW = measure(ctx, sample, compact ? fs : fs * 0.88, compact ? 600 : 400), textH = fs * 1.2 * nLines;
-        var x = Math.abs(w._mx - g.cx) * s2 + tw / 2 + dotRadius(tw) * 3 + 7 + textW;
-        var y = Math.abs(+w.y - g.cy) * s2 + textH / 2;
-        if (x * x + y * y > (inner - 3) * (inner - 3)) ok = false;
-        if (+w.y > g.cy && (+w.y - g.cy) * s2 + textH / 2 > inner - band - 2) ok = false;   // a front readout under the band
+        var w = body.wheels[i], th = Math.max(w._len * s2, MIN_TYRE_L);
+        if ((+w.y - g.cy) * s2 + th / 2 > room) ok = false;
       }
       if (ok) return k;
     }
@@ -1607,7 +1490,6 @@
   // live values into the shape the renderer draws.
   // layout fields a live update never overwrites (everything else it sends is copied as is)
   var STATIC_KEYS = { i: 1, n: 1, nt: 1, rd: 1, wd: 1, x: 1, y: 1 };
-  var READ_WHEEL = ['g', 'fz'];
   var STALE_MS = 1500;   // a coupled body this far behind the lead vehicle's updates is dropped
 
   function VGSStore() {
@@ -1640,10 +1522,7 @@
     }
     var m = mergeBody(b), R = this.read, id = p.id;
     (b.motion || (b.motion = new Motion())).feed(p, m, now);
-    if (p.vd) {   // numbers mode: feed the readouts
-      toArray(m.wheels).forEach(function (w) {
-        READ_WHEEL.forEach(function (f) { if (w[f] !== undefined && w[f] !== null) R.add(id + ':w' + w.i + '.' + f, w[f]); });
-      });
+    if (p.vd) {   // the balance's degrees, averaged so they can be read
       if (p.vd.af !== undefined && p.vd.ar !== undefined) R.add(id + ':vd.bal', (p.vd.af - p.vd.ar) * 180 / Math.PI);
       if (p.vd.sl !== undefined && p.vd.sl !== null) R.add(id + ':vd.sl', p.vd.sl * 180 / Math.PI);
       if (p.vd.da !== undefined && p.vd.da !== null) R.add(id + ':vd.da', +p.vd.da);
@@ -1737,22 +1616,16 @@
     tyre: drawTyre, slideColour: slideColour, inputArcs: drawInputArcs, travelColour: travelColour, steerScale: steerScale, steerK: steerK
   };
   VGSRenderer.Store = VGSStore;
-  VGSRenderer.Units = Units;
   VGSRenderer.balanceStatus = balanceStatus;
   window.VGSRenderer = VGSRenderer;
 
   // ----- BeamNG app directive (skipped when running in a plain browser) -----
   if (!window.angular) return;
 
-  // Every instance of the app on screen; the vehicles send the numbers-mode values while any of
-  // them is in numbers mode.
+  // Every instance of the app on screen. The vehicles send the balance's detail (vd) while any is.
   var instances = [];
-  var PREF_KEY = 'vgsDisplay.numbers';
-  function loadPref() { try { return window.localStorage.getItem(PREF_KEY) === '1'; } catch (e) { return false; } }
-  function savePref(on) { try { window.localStorage.setItem(PREF_KEY, on ? '1' : '0'); } catch (e) { /* not available */ } }
   function lua(cmd) { if (window.bngApi && bngApi.engineLua) bngApi.engineLua(cmd); }
-  function wantDetail() { return instances.some(function (it) { return it.opts.numbers; }); }
-  function pushDetail() { lua('if extensions.vgsHub then extensions.vgsHub.setDetail(' + wantDetail() + ') end'); }
+  function pushDetail() { lua('if extensions.vgsHub then extensions.vgsHub.setDetail(' + (instances.length > 0) + ') end'); }
   function nowMsApp() { return (window.performance && performance.now) ? performance.now() : Date.now(); }
   var ANIMATE_AFTER_MS = 1500;   // keep drawing every refresh this long after the last update (the trail fades)
 
@@ -1761,7 +1634,7 @@
     return {
       template:
         // no bngApp class: it paints a dark box behind the app; we only want the circle
-        '<div style="width:100%; height:100%; position:relative; cursor:pointer; background:transparent;">' +
+        '<div style="width:100%; height:100%; position:relative; background:transparent;">' +
           '<canvas style="width:100%; height:100%; display:block;"></canvas>' +
         '</div>',
       replace: true,
@@ -1771,8 +1644,7 @@
         var canvas = element[0].querySelector('canvas');
         var renderer = new VGSRenderer(canvas);
         var store = new VGSStore();
-        var units = new Units();
-        var me = { opts: { numbers: loadPref(), units: units, read: store.read } };
+        var me = { opts: { read: store.read } };
         var opts = me.opts;
         instances.push(me);
         var pending = false, alive = true, lastData = 0, lastChain = 0;
@@ -1795,7 +1667,6 @@
           pushDetail();
         }
         enableHub();
-        lua('settings.notifyUI()');   // for the unit settings
         schedule();
 
         scope.$on('VGSData', function (event, payload) {
@@ -1811,7 +1682,6 @@
           lastChain = nowMsApp();
           try { if (store.setChain(chain)) schedule(); } catch (e) { if (window.console) console.error('VGS Display: bad chain message', e); }
         });
-        scope.$on('SettingsChanged', function (event, data) { units.set(data && data.values); schedule(); });
 
         // Re-enable the hub if it goes quiet (level change, Lua reload, another instance closed).
         // While the game is paused the hub keeps talking, so the last picture stays up.
@@ -1821,12 +1691,6 @@
           if (t - lastData > 6000 && t - lastChain > 6000 && store.hasData()) { store.clear(); schedule(); }
         }, 1000);
 
-        element.on('click', function () {
-          opts.numbers = !opts.numbers;
-          savePref(opts.numbers);
-          pushDetail();
-          schedule();
-        });
         var ro = window.ResizeObserver ? new ResizeObserver(schedule) : null;
         if (ro) ro.observe(element[0]);
 

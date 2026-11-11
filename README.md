@@ -1,10 +1,10 @@
 # VGS Display for BeamNG.drive
 
-*Version 1.02*
+*Version 1.10*
 
 A live grip display for BeamNG.drive, inspired by the VGS (Vehicle Gravity System) in Enthusia Professional Racing. It shows what a simulator can't let you feel: how hard each tyre is working, when one lets go and how badly, where the car is really going against where you're steering, and whether it's the front or the rear that's giving up.
 
-Every wheel is drawn where it sits on the vehicle, with its grip in use, its slide, the torque through it and its steering angle. The drivetrain is drawn underneath, your inputs run around the rim, a G-force dot with a fading trail sits in the middle, and a small marker by the steering arc shows how much the car is actually turning, coloured for understeer and oversteer. Click it for the numbers: grip and load at every corner, and the balance in degrees.
+Every wheel is drawn where it sits on the vehicle, with its grip in use, its slide, the torque through it and its steering angle. The drivetrain is drawn underneath, your inputs run around the rim, a G-force dot with a fading trail sits in the middle, and a small marker by the steering arc shows how much the car is actually turning, coloured for understeer and oversteer. When the car is off balance, the top of the circle says how, and by how many degrees.
 
 ![The display mid-corner, with every element labelled](docs/overview.png)
 
@@ -16,7 +16,7 @@ Every wheel is drawn where it sits on the vehicle, with its grip in use, its sli
 - **Understeer and oversteer you can see.** A direction marker by the steering arc shows how much the car is really turning, and how near each end is to its limit, judged against the car's own tyres: BeamNG's stability-control calibration where the car has one, learnt while you drive where it doesn't. It warns in yellow before the front runs wide or the rear lets go, turns orange-red in real understeer, and swings out to the countersteer target in pink-magenta when the rear slides. A drift you're holding in control turns aquamarine instead. A band shows the gap to your steering, and each colour is held long enough to read. It's readable at highway and track speeds too.
 - **Driver assists.** ABS, ESC and traction control per wheel and per engine, for both BeamNG's classic assist script and its newer driving-dynamics electronics.
 - **The drivetrain, live.** Engines, motors, gearbox and differentials where they sit, shafts tinted by torque, diff lock state, disconnectable shafts, part-time 4WD, broken driveshafts.
-- **A numbers mode.** Click it for each corner's grip in use and the weight on it, and, whenever the car is off balance, *Front near limit*, *Understeer* or *Oversteer* with how many degrees it's out by, or *Drift* with the drift angle, all inside the circle.
+- **The balance in words and degrees.** Whenever the car is off balance, the top of the circle says so: *Front near limit*, *Understeer* or *Oversteer* with how many degrees it's out by, or *Drift* with the drift angle.
 - **Low latency.** Each vehicle sends its data straight to the app, exactly once per UI frame, using the same handshake BeamNG's own gauges use. The app draws once per screen refresh.
 - **Tested against the physics.** Version 1.0 was checked frame by frame against a full four-wheel vehicle simulation: 35 vehicles (front, rear and all-wheel drive, nose- and tail-heavy, trucks, slicks to all-terrain tyres) through 27 manoeuvres each, from gentle cornering to spins. See [How it was tested](#how-it-was-tested).
 
@@ -31,7 +31,7 @@ Every wheel is drawn where it sits on the vehicle, with its grip in use, its sli
 - [Drivetrain](#drivetrain)
 - [Layout and scale](#layout-and-scale)
 - [Dual tyres](#dual-tyres)
-- [Numbers mode](#numbers-mode)
+- [The balance at the top](#the-balance-at-the-top)
 - [Performance and latency](#performance-and-latency)
 - [Compatibility](#compatibility)
 - [How it works](#how-it-works)
@@ -80,7 +80,6 @@ To remove it, delete the zip (or its folder) from `mods`.
 | Small green dot in the middle of the engine or motor | Classic traction control is intervening on the wheels it drives: braking a spinning wheel, or cutting its power |
 | Small green dot beside a wheel | Traction control is acting on that wheel (newer driving-dynamics cars): braking it, or cutting the power of the motor that drives it |
 | Green driveshaft | The engine is driving the wheels at the end of it |
-| Click the app | Numbers mode on or off |
 
 ## Wheels
 
@@ -239,7 +238,7 @@ To make it easy to read at speed:
 - **Bigger.** The marker is about a fifth bigger, with a dark edge, so it stands out against the steering arc and the dark circle.
 - **The gap is drawn.** A band in the marker's colour runs between the marker and the end of the steering arc: how far you're steering past where the car is going (understeer), or short of it (oversteer). Its length is the size of the problem.
 
-It fades in within a few frames and out over about a tenth of a second. The numbers mode's balance readout always shows the same state as the marker.
+It fades in within a few frames and out over about a tenth of a second. The balance at the top of the circle always shows the same state as the marker.
 
 How it's worked out:
 
@@ -275,7 +274,7 @@ How it's worked out:
     - the front sliding into the turn too, from about 2° to 4° (`PS_FRONT_START`, `PS_FRONT_FULL`), but not far more than the rear: 5° to 10° more is ploughing (`PS_PLOUGH_START`, `PS_PLOUGH_FULL`), which is understeer;
     - the throttle on, from 20 % (`PS_THROTTLE`), above walking pace.
 
-    It's controlled when the slide holds, as for a drift (not growing faster than about 20°/s, never past 90°). It turns aquamarine once it has held for 0.2 s, and pink-magenta (oversteer) the moment it gets away. In numbers mode the degrees are how far the rear is sliding. In the simulation, three all-wheel-drive powerslides (20° to 35°, the front sliding 10° to 18°) all read *Powerslide*. The same slide with rear-wheel drive, a lift-off slide, a slide growing into a spin, a plough, a classic opposite-lock drift and ordinary cornering read as before.
+    It's controlled when the slide holds, as for a drift (not growing faster than about 20°/s, never past 90°). It turns aquamarine once it has held for 0.2 s, and pink-magenta (oversteer) the moment it gets away. The degrees at the top of the circle are how far the rear is sliding. In the simulation, three all-wheel-drive powerslides (20° to 35°, the front sliding 10° to 18°) all read *Powerslide*. The same slide with rear-wheel drive, a lift-off slide, a slide growing into a spin, a plough, a classic opposite-lock drift and ordinary cornering read as before.
   - Both go back to neutral (no marker) when the car is barely rotating (below 0.1 rad/s for understeer, `US_MIN_YAW`, and 0.15 rad/s for oversteer, `BAL_MIN_YAW`), so straight-line driving stays clear. At a crawl (both axles under about 1.5–3 m/s) the directions of travel mean nothing, so a car stopping or pulling away shows nothing either, but a donut, where the rear is moving fast though the middle of the car hardly moves, still counts.
 - **Spins and donuts:** an axle sliding backwards counts as rolling backwards, not as sliding the other way, so a spin stays pink-magenta instead of flipping to understeer. The direction of rotation comes from the yaw rate, which keeps its sign through a drift or a spin. The marker is also kept continuous past 180°: in a spin it stays on the side it started, and only comes round to the other side once the car has really rotated about three-quarters of a turn.
 - **Smoothing:** at highway speed the stretched scale magnifies the smallest movement, so the marker's smoothing is designed to be steady without trailing. There's one adaptive ("One Euro") filter, applied in the vehicle at full game rate to where the marker is drawn (degrees round the rim, after the scale's magnification, so noise is judged as you'd see it).
@@ -427,21 +426,11 @@ Dual tyres draw side by side with a small gap. BeamNG vehicles report them in th
 - **Two wheels at the same point.** Duals reported at a single hub position (within 5 cm, `DUAL_SAME_HUB`) are spread evenly around that point.
 - **One wheel standing in for a pair.** It's detected from a dual flag, a tyre mesh named "dual", or a truck-sized tyre (radius at least 0.42 m) that's wider than its radius (`DUAL_WIDTH_RATIO`). This also covers BeamNG's simplified duallies setting. The wheel is drawn as two tyres, spread evenly around its position, both showing the same data.
 
-A dual set shares one numeric readout per corner, which shows the harder-working tyre.
+## The balance at the top
 
-## Numbers mode
+![The balance while cornering, in a drift with its drift angle, and at the default size](docs/balance.png)
 
-![Numbers mode while cornering, in a drift with its drift angle, and at the default size](docs/numbers.png)
-
-Click the app to switch the numbers on, and click again to switch them off. The choice is remembered. Everything stays inside the circle; there's no extra window.
-
-| Where | What it shows |
-|---|---|
-| **87%** beside each tyre | Grip in use. 100 % is the limit; above it the tyre is past its peak. White while it holds, pink or red while it's sliding (the same colour as the tyre), blue while it's off the ground |
-| **412 kg** under it | The weight on that tyre right now, in your weight unit (kg or lb, from BeamNG's settings). Watch it move to the outside in a corner and to the front under braking |
-| **6.3°** / **Understeer** at the top | The balance on two lines, in the direction marker's colour: in large figures, how many degrees more one axle is slipping than the other, and under it the verdict in words. Both lines stay at fixed heights |
-
-While the car is balanced nothing shows there. Otherwise the words follow the marker's colour:
+At the top of the circle, in the direction marker's colour, the balance on two lines: in large figures, how many degrees more one axle is slipping than the other, and under it the verdict in words. Both lines stay at fixed heights. While the car is balanced nothing shows there. Otherwise the words follow the marker:
 
 | Words | Colour | Degrees |
 |---|---|---|
@@ -453,11 +442,11 @@ While the car is balanced nothing shows there. Otherwise the words follow the ma
 | *Powerslide* | aquamarine | how far the rear is sliding |
 | *Drift* (a controlled drift) | aquamarine | the drift angle: how far the rear is sliding, as on the AC version and Drift Scoring's angle meter. |
 
-A dual set shows its hardest-working tyre and the weight on the whole set. Readouts that would overlap, such as a trailer's tandem axles, are spaced apart around where they belong. In an app smaller than about 125 pixels there's only room for the grip, and the balance words are shortened (*Under*, *Front near*, *Rear near*, *At limit*, *Over*, *Drift*, *Powerslide*).
+In an app smaller than about 125 pixels the words are shortened (*Under*, *Front near*, *Rear near*, *At limit*, *Over*, *Drift*, *Powerslide*).
 
-Numbers that change every frame can't be read, so each one is averaged over a short window and refreshed about seven times a second (`READ_MS`). The drawing itself still shows every update as it arrives. The vehicle is drawn a little smaller in numbers mode, just enough to make room for the readouts and the balance.
+Degrees that change every frame can't be read, so they're averaged over a short window and refreshed about seven times a second (`READ_MS`). The drawing itself still shows every update as it arrives. The vehicle is drawn just small enough to stay clear of the band at the top.
 
-The vehicle only works out the extra values (each tyre's load and the two axles' slip angles) while numbers mode is on in some copy of the app, so it costs nothing the rest of the time.
+The vehicle only works out the values behind the degrees (the two axles' slip angles, a powerslide's slide and a drift's angle) while the app is open, so it costs nothing the rest of the time.
 
 ## Performance and latency
 
@@ -476,8 +465,8 @@ What it costs, measured outside the game (LuaJIT for the vehicle script, Chromiu
 
 | Part | Cost |
 |---|---|
-| Vehicle script, per frame | about 0.1 ms for a car or a six-wheel truck, numbers mode included |
-| App, per draw | about 0.09 ms; 0.17 ms with numbers mode (half what 2.3 took) |
+| Vehicle script, per frame | about 0.1 ms for a car or a six-wheel truck |
+| App, per draw | about 0.04 ms on the test machine (2.5.1 there: 0.03 ms, or 0.11 ms with its numbers mode) |
 | App, per update received | about 0.015 ms |
 
 In a simulation of frame pacing (uneven game frames, the UI's update gate, delivery delays and clumps, 60 and 144 Hz screens), the marker's frame-to-frame unevenness fell to between a quarter and a thirteenth of what drawing each update as it landed gave. Its delay behind the car fell by roughly half:
@@ -507,7 +496,7 @@ In a simulation of frame pacing (uneven game frames, the UI's update gate, deliv
 
   Mod devices are recognised by their device category, not their name. Assist dots only show for assists that use BeamNG's standard flags or controllers; a mod's own assist system shows only if it does the same.
 - **Other apps and mods:** it uses its own extension names (`vgsHub`, `vgsTelemetry`) and its own UI hooks (`VGSData`, `VGSChain`), and doesn't change anything in the game. It doesn't use or change BeamNG's streams, so it doesn't affect other apps.
-- **Several copies:** you can add the app more than once, say a small one and a large one with the numbers. They share the vehicles' data; numbers mode is worked out while any copy has it on.
+- **Several copies:** you can add the app more than once, say a small one and a large one. They share the vehicles' data.
 - **Multiplayer and split screen:** it shows the vehicle player one is driving.
 
 ## How it works
@@ -651,17 +640,16 @@ All of these are plain constants at the top of their file. After changing the ve
 | `INPUT` | blue, red, green, white, wine red | Colours of the rim arcs: steering, brake, throttle, clutch, handbrake, and the colours the brake (brighter) and throttle (darker) pulse towards |
 | `PULSE_HZ` | 5 | How fast the brake and throttle arcs pulse while ABS or traction control work |
 | `ASSIST` | red, green, blue | Colours of the ABS, traction control and ESC dots |
-| `READ_MS` | 150 ms | Numbers mode: how long each number is averaged over before it's refreshed |
-| `NUMBERS_SHRINK` | 0.86 | Numbers mode: how much smaller coupled vehicles are drawn, to make room for the readouts (a single vehicle is fitted exactly) |
-| `COMPACT_BELOW` | 62 px | Numbers mode: circle radius below which only the grip is shown and the balance words are shortened |
+| `READ_MS` | 150 ms | How long the balance's degrees are averaged over before they're refreshed |
+| `COMPACT_BELOW` | 62 px | Circle radius below which the balance's words are shortened |
 
 ## Calibrating grip
 
 The defaults suit a road car on tarmac. To tune them for a particular car or surface:
 
-1. Click the app to turn on the numbers.
-2. Do a clean launch and a steady corner at the limit, and watch each corner's grip figure. It should reach about 100 % just as the car lets go.
-3. If it reaches 100 % (and the tyre turns pink) well before the car lets go, raise `SLIP_LIMIT` and `SLIP_PEAK`; if the car lets go first, lower them. Keep `SLIP_PEAK` a bit below `SLIP_LIMIT`.
+1. Do a clean launch and a steady corner at the limit, and watch each tyre's grip bar. It should fill just as the car lets go.
+2. If it fills (and the tyre turns pink) well before the car lets go, raise `SLIP_LIMIT` and `SLIP_PEAK`; if the car lets go first, lower them. Keep `SLIP_PEAK` a bit below `SLIP_LIMIT`.
+3. Use `extensions.vgsHub.dumpTravel(true)` for the figures behind it: each axle's nearness to its limit and its learnt grip.
 4. The grip bars learn each axle's grip as you drive near the limit. If they sit too high or too low before that (a car on slicks, or on gravel, straight after spawning), adjust `MU_NOMINAL`, the grip they start from.
 5. Reload vehicle Lua (Ctrl+R) to apply the changes.
 
@@ -671,9 +659,6 @@ Some background from BeamNG's own code that helps here: its tyres use a Stribeck
 
 **The app says "waiting for vehicle".** No data has arrived yet. Make sure you're in a vehicle. If it persists, reload vehicle Lua (Ctrl+R) or close and reopen the app. The app re-enables its game-engine script by itself after 2.5 s of silence.
 
-**Numbers mode shows only percentages.** The app is very small (under about 125 pixels); make it a little bigger for the weights too.
-
-**The weights are in the wrong unit.** They follow the game's own unit settings, the same ones its other apps use. Changing them updates the app at once.
 
 **The warnings seem early or late for a car.** Run `extensions.vgsHub.dumpTravel(10)` and drive. Its `[vgs grip]` lines show the tyres' stiffness and where it came from (BeamNG's calibration, or learnt while driving), how near each end is to its limit (1 = at it) and the state. *Still learning* means the car hasn't had enough gentle cornering yet and the fixed slip angles are in use: drive a few gentle bends. If a car's are consistently off, `NEAR_ON` moves the warning.
 
@@ -778,7 +763,7 @@ Every run was done three ways: with BeamNG's stiffness calibration, learning it 
 The other measurements, in the same runs:
 
 - **Direction marker:** within 0.01° of the true turn in steady corners (median); 90 % of frames within 2.5° through step steers, lift-off and braking events and drifts.
-- **Drift angle** (numbers mode): within 0.2° in a held drift; a few degrees behind while a spin is building up quickly.
+- **Drift angle** (the degrees shown in a drift): within 0.2° in a held drift; a few degrees behind while a spin is building up quickly.
 - **Off the ground:** every wheel off the ground for more than 0.35 s (kerbs, jumps, a tall pickup lifting a wheel) was shown; on rough roads no wheel was ever shown off the ground falsely.
 - **Drivetrain:** the driven wheels were right for every vehicle in the fleet.
 
@@ -795,14 +780,20 @@ What still trips it, in the simulation: very tall, heavy vehicles on grippy tyre
 - **Data path:**
   - UI-frame gating, the keep-alive, and the layout's send cadence and resend on request.
   - Coupling and decoupling, vehicle switching and the no-vehicle state.
-  - Numbers mode on and off, the game-engine fallback route, and several copies of the app.
+  - The balance's values on and off as the app opens and closes, the game-engine fallback route, and several copies of the app.
 - **The app:**
   - The data store: ordering, stale bodies, layout versions, averaging and decoding, the balance words, and the motion between updates (steady motion, jumps, late clumps, resets).
   - Frame pacing: a simulation of uneven game frames, the UI's update gate and delivery jitter against 60 and 144 Hz screens, and a browser run with real captured drift data delivered unevenly.
-  - The Angular wiring, with BeamNG's UI calls mocked: one draw per refresh, clicks, the watchdog and preferences.
-  - End-to-end rendering of the vehicle script's real output at five app sizes, with kg and lb.
+  - The Angular wiring, with BeamNG's UI calls mocked: one draw per refresh, asking for the balance's values on opening, and the watchdog.
+  - End-to-end rendering of the vehicle script's real output at five app sizes.
 
 ## Changelog
+
+**1.10**
+
+- One mode: the balance (its degrees and words at the top of the circle) always shows when the car is off balance, and the grip percentage and weight beside each wheel are gone. Clicking the app no longer does anything. The grip in use is still drawn as each tyre's bar.
+- The vehicle is drawn only as much smaller as the balance band needs, not to make room for readouts by the wheels, so it's bigger than in the old numbers mode. Coupled vehicles are no longer drawn 14 % smaller.
+- The vehicle no longer sends each wheel's load, and the app no longer follows BeamNG's weight-unit setting (nothing shows a weight).
 
 **1.02**
 
@@ -941,4 +932,4 @@ The images in this README are drawn by the mod's own renderer (`app.js`), fed wi
 - `docs/drivetrain-legend.png`, `docs/drivetrain-examples.png`: the drivetrain legend and examples.
 - `docs/assists.png`: ABS, ESC and traction control.
 - `docs/gallery.png`, `docs/duals.png`: vehicle layouts and dual tyres.
-- `docs/numbers.png`: numbers mode, from the vehicle script's real output in the physics model (positions, loads, slip angles), fed through the app's own data store and renderer. The physics model can't drift or push into deep understeer, so in the second and third pictures the balance and the grip figures are set by hand.
+- `docs/balance.png`: the balance at the top of the circle, from the vehicle script's real output in the physics model (positions, slip angles), fed through the app's own data store and renderer. The physics model can't drift or push into deep understeer, so in the second and third pictures the balance and the tyres are set by hand.

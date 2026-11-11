@@ -20,7 +20,7 @@ local STALE_AFTER   = 1.5    -- s (sim time) without a ping before a vehicle is 
 local RETRY_EVERY   = 1.0    -- s (sim time) between activation attempts
 
 local enabled    = false
-local detail     = false     -- the app's numbers mode is on
+local detail     = false     -- the app is open: the vehicles send the balance's degrees
 local simClock   = 0
 local realClock  = 0
 local pings      = {}        -- [vid] = simClock of its last ping
@@ -167,7 +167,7 @@ function M.setEnabled(on)
   end
 end
 
--- The app's numbers mode: the vehicles work out and send the extra values only while it's on.
+-- While the app is open the vehicles work out and send the balance's degrees (vd).
 function M.setDetail(on)
   detail = on and true or false
   for vid in pairs(activated) do
