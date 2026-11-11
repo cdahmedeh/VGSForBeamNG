@@ -1,5 +1,7 @@
 # VGS Display for BeamNG.drive
 
+*Version 1.0*
+
 A live grip display for BeamNG.drive, inspired by the VGS (Vehicle Gravity System) in Enthusia Professional Racing. It shows what a simulator can't let you feel: how hard each tyre is working, when one lets go and how badly, where the car is really going against where you're steering, and whether it's the front or the rear that's giving up.
 
 Every wheel is drawn where it sits on the vehicle, with its grip in use, its slide, the torque through it and its steering angle. The drivetrain is drawn underneath, your inputs run around the rim, a G-force dot with a fading trail sits in the middle, and a small marker by the steering arc shows how much the car is actually turning, coloured for understeer and oversteer. Click it for the numbers: grip and load at every corner, and the balance in degrees.
@@ -16,6 +18,7 @@ Every wheel is drawn where it sits on the vehicle, with its grip in use, its sli
 - **The drivetrain, live.** Engines, motors, gearbox and differentials where they sit, shafts tinted by torque, diff lock state, disconnectable shafts, part-time 4WD, broken driveshafts.
 - **A numbers mode.** Click it for each corner's grip in use and the weight on it, and, whenever the car is off balance, *Front near limit*, *Understeer* or *Oversteer* with how many degrees it's out by, or *Drift* with the drift angle, all inside the circle.
 - **Low latency.** Each vehicle sends its data straight to the app, exactly once per UI frame, using the same handshake BeamNG's own gauges use. The app draws once per screen refresh.
+- **Tested against the physics.** Version 1.0 was checked frame by frame against a full four-wheel vehicle simulation: 35 vehicles (front, rear and all-wheel drive, nose- and tail-heavy, trucks, slicks to all-terrain tyres) through 27 manoeuvres each, from gentle cornering to spins. See [How it was tested](#how-it-was-tested).
 
 ## Contents
 
@@ -102,12 +105,16 @@ To remove it, delete the zip (or its folder) from `mods`.
 
 The white bar grows from the middle of the tyre towards both ends. An empty tyre is rolling freely, and a full bar is right at the limit.
 
-BeamNG doesn't report a "friction used" figure per tyre, so the bar is an estimate. It takes the larger of two numbers:
+BeamNG doesn't report a "friction used" figure per tyre, so the bar is an estimate: the force the tyre is making against the force it can grip with.
 
-- **Force-based:** the tyre's longitudinal force (drive or brake torque divided by the wheel radius) combined with its share of the cornering force (its load times the lateral acceleration), divided by what it can take (its load times `MU_NOMINAL`, 1.0 by default, a road tyre on dry tarmac).
-- **Slip-based:** the contact-patch slip speed divided by `SLIP_PEAK` (1.5 m/s by default).
+- **Sideways:** the tyre's share of its axle's cornering force. The axle's force comes from the grip model (see [how near the limit](#direction-of-travel-understeer-and-oversteer)): the car's mass and centre of gravity, its sideways acceleration and how fast its rotation is changing, with the drive and brake forces allowed for. It's shared between the axle's tyres by their load: a more heavily loaded tyre is stiffer and takes more of it, a little less than in proportion (`GRIP_LOAD_EXP`).
+- **Forwards:** the drive and brake torques on the wheel, divided by its radius.
+- **What it can grip with:** its load, BeamNG's own figure for that wheel, times its axle's grip (friction coefficient). The grip starts at a road tyre's on tarmac (`MU_NOMINAL`, 1.0) and is learnt as you drive. It's raised whenever the axle uses more than that, and right at the axle's peak, where the force *is* the grip, it's measured (`MU_TAU`). So race slicks, all-terrain tyres and loose surfaces read right once the car has been near its limit.
+- **At or past the limit:** an axle past its peak shows its tyres full, and the tyre's own slip counts too: its contact-patch slip speed divided by `SLIP_PEAK` (1.5 m/s), so a sliding or spinning tyre always shows.
 
-The result is smoothed a little (`GRIP_SMOOTHING`) so it doesn't jitter. A held brake at a standstill doesn't count as tyre force.
+Before 1.0 every tyre took the same share of the car's sideways acceleration, against a fixed grip of 1.0, so a front tyre at its limit in understeer could read 70 % and a race tyre read high all the time. In the simulation (see [How it was tested](#how-it-was-tested)) the bar's average error fell by about a quarter across the test fleet, from 7.7 % to 5.9 % of the tyre's grip. Tyres far from a road tyre's grip (slicks, gravel) still read off until the car has been near its limit and the grip has been learnt.
+
+The result is smoothed a little (`GRIP_SMOOTHING`) so it doesn't jitter. A held brake at a standstill doesn't count as tyre force. A wheel shown off the ground reads empty at once.
 
 ### Sliding, and how far past the limit
 
@@ -244,20 +251,17 @@ How it's worked out:
 - **Scale:** the full-lock angle of the front wheels is learned while you drive, from how far they actually turn for a given steering input. Until you've steered a little, it assumes about 34° (`LOCK_DEFAULT`). The marker can go round a full circle, four times that angle (`TRAVEL_MAX`).
 - **Colour: how near each end is to its limit.** This uses what BeamNG's own stability control knows about the car.
   - **BeamNG's calibration.** For its stability control, BeamNG calibrates each car's tyres: the *cornering stiffness* of the front and rear axle, how much sideways force they make per degree of slip while well within their grip. Cars with the driving-dynamics system carry it in a calibration file per configuration (`vehicles/<car>/drivingDynamics/<config>.stat.json`, 174 of them in 0.40: the Bastion, ETK 800 and K series, SBR, Scintilla and Vivace families); cars with the classic ESC carry it in their ESC settings. BeamNG's ESC uses these values to predict the yaw rate the car should have for your steering and speed (its "characteristic speed"), and treats more rotation than that as oversteer and less as understeer.
-  - **Learnt when there's no calibration.** Other vehicles learn it while you drive: about 2.5 s of gentle cornering (up to about a quarter of the grip, `CAL_AY_HI`) is enough, and it keeps refining from then on (`CAL_TAU`). Straight running counts too: it pins down any small constant error in the measured slip, which matters most for stiff tyres. A calibrated car refines BeamNG's values the same way, slowly.
-  - **How near the limit.** Each axle's sideways force is worked out from the car's mass, where its centre of gravity sits between the axles, its sideways acceleration and how fast its rotation is changing. That's set against the force its tyres would make at their current slip angle if they were still in their linear range (stiffness × slip). The ratio is 1 well within the grip and falls as the tyres near their peak, to about the same value at the peak whatever the tyre, a stiff race tyre or a soft off-road one (`GRIP_RATIO_PEAK`). So the limit is found for each car, with no fixed angles. The signals behind force and slip are timed to line up, so a quick turn-in or a slalom isn't mistaken for running out of grip, and the slip is compared with where the wheels pointed at the same moment, so turning the steering isn't mistaken for slip.
-  - **The states.** An axle counts as near its limit from about 87–92 % of its grip (`NEAR_ON`; it has to stay there 0.12 s, `WARN_HOLD`). Whichever end is clearly nearer gets the warning; when they're within `LEAD` of each other it's *at the limit*. *Understeer* is the front past its peak and nearer its limit than the rear. *Oversteer* is the rear slipping more than the front, beyond what linear tyres would need for the forces, with the rear near or past its limit. That takes the car's own designed balance out of the oversteer test, as BeamNG's ESC does with its expected yaw rate. A car that's naturally a little tail-happy reads as oversteer only when it really is, and a nose-heavy one doesn't hide a sliding rear. While the rear is sliding, the warnings stand down: that's oversteer or nothing.
+  - **Learnt when there's no calibration.** Other vehicles learn it while you drive: about 2.5 s of gentle cornering (up to about a third of the grip, `CAL_AY_HI`) is enough, and it keeps refining from then on (`CAL_TAU`). The fit follows the tyre's early bend (`CAL_BEND_PRIOR`, `CAL_BEND_SHARE`), so it finds the tyre's true starting stiffness. A straight line through the same data comes out 10–25 % low for a BeamNG-like tyre, whose tread starts to slide node by node from the first degree, and that read as being nearer the limit than it was. Straight running counts too: it pins down any small constant error in the measured slip, which matters most for stiff tyres. A calibrated car refines BeamNG's values the same way, slowly. After a dozen seconds of gentle weaving, the learnt stiffness of every vehicle in the test fleet was within 10 % of the true value, and half of them within 5 %.
+  - **How near the limit.** Each axle's sideways force is worked out from the car's mass, where its centre of gravity sits between the axles, its sideways acceleration and how fast its rotation is changing. Three things that turn the car besides the tyres' cornering force are allowed for:
+    - the tyres' forward forces, from the drive and brake torques on each wheel. A limited-slip or locked diff pushing the inside wheel harder, a brake on one wheel (ESC), or torque vectoring turns the car, and before 1.0 that was put down to the axles' cornering forces. On a rear-drive car with a limited-slip diff this made the rear look 10 % nearer its limit than it was, and the learnt stiffness 30 % off at the front;
+    - the steered wheels' forward force, part of which pushes sideways;
+    - a tandem's axles, which roll along different paths and so push against each other in a turn, resisting it more the stiffer and further apart they are.
+
+    That force is set against the force its tyres would make at their current slip angle if they were still in their linear range (stiffness × slip). The stiffness follows the load the axle's tyres carry right now, from BeamNG's per-wheel load: a tyre gets stiffer with load, a little less than in proportion (`GRIP_LOAD_EXP`), so braking (more load on the front) or load transfer in a corner isn't mistaken for the limit coming or going. The ratio is 1 well within the grip and falls as the tyres near their peak, to about the same value at the peak whatever the tyre, a stiff race tyre or a soft off-road one (`GRIP_RATIO_PEAK`). So the limit is found for each car, with no fixed angles. The signals behind force and slip are timed to line up, so a quick turn-in or a slalom isn't mistaken for running out of grip, and the slip is compared with where the wheels pointed at the same moment, so turning the steering isn't mistaken for slip.
+  - **The states.** An axle counts as near its limit from about 85–90 % of its grip (`NEAR_ON`; it has to stay there 0.12 s, `WARN_HOLD`). Whichever end is clearly nearer gets the warning; when they're within `LEAD` of each other it's *at the limit*. *Understeer* is the front at its peak, where more steering gives no more force (`PAST_ON`), and further gone than the rear. Before 1.0 it came on as soon as the warning was at full strength, at about 75 % of the way to the peak, so a car near but not past the limit read as understeer. *Oversteer* is the rear slipping more than the front, beyond what linear tyres would need for the forces, with the rear near or past its limit. That takes the car's own designed balance out of the oversteer test, as BeamNG's ESC does with its expected yaw rate. A car that's naturally a little tail-happy reads as oversteer only when it really is, and a nose-heavy one doesn't hide a sliding rear. While the rear is sliding, the warnings stand down: that's oversteer or nothing.
   - **Until the stiffness is known**, a fresh car without BeamNG's calibration uses fixed slip angles instead: the warning on the front slip angle on its way to a road tyre's peak, from about 2.5° (`US_SLIP_START`) to 7° (`US_SLIP_FULL`) with the front slipping 0.3° (`US_LEAD_START`) to 2° more (`US_LEAD_FULL`) than the rear; understeer from 7° (`US_PAST_START`) to 10° (`US_PAST_FULL`) of front slip with the front 2° (`US_PAST_LEAD`) to 4° (`US_PAST_LEAD_FULL`) more than the rear. Fine for a road tyre, but it warns early on soft tyres and late on stiff ones. Below walking pace (4–7 m/s, `GRIP_MIN_SPEED`) the slip angles are too small to judge, so it also uses these there.
-  - **Tested in the simulation**, sweeping eight kinds of vehicle (front-heavy, balanced, nose-heavy front-drive and rear-engined cars, a truck with a tandem, soft off-road tyres, stiff race tyres, a loose rear) up to and past the limit at 15, 25 and 35 m/s:
-
-    | | First warning, at this share of the front tyres' grip | Rear warning |
-    |---|---|---|
-    | Fixed slip angles (before 2.5) | 59–99 %, depending on the tyre | none |
-    | With BeamNG's calibration | 87–92 % | at 90–93 % of the rear tyres' grip, on the car with the loose rear |
-    | Learnt while driving | 88–97 % | |
-
-    With fixed angles, soft off-road tyres warned at 59–64 % of their grip and race tyres not until 97–99 %, right as they let go. In the scenario tests, lift-off and braking oversteer now show the rear warning first and then oversteer as the rear goes, where the fixed angles showed nothing until it had gone. A hard turn-in at 30 m/s (front 96 %, rear 35 %) now reads as understeer.
-  - **Oversteer (pink-magenta)** shows once the rear is clearly sliding more than the front: the difference has to pass about 3° (`BAL_DEADBAND`), reaching the full strength at about 12° (`BAL_FULL`), and the rear has to be working hard: near its limit, or past about 4.5° of slip (`BAL_SLIP_START`), with full strength from about 8° (`BAL_SLIP_FULL`).
+  - **Tested in the simulation** against the true grip of each axle: see [How it was tested](#how-it-was-tested) for the fleet, the manoeuvres and the results.
+  - **Oversteer (pink-magenta)** shows once the rear is clearly sliding more than the front: the difference has to pass about 3° (`BAL_DEADBAND`), reaching the full strength at about 12° (`BAL_FULL`), and the rear has to be working hard: near its limit, or past about 4.5° of slip (`BAL_SLIP_START`), with full strength from about 8° (`BAL_SLIP_FULL`). The rear sliding past any tyre's peak, from about 12° to 20° (`OS_SLIDE_START`, `OS_SLIDE_FULL`), is oversteer whatever the front is doing. In a spin the front slides too, so the difference between them says nothing, and before 1.0 a full spin showed no marker at all.
   - **A controlled drift (aquamarine instead of pink-magenta)** needs two things. Aquamarine because a controlled drift isn't a warning: it's a "good, in control" green, shifted towards cyan so it doesn't clash with the throttle arc or the drive outlines. In a colour-blindness simulation it stays distinct from the pink-magenta, the yellow and the orange-red.
     - **The countersteer matches the slide:** the front tyres slip only a few degrees, meaning the steering points about where the front is going. It's fully controlled up to 5° of front slip (`DRIFT_STEER_OK`) and not controlled from 15° (`DRIFT_STEER_OFF`).
     - **The slide isn't growing fast:** growing by up to 20° a second still counts (`DRIFT_GROW_OK`); from 57° a second it's spinning away (`DRIFT_GROW_OFF`). A slide that's shrinking, because you're recovering, counts as controlled.
@@ -272,7 +276,7 @@ How it's worked out:
     - the throttle on, from 20 % (`PS_THROTTLE`), above walking pace.
 
     It's controlled when the slide holds, as for a drift (not growing faster than about 20°/s, never past 90°). It turns aquamarine once it has held for 0.2 s, and pink-magenta (oversteer) the moment it gets away. In numbers mode the degrees are how far the rear is sliding. In the simulation, three all-wheel-drive powerslides (20° to 35°, the front sliding 10° to 18°) all read *Controlled powerslide*. The same slide with rear-wheel drive, a lift-off slide, a slide growing into a spin, a plough, a classic opposite-lock drift and ordinary cornering read as before.
-  - Both go back to neutral (no marker) when the car is barely rotating (below 0.1 rad/s for understeer, `US_MIN_YAW`, and 0.15 rad/s for oversteer, `BAL_MIN_YAW`), so straight-line driving stays clear.
+  - Both go back to neutral (no marker) when the car is barely rotating (below 0.1 rad/s for understeer, `US_MIN_YAW`, and 0.15 rad/s for oversteer, `BAL_MIN_YAW`), so straight-line driving stays clear. At a crawl (both axles under about 1.5–3 m/s) the directions of travel mean nothing, so a car stopping or pulling away shows nothing either, but a donut, where the rear is moving fast though the middle of the car hardly moves, still counts.
 - **Spins and donuts:** an axle sliding backwards counts as rolling backwards, not as sliding the other way, so a spin stays pink-magenta instead of flipping to understeer. The direction of rotation comes from the yaw rate, which keeps its sign through a drift or a spin. The marker is also kept continuous past 180°: in a spin it stays on the side it started, and only comes round to the other side once the car has really rotated about three-quarters of a turn.
 - **Smoothing:** at highway speed the stretched scale magnifies the smallest movement, so the marker's smoothing is designed to be steady without trailing. There's one adaptive ("One Euro") filter, applied in the vehicle at full game rate to where the marker is drawn (degrees round the rim, after the scale's magnification, so noise is judged as you'd see it).
   - **Holding still:** it smooths strongly (`MARK_MIN_CUTOFF`).
@@ -531,7 +535,7 @@ All of these are plain constants at the top of their file. After changing the ve
 | `KEEPALIVE` | 0.25 s | If the UI hasn't asked for a frame this long, send one anyway |
 | `STATIC_EVERY` | 2 s | How often the layout is re-sent, so a reloaded UI picks it up |
 | `PING_EVERY` | 0.5 s | How often the vehicle tells the hub it's running, and what it's coupled to |
-| `MU_NOMINAL` | 1.0 | Assumed peak friction coefficient. Raise it for race tyres, lower it for gravel or snow |
+| `MU_NOMINAL` | 1.0 | Peak friction coefficient each axle's grip starts at, before it's learnt (see [Grip bar](#grip-bar)) |
 | `SLIP_PEAK` | 1.5 m/s | Slip speed that reads as 100 % grip |
 | `SLIP_LIMIT` | 2.0 m/s | Slip speed above which a tyre counts as sliding |
 | `SLIP_RELEASE` | 0.8 | Sliding clears below `SLIP_LIMIT` times this |
@@ -582,13 +586,18 @@ All of these are plain constants at the top of their file. After changing the ve
 | `PS_FRONT_START` / `PS_FRONT_FULL` | 2° / 4° | Powerslide: front slip into the turn where it starts to count, and fully |
 | `PS_PLOUGH_START` / `PS_PLOUGH_FULL` | 5° / 10° | Powerslide: this much more front slip than rear is ploughing (understeer), not a powerslide |
 | `PS_THROTTLE` | 0.2 | Powerslide: throttle from which it's under power |
-| `NEAR_ON` / `NEAR_OFF` | 0.56 / 0.46 | How near its limit an axle must be for its warning, and to clear it (1 = at the peak). Lower warns earlier |
-| `PAST_ON` | 1.0 | How near the front must be to count as past its peak (understeer, with the balance) |
+| `NEAR_ON` / `NEAR_OFF` | 0.60 / 0.50 | How near its limit an axle must be for its warning, and to clear it (1 = at the peak). Lower warns earlier |
+| `PAST_ON` / `PAST_OFF` | 0.95 / 0.85 | How near the front must be to count as at its peak (understeer), and to come back under it |
 | `LEAD` | 0.15 | How much nearer one end must be for its own warning, rather than *at the limit* |
 | `WARN_HOLD` | 0.12 s | How long an axle must stay near its limit before the warning shows |
 | `GRIP_RATIO_PEAK` | 0.42 | Force ÷ (stiffness × slip) at a tyre's peak: where proximity reads 1 |
 | `GRIP_MIN_SPEED` | 4 m/s | Below this the grip model stays out (fading in over the next 3 m/s) |
-| `CAL_AY_LO` / `CAL_AY_HI` | 1.0 / 2.5 m/s² | Cornering that counts towards learning the tyres' stiffness |
+| `CAL_AY_LO` / `CAL_AY_HI` | 1.0 / 3.5 m/s² | Cornering that counts towards learning the tyres' stiffness |
+| `CAL_BEND_SHARE` | 0.85 | The stiffness fit's starting guess for the tyre's early bend, as a share of a BeamNG-like (brush) tyre's |
+| `CAL_BEND_PRIOR` | 6 s | How much well-spread data that guess counts as |
+| `GRIP_LOAD_EXP` | 0.8 | A tyre's stiffness grows with its load to this power (and its share of the axle's force with it) |
+| `MU_TAU` | 1.5 s | Time at an axle's peak over which its grip (friction coefficient) is measured |
+| `OS_SLIDE_START` / `OS_SLIDE_FULL` | 0.21 / 0.35 rad | Rear slide (about 12° / 20°) from which it's oversteer whatever the front does (a spin), and fully |
 | `CAL_TAU` | 40 s | How much driving the learnt stiffness averages over |
 | `CAL_PRIOR_BNG` | 20 s | How much driving BeamNG's own calibration counts as, against what's learnt |
 | `CAL_READY` | 2.5 s | Cornering needed before a learnt stiffness is used |
@@ -651,7 +660,7 @@ The defaults suit a road car on tarmac. To tune them for a particular car or sur
 1. Click the app to turn on the numbers.
 2. Do a clean launch and a steady corner at the limit, and watch each corner's grip figure. It should reach about 100 % just as the car lets go.
 3. If it reaches 100 % (and the tyre turns pink) well before the car lets go, raise `SLIP_LIMIT` and `SLIP_PEAK`; if the car lets go first, lower them. Keep `SLIP_PEAK` a bit below `SLIP_LIMIT`.
-4. If the grip bars sit too high or too low in steady cornering, adjust `MU_NOMINAL`.
+4. The grip bars learn each axle's grip as you drive near the limit. If they sit too high or too low before that (a car on slicks, or on gravel, straight after spawning), adjust `MU_NOMINAL`, the grip they start from.
 5. Reload vehicle Lua (Ctrl+R) to apply the changes.
 
 Some background from BeamNG's own code that helps here: its tyres use a Stribeck friction model, where grip depends on how fast the contact patch is sliding (its slip speed), not on the slip angle as such. The default surface has a static friction of 1.0, a sliding friction of 0.7, and a Stribeck speed of 6 m/s (each tyre can scale that with `stribeckVelMult`), so grip falls away gradually over several m/s of slip. That's why the limit is set by slip speed. It also means the right values differ between tyres and surfaces, which is what the steps above are for. BeamNG's ABS aims for about 18 % slip ratio (`slipRatioTarget`), a useful check that the pink band ends in the right place.
@@ -716,7 +725,9 @@ If you've switched the console to the vehicle's own context instead, the same co
 
 ## Known limits
 
-- A learnt tyre stiffness starts again when the vehicle is spawned or reset (BeamNG's own calibration doesn't need learning). Until a few gentle bends have been driven, the warnings use fixed slip angles.
+- A learnt tyre stiffness and grip start again when the vehicle is spawned or reset (BeamNG's own calibration doesn't need learning). Until a few gentle bends have been driven, the warnings use fixed slip angles, and the grip bars assume a road tyre on tarmac until the car has been near its limit.
+- The grip is learnt per axle, not per surface: driving from tarmac onto gravel, the bars read low until the car has been near its limit on the gravel, and back on tarmac they read high for a while.
+- On very tall, heavy vehicles with grippy tyres, the inside tyres carry so little in a hard corner that the axle stiffens less than expected, and the warning comes early (about 75 % of the grip instead of 85 %). A truck's rear warning comes a little early too: the rear-most axle of a tandem works harder than the group.
 - With a trailer hitched, the trailer's pull on the hitch adds to the forces the grip model works out from the car's own mass, so the warnings can be a little off while towing hard through a corner.
 - Grip loss through bumps, kerbs or a change of surface shows as it happens, but a surface change also skews the learnt stiffness for a while (it averages over about 40 s of gentle cornering).
 - The drivetrain is mapped when the vehicle spawns or resets. Swapping a powertrain part reloads the vehicle, which re-maps it.
@@ -726,7 +737,52 @@ If you've switched the console to the vehicle's own context instead, the same co
 
 ## How it was tested
 
-Outside the game, against BeamNG 0.40's own scripts:
+Outside the game, against BeamNG 0.40's own scripts.
+
+### The 1.0 test fleet
+
+For 1.0 the real `vgsTelemetry.lua` was run, under LuaJIT 2.1 as in the game, inside a full four-wheel vehicle simulation, fed through the same `obj`, `electrics`, `wheels` and `controller` calls BeamNG gives it, and checked frame by frame against what the simulated tyres were really doing.
+
+**The simulation** (2000 Hz physics, graphics frames at an uneven 50–72 Hz):
+
+- every wheel's load, with weight transfer through the car's pitch and roll (front/rear roll stiffness), aero downforce, rough roads, kerbs and jumps; wheels can leave the ground;
+- tyres with combined slip (cornering and drive or braking at once), relaxation length and load sensitivity, in two families so nothing is tuned to one shape: a "magic formula" tyre, and a BeamNG-like tyre whose tread grips and slides like a brush, with its friction falling as it slides faster (Stribeck), as BeamNG's does;
+- each wheel spinning on its own, with drive, brakes (bias, handbrake, ABS) and rolling resistance;
+- the driveline: front, rear and all-wheel drive (fixed split with open, viscous, limited-slip or locked centre, or a motor per axle), each axle open, clutch limited-slip or locked (welded), power-limited torque, engine braking and traction control;
+- steering with Ackermann, hub nodes that vibrate as BeamNG's do, a noisy yaw rate, and BeamNG's stiffness calibration either present or absent.
+
+**The fleet**, 15 vehicles: a nose-heavy front-drive hatchback, a rear-drive saloon with a limited-slip diff, a 50/50 sports car, a mid-engined and a rear-engined car, a gravel rally car and a nose-heavy all-wheel-drive supercar, a tall pickup, a heavy front-drive van, a race car on slicks with downforce, a drift car with a welded diff and big lock, a locked 4×4 on all-terrain tyres, a dual-motor EV, a light roadster with an open diff, and a 6×4 truck with a tandem.
+
+**The manoeuvres**, 27 per vehicle: ramps of speed on a circle (left and right, tight and fast) until the car gives up, slowly wound-on steering, step steers (gentle, hard, and hard while coasting), the stability-control sine-with-dwell, lift-off, power-on, trail-braking and hard braking at 82 % of the grip mid-corner, a straight cruise (smooth and rough), cornering over a kerb, a jump, an ice patch and a rough road, straight-line braking, a standing start, a parking-speed U-turn and reversing, a slalom, and for rear- and all-wheel drive: held drifts at 25° and 40°, a drift lost into a spin, and donuts; for all-wheel drive, powerslides on gravel and tarmac.
+
+Every run was done three ways: with BeamNG's stiffness calibration, learning it after a short drive, and from a cold start (no calibration, nothing learnt yet): 844 runs and 656,000 frames. Then the same (with calibration and learnt; 1,032 runs, 790,000 frames) on a **held-out fleet** of 20 random vehicles (weight distribution, size, centre of gravity height, roll stiffness, tyre shape, grip, peak slip and load sensitivity, drivetrain, diffs, power, aero), none of which the tuning ever saw.
+
+**The truth** each frame comes straight from the simulated tyres. For each axle: how much more cornering force it could give if its slip grew (the share of its most force it's making now, and its slip against the slip of that most force), and its grip use counting drive and braking too (the friction circle). Near the limit is 85 % of the axle's grip (±6 %), past it is at the force's peak or plateau. Oversteer is the rear past its peak and further gone than the front, or sliding more than 12° (±4°). A drift is a slide caught with the front tyres nearly pointing where they're going; an all-wheel-drive powerslide is one with the front tyres slipping into the turn too. Driving straight, at a crawl and reversing are neutral. The display may trail the truth by 0.3 s.
+
+**Results**, state shown (understeer, oversteer, drift, powerslide, the warnings) against the truth:
+
+| | 2.5.1 | 1.0 |
+|---|---|---|
+| Test fleet: frames showing the right state | 89.5 % | 97.6 % |
+| ... false warnings while clearly within the grip | 6.9 % | 1.9 % |
+| ... missed, with an end clearly at or past its limit | 13.0 % | 1.3 % |
+| ... warning about the wrong end of the car | 0.4 % | 0.0 % |
+| Held-out fleet: frames showing the right state | 84.5 % | 94.9 % |
+| ... false warnings | 14.6 % | 4.8 % |
+| ... missed | 19.7 % | 1.4 % |
+| Grip bar: average error, test fleet | 7.7 % | 5.9 % |
+| Grip bar: average error, held-out fleet | 8.3 % | 7.2 % |
+
+The other measurements, in the same runs:
+
+- **Direction marker:** within 0.01° of the true turn in steady corners (median); 90 % of frames within 2.5° through step steers, lift-off and braking events and drifts.
+- **Drift angle** (numbers mode): within 0.2° in a held drift; a few degrees behind while a spin is building up quickly.
+- **Off the ground:** every wheel off the ground for more than 0.35 s (kerbs, jumps, a tall pickup lifting a wheel) was shown; on rough roads no wheel was ever shown off the ground falsely.
+- **Drivetrain:** the driven wheels were right for every vehicle in the fleet.
+
+What still trips it, in the simulation: very tall, heavy vehicles on grippy tyres, where load transfer leaves the inside tyre so light that the axle as a whole stiffens less than the formula expects (the warning comes at about 75 % instead of 85 %); a tandem's rear-most axle working harder than the group (a truck's rear warning comes early); and a front-drive car spinning a wheel on a rough road, which reads as nearer its limit than it is. With no calibration, until a few gentle bends have been driven, the fixed slip angles miss about 4 % of the frames at the limit.
+
+### Earlier tests (still run)
 
 - **The vehicle script, in a physics model of the car.** The real `vgsTelemetry.lua` runs under LuaJIT 2.1 (BeamNG's Lua) against a 2000 Hz single-track car model with non-linear tyres, steering compliance, a non-linear rack, yaw-rate noise and hub vibration. It's fed through the same `obj`, `electrics` and `wheels` calls as in the game.
   - The model covers 17 scenarios: hairpins, fast and highway corners, the limit, hard turn-in understeer, worn front tyres, lift-off and power oversteer, lane changes, slaloms, braking in a corner, trucks with tandems, a rear-engined car, drifts and spins.
@@ -745,6 +801,23 @@ Outside the game, against BeamNG 0.40's own scripts:
   - End-to-end rendering of the vehicle script's real output at five app sizes, with kg and lb.
 
 ## Changelog
+
+**1.0**
+
+The first full release: every measurement and every detection checked against a full four-wheel vehicle simulation, a 15-vehicle test fleet through 27 manoeuvres each, and a held-out fleet of 20 random vehicles (see [How it was tested](#how-it-was-tested)). Against 2.5.1, the right state now shows in 97.6 % of frames instead of 89.5 % (94.9 % instead of 84.5 % on vehicles the tuning never saw), with false warnings down from 6.9 % to 1.9 % and misses from 13.0 % to 1.3 %.
+
+- **Spins show.** The rear sliding past any tyre's peak (12–20°) is oversteer, whatever the front does. A full spin, with the front sliding too, used to show nothing.
+- **Understeer at the peak, not before it.** *Understeer* now means the front is at its peak, where more steering gives no more force. It used to come on at about three-quarters of the way there, so a car near but not past its limit read as understeer.
+- **The car's forces split right.** The sideways force each axle makes now allows for the tyres' drive and brake forces: a limited-slip or locked diff pushing the inside wheel, ESC braking one wheel, torque vectoring, and the sideways push of a steered wheel's drive or braking. It also allows for a tandem's axles fighting each other in a turn. Before, on a rear-drive car with a limited-slip diff, the rear looked about 10 % nearer its limit than it was, and the learnt front stiffness came out 30 % low.
+- **Tyre stiffness follows the load.** Each axle's expected stiffness follows the load its tyres carry right now (BeamNG's per-wheel load), so braking, load transfer and downforce aren't mistaken for the limit coming or going.
+- **Learning finds the true stiffness.** The fit follows the tyre's early bend, so cornering at up to a third of the grip gives the tyre's real starting stiffness. A straight line came out 10–25 % low on BeamNG-like tyres.
+- **The warnings retuned** to the new measurement: front or rear near its limit from about 85–90 % of its grip (`NEAR_ON` 0.60), understeer at the peak (`PAST_ON` 0.95).
+- **Grip bars:** each tyre's sideways force is its share of its axle's force (by load), its forward force comes from its drive and brake torques, and its grip is learnt per axle (raised whenever the axle uses more, measured at the axle's peak). Race slicks, all-terrain tyres and loose surfaces read right once the car has been near its limit. Average error down by about a quarter; a wheel shown off the ground reads empty at once.
+- **Quieter at a crawl:** stopping and pulling away no longer flash oversteer (the axles must be moving), but a donut still counts. The balance also clears when you select reverse.
+- `dumpTravel` also prints each axle's learnt grip.
+- Version numbering starts again at 1.0. The development builds before it were numbered 1.x to 2.5.1; what each added is below.
+
+### Development builds
 
 **2.5.1**
 
