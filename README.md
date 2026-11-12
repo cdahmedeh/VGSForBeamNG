@@ -4,9 +4,9 @@
 
 A live grip display for BeamNG.drive, inspired by the VGS (Visual Gravity System) in Enthusia Professional Racing. It shows what a simulator can't let you feel: how hard each tyre is working, when one lets go and how badly, where the car is really going against where you're steering, and whether it's the front or the rear that's giving up.
 
-![A one-minute tour: cornering to the limit, ABS, understeer, oversteer, a drift, a powerslide, ice, a launch with traction control, a kerb, a jump and a truck](docs/tour.gif)
+![A tour of 18 situations: cornering to the limit, ABS, understeer, oversteer, drifts, a powerslide, ice, traction control, ESC and ABS on snow, a split surface, a launch, a kerb, a jump, a part-time 4x4, a 6x6 locking its diffs and a truck](docs/tour.gif)
 
-*A one-minute tour through 14 situations, from a steady corner to a jump. This is the vehicle script's real output, recorded while it ran on simulated cars in the test simulation (see [How it was tested](#how-it-was-tested)) and played back through the app's own renderer. The simulation has no powertrain, so the engines and shafts are added from each car's layout.*
+*A tour of 18 situations, about a minute and a half. It includes traction control, ESC and ABS taking turns on snow, a car with its left wheels on tarmac and its right wheels on ice, a part-time 4x4 engaging four-wheel drive, and a 6x6 locking its transfer case and diffs one by one to get off the ice. This is the vehicle script's real output, recorded while it ran on simulated cars in the test simulation (see [How it was tested](#how-it-was-tested)) and played back through the app's own renderer.*
 
 Every wheel is drawn where it sits on the vehicle, with its grip in use, its slide, the torque through it and its steering angle. The drivetrain is drawn underneath, your inputs run around the rim, a G-force dot with a fading trail sits in the middle, and a small marker by the steering arc shows how much the car is actually turning, coloured for understeer and oversteer. When the car is off balance, the top of the circle says how, and by how many degrees.
 
@@ -1340,6 +1340,7 @@ It follows the same idea: a top-down car whose tyres show how hard they're worki
 
 - A learnt tyre stiffness and grip start again when the vehicle is spawned or reset (BeamNG's own calibration doesn't need learning). Until a few gentle bends have been driven, the warnings use fixed slip angles, and the grip bars assume a road tyre on tarmac until the car has been near its limit.
 - The grip is learnt per axle, not per surface: driving from tarmac onto gravel, the bars read low until the car has been near its limit on the gravel, and back on tarmac they read high for a while.
+- For the same reason it isn't learnt per wheel. With one side of the car on ice, a tyre rolling on the ice reads short, even when it's at its own limit. What does show per wheel is everything that comes from the tyre's own slip: a wheel spinning or locking on the ice turns pink or red and gets its own ABS or traction-control dot, while the wheels on tarmac stay white. The split-surface scene in the tour shows both.
 - On very tall, heavy vehicles with grippy tyres, the inside tyres carry so little in a hard corner that the axle stiffens less than expected, and the warning comes early (about 75 % of the grip instead of 85 %). A truck's rear warning comes a little early too: the rear-most axle of a tandem works harder than the group.
 - With a trailer hitched, the trailer's pull on the hitch adds to the forces the grip model works out from the car's own mass, so the warnings can be a little off while towing hard through a corner.
 - Grip loss through bumps, kerbs or a change of surface shows as it happens, but a surface change also skews the learnt stiffness for a while (it averages over about 40 s of gentle cornering).
@@ -1596,7 +1597,13 @@ The first full release: every measurement and every detection checked against a 
 
 The images in this README are drawn by the mod's own renderer (`app.js`), fed with example data, so they look exactly as the app does in game. The vehicles are modelled on BeamNG vehicle types, with real wheel positions and sizes taken from their files for the school bus and dump truck. In the driving lessons, the tyres, inputs, G-force and balance are set by hand to show each situation as it typically looks; the friction-circle picture is a plain diagram.
 
-- `docs/tour.gif`: the one-minute tour. Unlike the still pictures, it isn't set by hand. The vehicle script ran on 10 cars of the simulated test fleet through 14 of the test manoeuvres, and every update it sent was recorded. The recordings were then played back through the app's own data store and renderer on a virtual clock, so the smoothing, the state holds, the pulses and the G-force trail behave as they do in game. The engines and shafts are added from each car's layout, because the simulation has no powertrain. The traction-control dot on the engine follows the script's traction-control flag.
+- `docs/tour.gif`: the tour. Unlike the still pictures, it isn't set by hand. The vehicle script ran on simulated vehicles from the test fleet through 18 manoeuvres: 14 of the test manoeuvres and 4 written for the tour. Every update it sent was recorded. For the tour, the simulation also gives the script things BeamNG would provide:
+  - a BeamNG-style powertrain (engine, gearbox, transfer case, differentials, disconnectable shafts and hubs) to map, so the drivetrain, the lock states and the traction-control dot on the engine come from the script itself;
+  - a classic ESC that brakes single wheels;
+  - a different surface under each wheel;
+  - locks and four-wheel drive that switch mid-run.
+
+  The 6x6 is laid out like the midtruck's 6x6 configurations: a front axle and a driven tandem, a lockable transfer case, and front and rear diff locks. The simulation's ABS, traction control and ESC are simple stand-ins for BeamNG's, so they act a little differently from the real ones. The recordings were played back through the app's own data store and renderer on a virtual clock, so the smoothing, the state holds, the pulses and the G-force trail behave as they do in game.
 - `docs/overview.png`: the labelled overview, with a key to the direction marker's states.
 - `docs/wheel-states.png`, `docs/slide-colour.png`: the wheel legend.
 - `docs/steering-scale.png`: the steering scale, straight and stretched with speed, with steering and turning values from the simulated scenarios.
