@@ -2,7 +2,7 @@
 
 *Version 1.20*
 
-A live grip display for BeamNG.drive, inspired by the VGS (Visual Gravity System) in Enthusia Professional Racing. It shows what a simulator can't let you feel: how hard each tyre is working, when one lets go and how badly, where the car is really going against where you're steering, and whether it's the front or the rear that's giving up.
+A live grip and G-force display for BeamNG.drive, inspired by the VGS (Visual Gravity System) in Enthusia Professional Racing. It shows what a simulator can't let you feel: the G-forces that press you into the seat as the car brakes, accelerates and corners, how hard each tyre is working, when one lets go and how badly, where the car is really going against where you're steering, and whether it's the front or the rear that's giving up.
 
 ![A tour of 18 situations: cornering to the limit, ABS, understeer, oversteer, drifts, a powerslide, ice, traction control, ESC and ABS on snow, a split surface, a launch, a kerb, a jump, a part-time 4x4, a 6x6 locking its diffs and a truck](docs/tour.gif)
 
@@ -89,15 +89,17 @@ Every wheel is drawn where it sits on the vehicle, with its grip in use, its sli
 
 ## What it is, and why
 
-In a real car you feel the limit long before you see it. The steering goes light when the front tyres start to slide, the seat tells you the rear is stepping out, and your body feels the weight pile onto the nose under braking. A simulator can give you some of that through a force-feedback wheel, but most of it is lost, and with a pad or keyboard almost all of it is.
+In a real car you feel the limit long before you see it, and much of that feel comes through the seat of your pants. The G-forces push you into the seat, the belts and the side bolsters. They tell you how hard the car is braking, accelerating and cornering, and where its weight is going: onto the nose under braking, onto the outside wheels in a corner. When they stop building as you add steering, the front has given up. When they suddenly swing, the rear is stepping out. The steering adds the rest: it goes light when the front tyres start to slide.
+
+A simulator loses most of this. A force-feedback wheel can give back some of the steering feel, but without a motion rig nothing presses you into the seat, so the G-forces, the biggest part, are gone entirely. With a pad or keyboard, almost everything is.
 
 Enthusia Professional Racing (2005) answered that with the VGS, a small diagram of the car that showed the weight moving and the tyres working. This mod brings the idea to BeamNG.drive, which has a full soft-body physics model with real tyres, so there is a great deal to show:
 
+- **The G-forces you'd feel in the seat**: how hard the car is braking, accelerating and cornering, where the weight is moving, and wheels going light or leaving the ground.
 - **How hard each tyre is working**, and the moment it goes past its limit.
 - **How badly it's sliding**, from "just over" (pink, ease off now) to locked or spinning (deep red).
 - **Which end of the car is giving up**: a warning before the front runs wide or the rear lets go, then understeer, oversteer, a held drift or a powerslide, with how many degrees it's out by.
 - **Where the car is really going** against where you're steering, so you know where to point the wheels to catch a slide.
-- **Where the weight is**: the G-force you'd feel, and wheels going light or leaving the ground.
 - **What the car is doing for you**: ABS, ESC and traction control, wheel by wheel, and the drivetrain, live.
 
 It's a tool for learning to drive at the limit (threshold braking, trail braking, catching slides, balancing a car on the throttle), for understanding and setting up a car, and for checking that a vehicle does what you think it does. See [Using it to drive better](#using-it-to-drive-better).
@@ -106,6 +108,7 @@ It's a tool for learning to drive at the limit (threshold braking, trail braking
 
 - **Every wheel, to scale.** Grip in use, slides graded from "just over the limit" to "locked", drive and braking torque, live steering angle, flats and broken wheels. Cars, trucks with tandems and duals, three-wheelers, buses, tractor-trailers and articulated rigs.
 - **Understeer and oversteer you can see.** A direction marker by the steering arc shows how much the car is really turning, and how near each end is to its limit, judged against the car's own tyres: BeamNG's stability-control calibration where the car has one, learnt while you drive where it doesn't. It warns in yellow before the front runs wide or the rear lets go, turns orange-red in real understeer, and swings out to the countersteer target in pink-magenta when the rear slides. A drift you're holding in control turns aquamarine instead. A band shows the gap to your steering, and each colour is held long enough to read. It's readable at highway and track speeds too.
+- **The G-forces you'd feel.** A G-force dot with a fading trail shows what the seat of your pants would tell you: braking, accelerating and cornering forces and where the weight is moving. Measured from the physics, it follows a turn-in within about 35 ms and stays steady over a rough road.
 - **The balance in words and degrees.** Whenever the car is off balance, the top of the circle says so: *Front near limit*, *Rear near limit*, *At the limit*, *Understeer* or *Oversteer* with how many degrees it's out by, *Drift* with the drift angle, or *Powerslide* with how far the rear is sliding.
 - **Driver assists.** ABS, ESC and traction control per wheel and per engine, for both BeamNG's classic assist script and its newer driving-dynamics electronics.
 - **The drivetrain, live.** Engines, motors, gearbox and differentials where they sit, shafts tinted by torque, diff lock state, disconnectable shafts, part-time 4WD, broken driveshafts.
@@ -464,7 +467,7 @@ Dual tyres draw side by side with a small gap. BeamNG vehicles report them in th
 
 # Using it to drive better
 
-Every driving skill that matters at the limit comes down to one question: **how much of each tyre's grip am I using, and for what?** In a real car you answer it through the seat and the steering. Here you can see it. This part goes through the classic skills one by one, with what each looks like on the display, what to do, and what going wrong looks like.
+Every driving skill that matters at the limit comes down to one question: **how much of each tyre's grip am I using, and for what?** In a real car you answer it through the G-forces in the seat and the feel of the steering. Here you can see it. This part goes through the classic skills one by one, with what each looks like on the display, what to do, and what going wrong looks like.
 
 The pictures are drawn by the mod's own renderer. Each strip reads left to right through one manoeuvre, or side by side as alternatives. The yellow trail behind the G-force dot shows where it's been over the last moment.
 
