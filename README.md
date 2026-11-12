@@ -4,9 +4,9 @@
 
 A live grip and G-force display for BeamNG.drive, inspired by the VGS (Visual Gravity System) in Enthusia Professional Racing. It shows what a simulator can't let you feel: the G-forces that press you into the seat as the car brakes, accelerates and corners, how hard each tyre is working, when one lets go and how badly, where the car is really going against where you're steering, and whether it's the front or the rear that's giving up.
 
-![A tour of 18 situations: cornering to the limit, ABS, understeer, oversteer, drifts, a powerslide, ice, traction control, ESC and ABS on snow, a split surface, a launch, a kerb, a jump, a part-time 4x4, a 6x6 locking its diffs and a truck](docs/tour.gif)
+![A tour of 18 situations: cornering to the limit, ABS, understeer, oversteer, drifts, a powerslide, ice, per-wheel traction control with ESC and ABS on snow, a split surface, a launch, a kerb, a jump, a part-time 4x4, a 6x6 locking its diffs and a truck](docs/tour.gif)
 
-*A tour of 18 situations, about a minute and a half. It includes traction control, ESC and ABS taking turns on snow, a car with its left wheels on tarmac and its right wheels on ice, a part-time 4x4 engaging four-wheel drive, and a 6x6 locking its transfer case and diffs one by one to get off the ice. This is the vehicle script's real output, recorded while it ran on simulated cars in the test simulation (see [How it was tested](#how-it-was-tested)) and played back through the app's own renderer.*
+*A tour of 18 situations, about a minute and a half. It includes per-wheel traction control, ESC and ABS taking turns on snow (traction control braking only the front wheel on an ice patch), a car with its left wheels on tarmac and its right wheels on ice, a part-time 4x4 engaging four-wheel drive, and a 6x6 locking its transfer case and diffs one by one to get off the ice. This is the vehicle script's real output, recorded while it ran on simulated cars in the test simulation (see [How it was tested](#how-it-was-tested)) and played back through the app's own renderer.*
 
 Every wheel is drawn where it sits on the vehicle, with its grip in use, its slide, the torque through it and its steering angle. The drivetrain is drawn underneath, your inputs run around the rim, a G-force dot with a fading trail sits in the middle, and a small marker by the steering arc shows how much the car is actually turning, coloured for understeer and oversteer. When the car is off balance, the top of the circle says how, and by how many degrees.
 
@@ -1602,7 +1602,7 @@ The images in this README are drawn by the mod's own renderer (`app.js`), fed wi
 
 - `docs/tour.gif`: the tour. Unlike the still pictures, it isn't set by hand. The vehicle script ran on simulated vehicles from the test fleet through 18 manoeuvres: 14 of the test manoeuvres and 4 written for the tour. Every update it sent was recorded. For the tour, the simulation also gives the script things BeamNG would provide:
   - a BeamNG-style powertrain (engine, gearbox, transfer case, differentials, disconnectable shafts and hubs) to map, so the drivetrain, the lock states and the traction-control dot on the engine come from the script itself;
-  - a classic ESC that brakes single wheels;
+  - BeamNG's newer driving-dynamics assists (per-wheel traction control that brakes each spinning wheel, ESC and ABS), as on the Vivace;
   - a different surface under each wheel;
   - locks and four-wheel drive that switch mid-run.
 
