@@ -4,9 +4,9 @@
 
 A live grip and G-force display for BeamNG.drive, inspired by the VGS (Visual Gravity System) in Enthusia Professional Racing. It shows what a simulator can't let you feel: the G-forces that press you into the seat as the car brakes, accelerates and corners, how hard each tyre is working, when one lets go and how badly, where the car is really going against where you're steering, and whether it's the front or the rear that's giving up.
 
-![A tour of 18 situations: cornering to the limit, ABS, understeer, oversteer, drifts, a powerslide, ice, per-wheel traction control with ESC and ABS on snow, a split surface, a launch, a kerb, a jump, a part-time 4x4, a 6x6 locking its diffs and a truck](docs/tour.gif)
+![A tour of 20 situations: cornering to the limit, tripod mode, ABS, understeer, oversteer, drifts, a powerslide, ice, per-wheel traction control with ESC and ABS on snow, a split surface, a launch, a kerb, a jump, a part-time 4x4, an on-demand all-wheel-drive minivan, a 6x6 locking its diffs and a truck](docs/tour.gif)
 
-*A tour of 18 situations, about a minute and a half. It includes per-wheel traction control, ESC and ABS taking turns on snow (traction control braking only the front wheel on an ice patch), a car with its left wheels on tarmac and its right wheels on ice, a part-time 4x4 engaging four-wheel drive, and a 6x6 locking its transfer case and diffs one by one to get off the ice. This is the vehicle script's real output, recorded while it ran on simulated cars in the test simulation (see [How it was tested](#how-it-was-tested)) and played back through the app's own renderer.*
+*A tour of 20 situations, a little under two minutes. It includes a compact front-drive car cornering on three wheels ("tripod mode"), per-wheel traction control, ESC and ABS taking turns on snow (traction control braking only the front wheel on an ice patch), a car with its left wheels on tarmac and its right wheels on ice, a part-time 4x4 engaging four-wheel drive, an on-demand all-wheel-drive minivan whose rear axle comes in when the fronts slip or the car turns (more to the outside wheel), and a 6x6 locking its transfer case and diffs one by one to get off the ice. This is the vehicle script's real output, recorded while it ran on simulated cars in the test simulation (see [How it was tested](#how-it-was-tested)) and played back through the app's own renderer.*
 
 Every wheel is drawn where it sits on the vehicle, with its grip in use, its slide, the torque through it and its steering angle. The drivetrain is drawn underneath, your inputs run around the rim, a G-force dot with a fading trail sits in the middle, and a small marker by the steering arc shows how much the car is actually turning, coloured for understeer and oversteer. When the car is off balance, the top of the circle says how, and by how many degrees.
 
@@ -698,6 +698,8 @@ Which axle runs out depends on the car and on what you add:
 - **Blue:** off the ground. With two wheels up, the vehicle is balancing on the other two.
 
 **What to do:** unwind the steering smoothly and ease off. A sudden steering correction, or braking hard while on two wheels, can tip it further. A wheel showing pale blue also has very little grip: in a corner, the outside tyres are doing nearly all the work.
+
+Some compact front-drive cars do this on purpose: stiff at the rear, they lift the inside rear wheel in a hard corner and run on three wheels ("tripod mode"). The inside rear goes pale blue, then blue, while the car carries on round the corner; with the load on the outside wheels and the fronts doing the driving, that's normal for those cars. The tour at the top shows one.
 
 The same pale blue shows other load changes: the rear wheels of a car braking hard, the front of a powerful car launching, a wheel at full suspension droop on rough ground, or diagonally opposite wheels on an off-road vehicle crossing a ditch.
 
@@ -1600,11 +1602,12 @@ The first full release: every measurement and every detection checked against a 
 
 The images in this README are drawn by the mod's own renderer (`app.js`), fed with example data, so they look exactly as the app does in game. The vehicles are modelled on BeamNG vehicle types, with real wheel positions and sizes taken from their files for the school bus and dump truck. In the driving lessons, the tyres, inputs, G-force and balance are set by hand to show each situation as it typically looks; the friction-circle picture is a plain diagram.
 
-- `docs/tour.gif`: the tour. Unlike the still pictures, it isn't set by hand. The vehicle script ran on simulated vehicles from the test fleet through 18 manoeuvres: 14 of the test manoeuvres and 4 written for the tour. Every update it sent was recorded. For the tour, the simulation also gives the script things BeamNG would provide:
+- `docs/tour.gif`: the tour. Unlike the still pictures, it isn't set by hand. The vehicle script ran on simulated vehicles from the test fleet through 20 manoeuvres: 14 of the test manoeuvres and 6 written for the tour. Every update it sent was recorded. For the tour, the simulation also gives the script things BeamNG would provide:
   - a BeamNG-style powertrain (engine, gearbox, transfer case, differentials, disconnectable shafts and hubs) to map, so the drivetrain, the lock states and the traction-control dot on the engine come from the script itself;
   - BeamNG's newer driving-dynamics assists (per-wheel traction control that brakes each spinning wheel, ESC and ABS), as on the Vivace;
   - a different surface under each wheel;
-  - locks and four-wheel drive that switch mid-run.
+  - locks and four-wheel drive that switch mid-run;
+  - an on-demand all-wheel drive: a rear coupling that engages when the fronts slip, in a turn or pulling away, and a twin-clutch rear axle that sends more of it to the outside wheel.
 
   The 6x6 is laid out like the midtruck's 6x6 configurations: a front axle and a driven tandem, a lockable transfer case, and front and rear diff locks. The simulation's ABS, traction control and ESC are simple stand-ins for BeamNG's, so they act a little differently from the real ones. The recordings were played back through the app's own data store and renderer on a virtual clock, so the smoothing, the state holds, the pulses and the G-force trail behave as they do in game.
 - `docs/overview.png`: the labelled overview, with a key to the direction marker's states.
