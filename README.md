@@ -4,11 +4,15 @@
 
 A live grip display for BeamNG.drive, inspired by the VGS (Visual Gravity System) in Enthusia Professional Racing. It shows what a simulator can't let you feel: how hard each tyre is working, when one lets go and how badly, where the car is really going against where you're steering, and whether it's the front or the rear that's giving up.
 
+![A one-minute tour: cornering to the limit, ABS, understeer, oversteer, a drift, a powerslide, ice, a launch with traction control, a kerb, a jump and a truck](docs/tour.gif)
+
+*A one-minute tour through 14 situations, from a steady corner to a jump. This is the vehicle script's real output, recorded while it ran on simulated cars in the test simulation (see [How it was tested](#how-it-was-tested)) and played back through the app's own renderer. The simulation has no powertrain, so the engines and shafts are added from each car's layout.*
+
 Every wheel is drawn where it sits on the vehicle, with its grip in use, its slide, the torque through it and its steering angle. The drivetrain is drawn underneath, your inputs run around the rim, a G-force dot with a fading trail sits in the middle, and a small marker by the steering arc shows how much the car is actually turning, coloured for understeer and oversteer. When the car is off balance, the top of the circle says how, and by how many degrees.
 
-![The display mid-corner, with every element labelled](docs/overview.png)
+![The display mid-corner, with every element labelled, and a key to the direction marker's states](docs/overview.png)
 
-*Above: a front-engined, rear-drive car turning left on the power. The inside rear tyre has just gone past its limit (pink), the drive wheels have green outlines, the steering sits just past the light-blue direction marker (the front tyres are working well), and the G-force dot is pushed right and slightly back.*
+*Above: a front-engined, rear-drive car turning left on the power. The inside rear tyre has just gone past its limit (pink), the drive wheels have green outlines, and the G-force dot is pushed right and slightly back. The steering runs just past the yellow direction marker: the front is near its limit, slipping 1.7° more than the rear, as the balance at the top says. The key underneath explains each state the marker and the balance can show.*
 
 ## Contents
 
@@ -1592,7 +1596,8 @@ The first full release: every measurement and every detection checked against a 
 
 The images in this README are drawn by the mod's own renderer (`app.js`), fed with example data, so they look exactly as the app does in game. The vehicles are modelled on BeamNG vehicle types, with real wheel positions and sizes taken from their files for the school bus and dump truck. In the driving lessons, the tyres, inputs, G-force and balance are set by hand to show each situation as it typically looks; the friction-circle picture is a plain diagram.
 
-- `docs/overview.png`: the labelled overview.
+- `docs/tour.gif`: the one-minute tour. Unlike the still pictures, it isn't set by hand. The vehicle script ran on 10 cars of the simulated test fleet through 14 of the test manoeuvres, and every update it sent was recorded. The recordings were then played back through the app's own data store and renderer on a virtual clock, so the smoothing, the state holds, the pulses and the G-force trail behave as they do in game. The engines and shafts are added from each car's layout, because the simulation has no powertrain. The traction-control dot on the engine follows the script's traction-control flag.
+- `docs/overview.png`: the labelled overview, with a key to the direction marker's states.
 - `docs/wheel-states.png`, `docs/slide-colour.png`: the wheel legend.
 - `docs/steering-scale.png`: the steering scale, straight and stretched with speed, with steering and turning values from the simulated scenarios.
 - `docs/inputs-gforce.png`, `docs/travel.png`: inputs (including the clutch and handbrake), G-force, and the direction marker.
