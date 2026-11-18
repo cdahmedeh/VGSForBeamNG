@@ -1,6 +1,6 @@
 # VGS Display for BeamNG.drive
 
-*Version 1.20*
+*Version 1.21*
 
 A live grip and G-force display for BeamNG.drive, inspired by the VGS (Visual Gravity System) in Enthusia Professional Racing. It shows what a simulator can't let you feel: the G-forces that press you into the seat as the car brakes, accelerates and corners, how hard each tyre is working, when one lets go and how badly, where the car is really going against where you're steering, and whether it's the front or the rear that's giving up.
 
@@ -112,7 +112,7 @@ It's a tool for learning to drive at the limit (threshold braking, trail braking
 - **The balance in words and degrees.** Whenever the car is off balance, the top of the circle says so: *Front near limit*, *Rear near limit*, *At the limit*, *Understeer* or *Oversteer* with how many degrees it's out by, *Drift* with the drift angle, or *Powerslide* with how far the rear is sliding.
 - **Driver assists.** ABS, ESC and traction control per wheel and per engine, for both BeamNG's classic assist script and its newer driving-dynamics electronics.
 - **The drivetrain, live.** Engines, motors, gearbox and differentials where they sit, shafts tinted by torque, diff lock state, disconnectable shafts, part-time 4WD, broken driveshafts.
-- **Low latency.** Each vehicle sends its data straight to the app, exactly once per UI frame, using the same handshake BeamNG's own gauges use. The app draws once per screen refresh, carrying moving parts on smoothly between updates. In the simulation, through a slalom, the marker, the G-force dot and the grip bars trail the physics by 10 ms or less.
+- **Low latency.** The vehicle you're driving sends its data straight to the app, exactly once per UI frame, using the same handshake BeamNG's own gauges use. The app draws once per screen refresh, carrying moving parts on smoothly between updates. In the simulation, through a slalom, the marker, the G-force dot and the grip bars trail the physics by 10 ms or less.
 - **Tested against the physics.** Version 1.0 was checked frame by frame against a full four-wheel vehicle simulation: 35 vehicles (front, rear and all-wheel drive, nose- and tail-heavy, trucks, slicks to all-terrain tyres) through 27 manoeuvres each, from gentle cornering to spins. See [How it was tested](#how-it-was-tested).
 
 ## Install
@@ -450,7 +450,7 @@ Everything is drawn to scale, from measurements taken when the vehicle spawns:
 - **Wheels** sit at their real positions, including any `wheelOffset`. Each tyre is drawn at its real diameter and at 1.5 times its real width so it's easy to see (`TYRE_WIDEN`). A wheel with no tyre, such as the Ibishu Pigeon's stabiliser wheels, is drawn at the size of its hub. Very small wheels are kept at least a few pixels across.
 - **The outline** is the vehicle's real body: the extent of all its nodes, seen from above. It's kept symmetric about the middle of the axles. Anything that sticks out on one side only, such as a haul truck's left mirror and railing, a ladder or an exhaust stack, is trimmed back to match the other side, so the wheels stay centred. Front and rear overhangs are kept as they are.
 - **The circle** is always the same size: it fills the app. The vehicle is scaled to fit inside it, clear of the input arcs and the balance band at the top, with room for its tyres at full steering lock.
-- **Coupled vehicles** (trailers, dollies, separately spawned bus sections) are drawn as separate outlined boxes stacked front to back, all at the same scale, shrunk to fit inside the circle. They're found from BeamNG's own record of each vehicle's attached couplers, its trailer register and its coupler events, so a trailer hitched before you opened the app shows straight away. A coupled vehicle that stops sending data (deleted, or out of range) is dropped after 1.5 s. Coupled vehicles show their wheels, slides and assists; the marker and the balance words are for the vehicle you're driving.
+- **Coupled vehicles** (trailers, dollies, separately spawned bus sections) are drawn as separate outlined boxes stacked front to back, all at the same scale, shrunk to fit inside the circle. They're found from BeamNG's own record of each vehicle's attached couplers, its trailer register and its coupler events, so a trailer hitched before you opened the app shows straight away. Coupled vehicles send their data through the game-engine hub, about 30 times a second (see [Performance and latency](#performance-and-latency)). A coupled vehicle that stops sending data (deleted, or out of range) is dropped after 1.5 s. Coupled vehicles show their wheels, slides and assists; the marker and the balance words are for the vehicle you're driving.
 - **A trailer** with its axles at the back shows its long empty front section, whether you're driving the tractor or have switched to the trailer itself.
 
 ### Dual tyres
@@ -829,8 +829,8 @@ This part is for the curious, and for anyone tuning the settings. Nothing here i
 
 | File | Runs in | What it does |
 |---|---|---|
-| `lua/vehicle/extensions/vgsTelemetry.lua` | Each displayed vehicle | Measures the wheel layout, body outline, mass and centre of gravity once, and maps the drivetrain. Then, every graphics frame, it works out each wheel's grip, slide, torque, steering and assists, the inputs, the G-force, the direction of travel and the balance. Whenever the UI is ready for a frame, it sends them straight to the app as the `VGSData` UI hook. |
-| `lua/ge/extensions/vgsHub.lua` | The game engine | Finds the vehicle you're driving and everything coupled to it, and keeps the telemetry running on exactly those. Four times a second it tells the app which vehicles make up the player's chain (`VGSChain`), which also tells it the game is still there while paused. It passes the app's requests to the vehicles (the balance's values on or off, resend the layout) and has the [console commands](#console-commands). |
+| `lua/vehicle/extensions/vgsTelemetry.lua` | Each displayed vehicle | Measures the wheel layout, body outline, mass and centre of gravity once, and maps the drivetrain. Then, every graphics frame, it works out each wheel's grip, slide, torque, steering and assists, the inputs, the G-force, the direction of travel and the balance. The vehicle you're driving sends them straight to the app as the `VGSData` UI hook, whenever the UI is ready for a frame; any other vehicle in the chain (a trailer, a dolly) sends them through the hub instead, about 30 times a second. |
+| `lua/ge/extensions/vgsHub.lua` | The game engine | Finds the vehicle you're driving and everything coupled to it, and keeps the telemetry running on exactly those. Four times a second it tells the app which vehicles make up the player's chain (`VGSChain`), which also tells it the game is still there while paused. It passes the updates of every vehicle in the chain other than the one you're driving on to the app, as they came. It passes the app's requests to the vehicles (the balance's values on or off, resend the layout) and has the [console commands](#console-commands). |
 | `ui/modules/apps/VGSDisplay/app.js` | The UI | Keeps each vehicle's layout and latest data, puts the chain in order front to back, lays everything out and draws it on a canvas once per screen refresh. The renderer has no BeamNG dependencies, so the same file also runs in a plain browser (that's how the images in this README are made). |
 | `ui/modules/apps/VGSDisplay/app.json`, `app.png` | The UI | The app's name, category, default size and icon. |
 
@@ -996,7 +996,8 @@ The result isn't exact, but every part stays visible. Disconnect diamonds go on 
 
 The display is built to add as little delay as possible between the physics and what you see:
 
-- **One hop.** Each vehicle sends its data straight to the app as a UI hook from its own Lua. Before 2.0 it went through the game-engine Lua first, which added a frame and a second round of encoding.
+- **One hop.** The vehicle you're driving sends its data straight to the app as a UI hook from its own Lua. Before 2.0 it went through the game-engine Lua first, which added a frame and a second round of encoding.
+- **Coupled vehicles through the hub.** BeamNG only reliably delivers a vehicle's own UI messages from the vehicle you're driving. From the others (a trailer, a dolly, the tractor while you're in the trailer) they get through for a moment after a switch or a coupling, then stop. So every other vehicle in the chain sends through the game-engine hub, which passes the message on as it came, with no decoding. That costs them a frame. The UI never asks those vehicles for a frame, so they send at a steady rate instead, about 30 times a second (`COUPLED_HZ`), and the app carries their motion on smoothly between updates. When you switch vehicles, the routes swap by themselves.
 - **No backlog.** BeamNG's UI acknowledges each frame it has drawn, and BeamNG's own gauges only send when it has (`obj:getUpdateUIflag()`). The display does the same, so every update it sends is drawn straight away. When the game runs faster than the UI there's no queue of stale updates building up, and when the game runs slower every frame still gets an update. If the UI stops asking for a while, a keep-alive update goes out four times a second.
 - **No filter delay that can be avoided.** Each readout is measured from the quickest clean signal there is, and only smoothed where noise would otherwise show (see the G-force dot, the direction marker and the grip bar). In the simulation, through a slalom and a sine-with-dwell:
 
@@ -1055,6 +1056,7 @@ The defaults suit almost everything, and the display was tuned against a large s
 | `FALLBACK_HZ` | 60 | Update rate if the game doesn't report when the UI wants a frame |
 | `KEEPALIVE` | 0.25 s | If the UI hasn't asked for a frame this long, send one anyway |
 | `STATIC_EVERY` | 2 s | How often the layout is re-sent, so a reloaded UI picks it up |
+| `COUPLED_HZ` | 30 | Update rate of the vehicles in the chain you aren't driving (sent through the hub). At some frame rates it comes out a little lower (24 at 72 fps), since updates go out on whole frames |
 | `PING_EVERY` | 0.5 s | How often the vehicle tells the hub it's running, and what it's coupled to |
 
 **Grip bars and slides**
@@ -1287,6 +1289,8 @@ BeamNG's tyres grip according to how fast the contact patch is sliding, and the 
 
 **A trailer doesn't appear.** It should show within half a second of hitching, including one hitched before you opened the app. If not, unhitch and re-hitch once.
 
+**Trailers show for a second, then disappear** (version 1.20 and older). BeamNG stops delivering the UI messages of vehicles you aren't in. Update to 1.21, which sends them through the game-engine hub instead. Afterwards, `extensions.vgsHub.state().pings` should show every vehicle in the chain counting up.
+
 **Dual tyres don't show, or show wrongly.** Run `extensions.load("vgsHub") extensions.vgsHub.dumpWheels()`. The widths and groups show which rule needs adjusting.
 
 **The drivetrain looks wrong.** Run `extensions.load("vgsHub") extensions.vgsHub.dumpDrivetrain()`. It lists every powertrain device, then each part the display draws, its differential type and lock state, and the disconnectable shafts.
@@ -1454,6 +1458,10 @@ What still trips it, in the simulation: very tall, heavy vehicles on grippy tyre
   - End-to-end rendering of the vehicle script's real output at five app sizes.
 
 ## Changelog
+
+**1.21**
+
+- **Coupled vehicles stay on the display.** Trailers, dollies and the other vehicles in a chain showed for about a second after coupling or switching vehicles, then disappeared, leaving only the vehicle you were driving. BeamNG only reliably delivers a vehicle's own UI messages from the vehicle the player is in. Every other vehicle in the chain now sends through the game-engine hub, which always gets through, at about 30 updates a second. Before, they sent only four times a second, because the UI never asks them for a frame. The vehicle you're driving still sends straight to the app, so its latency is unchanged.
 
 **1.20**
 

@@ -25,6 +25,7 @@ local M = {}
 local MAX_SEND_HZ      = 0     -- 0: one update per UI frame (lowest latency, no queueing); else a cap
 local FALLBACK_HZ      = 60    -- update rate if the game doesn't report when the UI wants a frame
 local KEEPALIVE        = 0.25  -- s: send anyway if the UI hasn't asked for this long
+local COUPLED_HZ       = 30    -- update rate of a vehicle the player isn't in (a trailer, a dolly), sent through the hub
 local STATIC_EVERY     = 2     -- s: the layout is re-sent this often (a reloaded UI picks it up)
 local PING_EVERY       = 0.5   -- s: liveness and couplings, to the game-engine hub
 -- Grip. BeamNG doesn't expose a "friction used" figure per tyre, so grip use is an estimate:
@@ -1923,11 +1924,22 @@ end
 
 -- ===== Sending =============================================================
 
+-- Is the player in this vehicle? BeamNG only reliably delivers a vehicle's own UI messages from
+-- the vehicle the player is in: from the others (a trailer, a dolly, the tractor while you're in
+-- the trailer) they get through for a moment after a switch or a coupling, then stop. So only
+-- the player's vehicle sends straight to the UI; the others send through the game-engine hub,
+-- which always gets through, one frame later. Unknown (an older game): straight to the UI.
+local function playerVehicle()
+  if type(playerInfo) ~= "table" or playerInfo.firstPlayerSeated == nil then return true end
+  return playerInfo.firstPlayerSeated == true
+end
+
 local function transmit(payload)
-  if guihooks and guihooks.trigger then
-    guihooks.trigger('VGSData', payload)          -- straight to the UI, no game-engine hop
-  else                                            -- older game versions: through the hub
-    obj:queueGameEngineLua(string.format("if extensions.vgsHub then extensions.vgsHub.onVehicleJson(%q) end", jsonEncode(payload)))
+  if guihooks and guihooks.trigger and playerVehicle() then
+    guihooks.trigger('VGSData', payload)          -- the player's vehicle: straight to the UI, no hop
+  else                                            -- any other vehicle (and older games): through the hub
+    obj:queueGameEngineLua(string.format("if extensions.vgsHub then extensions.vgsHub.onVehicleRaw(%d, %q) end",
+      obj:getId(), jsonEncode(payload)))
   end
 end
 
@@ -1958,6 +1970,8 @@ end
 -- then means every update is drawn at once, with no backlog building up when the game runs
 -- faster than the UI.
 local function uiWantsFrame()
+  -- the UI never asks a vehicle the player isn't in for a frame: send at a steady rate instead
+  if not playerVehicle() then return tx.since >= 0.95 / COUPLED_HZ end
   if tx.uiFlag == nil then
     tx.uiFlag = false
     if obj.getUpdateUIflag then tx.uiFlag = pcall(obj.getUpdateUIflag, obj) end

@@ -7,7 +7,8 @@
 -- The vehicles send their data straight to the app (the 'VGSData' UI hook); this hub only
 -- tells the app which vehicles make up the player's chain ('VGSChain', a few times a second,
 -- which also tells it the game is still there while paused), passes the app's requests on to
--- the vehicles, and forwards data from vehicles that can't reach the UI directly.
+-- the vehicles, and forwards the data of every vehicle the player isn't in (BeamNG only reliably
+-- delivers a vehicle's own UI messages from the vehicle the player is in).
 --
 -- The UI app loads and enables this extension itself; no modScript needed.
 -- ---------------------------------------------------------------------------
@@ -144,7 +145,21 @@ function M.onVehiclePing(vid, coupledTo)
   reported[vid] = type(coupledTo) == "table" and coupledTo or {}
 end
 
--- Vehicles that can't trigger UI hooks themselves (older game versions) send through here.
+-- Vehicles the player isn't in send their updates through here: BeamNG only reliably delivers a
+-- vehicle's own UI messages from the vehicle the player is in. Passed on as it came, already JSON.
+function M.onVehicleRaw(vid, str)
+  if type(vid) ~= "number" or type(str) ~= "string" then return end
+  pings[vid] = simClock
+  if not enabled then return end
+  if guihooks.triggerRawJS then
+    guihooks.triggerRawJS('VGSData', str)
+  else
+    local ok, d = pcall(jsonDecode, str)
+    if ok and type(d) == "table" then guihooks.trigger('VGSData', d) end
+  end
+end
+
+-- Older builds of the vehicle script send through here.
 function M.onVehicleJson(str)
   local ok, d = pcall(jsonDecode, str)
   if ok and type(d) == "table" and type(d.id) == "number" then
