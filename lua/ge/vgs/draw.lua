@@ -677,6 +677,7 @@ local SOFT_PER_STRETCH, SOFT_MAX = 2.7, 1.1   -- device px of softening per unit
 function M.imguiGfx(im)
   local g = {}
   local dl, ox, oy, k = nil, 0, 0, 1
+  local soft = 0   -- device px of softening (see g.begin)
   local pool, used = {}, 0
   -- vectors are reused when their fields can be set (otherwise a new one each time)
   local reuse = pcall(function() local v = im.ImVec2(0, 0); v.x, v.y = 1, 2; assert(v.x == 1 and v.y == 2) end)

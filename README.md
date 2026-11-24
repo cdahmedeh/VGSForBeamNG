@@ -1,6 +1,6 @@
 # VGS Display for BeamNG.drive
 
-*Version 2.00*
+*Version 2.20*
 
 A live grip and G-force display for BeamNG.drive, inspired by the VGS (Visual Gravity System) in Enthusia Professional Racing. It shows what a simulator can't let you feel: the G-forces that press you into the seat as the car brakes, accelerates and corners, how hard each tyre is working, when one lets go and how badly, where the car is really going against where you're steering, and whether it's the front or the rear that's giving up.
 
@@ -203,7 +203,7 @@ The marker, its band and the words at the top only appear when the car is off ba
 
 The white bar grows from the middle of the tyre towards both ends. An empty tyre is rolling freely, and a full bar is right at the limit. It counts everything the tyre is doing at once: cornering, braking and driving together (see [The grip budget](#the-grip-budget)).
 
-BeamNG doesn't report a "friction used" figure per tyre, so the bar is an estimate: the force the tyre is making against the force it can grip with. Each axle's grip is learnt while you drive, so race slicks, all-terrain tyres and loose surfaces read right once the car has been near its limit. How it's worked out: [The grip bar](#the-grip-bar).
+BeamNG doesn't report a "friction used" figure per tyre, so the bar is an estimate: the force the tyre is making against the force it can grip with. Each tyre knows the surface under it (ice, snow, gravel, tarmac), even with the two sides of the car on different ones, and the tyres' own grip is learnt while you drive, so race slicks and all-terrain tyres read right once the car has been near its limit. How it's worked out: [The grip bar](#the-grip-bar).
 
 ### Sliding, and how far past the limit
 
@@ -495,7 +495,7 @@ Combining is fine, and fast, as long as the total stays inside the circle: 75 % 
 Two things decide how big each tyre's circle is:
 
 - **Load.** A tyre pressed harder into the road grips harder (a little less than in proportion). Braking moves load onto the front tyres and off the rear; accelerating does the opposite; cornering moves it onto the outside tyres. The G-force dot shows which way it's going; pale-blue wheels show where it's gone from.
-- **The surface and the tyre.** Snow shrinks everyone's circle; slicks grow it. The grip bars always show the share of the circle in use; how big the circle is, you read from how far out the G-force dot can get (see [Surfaces](#surfaces)).
+- **The surface and the tyre.** Snow shrinks everyone's circle; slicks grow it. The grip bars always show the share of each tyre's own circle in use (a tyre on ice has a smaller circle than its neighbour on tarmac); how big the circle is, you read from how far out the G-force dot can get (see [Surfaces](#surfaces)).
 
 Nearly everything below is this one idea applied to a different situation.
 
@@ -724,7 +724,7 @@ The same pale blue shows other load changes: the rear wheels of a car braking ha
 
 **The point:** the grip bars show the *share* of grip in use; the G-force dot shows how *much* grip there is. On every surface a full bar means "at the limit", but the limit comes at very different forces.
 
-**What to look for:** on tarmac a road car reaches the limit with the dot about two-thirds of the way out (1 g); on gravel perhaps a third of the way out; on snow or ice, barely off the middle. The display learns each axle's grip as you drive near its limit, so after a change of surface the bars may read low (or high) until the car has been near its limit there (see [Known limits](#known-limits)).
+**What to look for:** on tarmac a road car reaches the limit with the dot about two-thirds of the way out (1 g); on gravel perhaps a third of the way out; on snow or ice, barely off the middle. Each tyre knows the surface under it (BeamNG's ground model, and its grip), so the bars read right on a new surface straight away.
 
 **How to use it:** on a new surface, find the limit gently, braking in a straight line until the fronts fill, and note how far out the G-force dot gets. That's how hard you can brake or corner there: everything happens at that fraction of the force. A surface change mid-corner (a patch of ice, wet paint, gravel on the apex) shows as tyres going pink with the G-force dot suddenly smaller.
 
@@ -831,7 +831,7 @@ This part is for the curious, and for anyone tuning the settings. Nothing here i
 | File | Runs in | What it does |
 |---|---|---|
 | `lua/vehicle/extensions/vgsTelemetry.lua` | Each displayed vehicle | Measures the wheel layout, body outline, mass and centre of gravity once, and maps the drivetrain. Then, every graphics frame, it works out each wheel's grip, slide, torque, steering and assists, the inputs, the G-force, the direction of travel and the balance, and sends them through the hub. (With the app drawing everything, the vehicle you're driving sends them straight to the app as the `VGSData` UI hook whenever the UI is ready for a frame, and any other vehicle in the chain sends through the hub about 30 times a second.) |
-| `lua/ge/extensions/vgsHub.lua` | The game engine | Finds the vehicle you're driving and everything coupled to it, and keeps the telemetry running on exactly those. Keeps every vehicle's latest update, draws the moving parts of each app on screen every frame (with `vgs/draw.lua`), and passes each vehicle's layout and a few updates a second on to the app. Four times a second it tells the app which vehicles make up the player's chain and which renderer is drawing (`VGSChain`), which also tells it the game is still there while paused. It passes the app's requests to the vehicles (the balance's values on or off, resend the layout), falls back to the app's own renderer if drawing fails, and has the [console commands](#console-commands). |
+| `lua/ge/extensions/vgsHub.lua` | The game engine | Finds the vehicle you're driving and everything coupled to it, and keeps the telemetry running on exactly those. Keeps every vehicle's latest update, draws the moving parts of each app on screen every frame (with `vgs/draw.lua`), and passes each vehicle's layout and a few updates a second on to the app. Four times a second it tells the app which vehicles make up the player's chain and which renderer is drawing (`VGSChain`), which also tells it the game is still there while paused. It passes the app's requests to the vehicles (the balance's values on or off, resend the layout), falls back to the app's own renderer if drawing fails, sends the vehicles every surface's grip (from the game's ground models) for the grip bars, and has the [console commands](#console-commands). |
 | `lua/ge/vgs/draw.lua` | The game engine | The game-engine renderer: draws the tyres, the drivetrain's live state, the G-force dot and trail, the rim, the direction marker, the assist dots and the balance with ImGui, in a click-through window over the app. A port of the app's canvas renderer, with the same constants. |
 | `ui/modules/apps/VGSDisplay/app.js` | The UI | Keeps each vehicle's layout and latest data and puts the chain in order front to back. It lays everything out, draws the parts that only change with the layout (the circle, the outlines, the hitches) on its canvas, and hands the game engine the rest of the layout in its own pixels, with where the app is on screen. If the game engine isn't drawing, it draws everything itself, once per screen refresh. The renderer has no BeamNG dependencies, so the same file also runs in a plain browser (that's how the images in this README are made). |
 | `ui/modules/apps/VGSDisplay/app.json`, `app.png` | The UI | The app's name, category, default size and icon. |
@@ -844,9 +844,11 @@ Everything the vehicle script does runs protected: a problem in the display is l
 
 BeamNG doesn't report a "friction used" figure per tyre, so the bar is an estimate: the force the tyre is making against the force it can grip with.
 
-- **Sideways:** the tyre's share of its axle's cornering force. The axle's force comes from the grip model (see [How near each end is to its limit](#how-near-each-end-is-to-its-limit)): the car's mass and centre of gravity, its sideways acceleration and how fast its rotation is changing, with the drive and brake forces allowed for. It's shared between the axle's tyres by their load: a more heavily loaded tyre is stiffer and takes more of it, a little less than in proportion (`GRIP_LOAD_EXP`).
+- **Sideways:** the tyre's share of its axle's cornering force. The axle's force comes from the grip model (see [How near each end is to its limit](#how-near-each-end-is-to-its-limit)): the car's mass and centre of gravity, its sideways acceleration and how fast its rotation is changing, with the drive and brake forces allowed for. It's shared between the axle's tyres by their stiffness, which comes from their load: a more heavily loaded tyre is stiffer and takes more of it, a little less than in proportion (`GRIP_LOAD_EXP`). The surface doesn't change a tyre's stiffness much (on ice it corners almost as stiffly as on tarmac at the same slip angle), so it doesn't change the share either, until a tyre reaches its own limit: then it can't take more, and the rest goes to the axle's other tyres.
 - **Forwards:** the drive and brake torques on the wheel, divided by its radius.
-- **What it can grip with:** its load, BeamNG's own figure for that wheel, times its axle's grip (friction coefficient). The grip starts at a road tyre's on tarmac (`MU_NOMINAL`, 1.0) and is learnt as you drive. It's raised whenever the axle uses more than that, and right at the axle's peak, where the force *is* the grip, it's measured (`MU_TAU`). So race slicks, all-terrain tyres and loose surfaces read right once the car has been near its limit.
+- **What it can grip with:** its load, BeamNG's own figure for that wheel, times its grip (friction coefficient): the tyre's own grip, as it would be on tarmac, times the surface's.
+  - **The surface:** BeamNG reports what every wheel is touching (its ground model), and each ground model's peak grip (its static friction). The hub reads them all from the game when a level loads and sends each vehicle every surface's grip against tarmac's (`ASPHALT`): 1 on tarmac, about 0.7 on BeamNG's ice. So with one side of the car on ice, the tyres on the ice have less grip to use, and their bars read fuller than the tarmac side's for the same work, as they should.
+  - **The tyre:** starts at a road tyre's (`MU_NOMINAL`, 1.0) and is learnt for each axle as you drive, allowing for the surfaces under it. It's raised whenever the axle uses more than that, and right at the axle's peak, where the force *is* the grip, it's measured (`MU_TAU`). So race slicks and all-terrain tyres read right once the car has been near its limit, and what's learnt on one surface carries over to the next.
 - **At or past the limit:** an axle past its peak shows its tyres full, and the tyre's own slip counts too: its contact-patch slip speed divided by `SLIP_PEAK` (1.5 m/s), so a sliding or spinning tyre always shows.
 
 Before 1.0 every tyre took the same share of the car's sideways acceleration, against a fixed grip of 1.0, so a front tyre at its limit in understeer could read 70 % and a race tyre read high all the time. In the simulation (see [How it was tested](#how-it-was-tested)) the bar's average error fell by about a quarter across the test fleet, from 7.7 % to 5.9 % of the tyre's grip. Tyres far from a road tyre's grip (slicks, gravel) still read off until the car has been near its limit and the grip has been learnt.
@@ -1082,7 +1084,7 @@ The defaults suit almost everything, and the display was tuned against a large s
 
 | Setting | Default | What it does |
 |---|---|---|
-| `MU_NOMINAL` | 1.0 | Peak friction coefficient each axle's grip starts at, before it's learnt (see [The grip bar](#the-grip-bar)) |
+| `MU_NOMINAL` | 1.0 | Peak friction coefficient each axle's tyre grip starts at (as on tarmac), before it's learnt; the surface's grip is applied on top (see [The grip bar](#the-grip-bar)) |
 | `MU_TAU` | 1.5 s | Time at an axle's peak over which its grip (friction coefficient) is measured |
 | `GRIP_LOAD_EXP` | 0.8 | A tyre's stiffness grows with its load to this power (and its share of the axle's force with it) |
 | `SLIP_PEAK` | 1.5 m/s | Slip speed that reads as 100 % grip |
@@ -1292,7 +1294,7 @@ The defaults suit a road car on tarmac, and the display learns each car's tyres 
 1. Do a clean launch and a steady corner at the limit, and watch each tyre's grip bar. It should fill just as the car lets go.
 2. If it fills (and the tyre turns pink) well before the car lets go, raise `SLIP_LIMIT` and `SLIP_PEAK`; if the car lets go first, lower them. Keep `SLIP_PEAK` a bit below `SLIP_LIMIT`.
 3. Use `extensions.vgsHub.dumpTravel(10)` for the figures behind it: each axle's nearness to its limit and its learnt grip.
-4. The grip bars learn each axle's grip as you drive near the limit. If they sit too high or too low before that (a car on slicks, or on gravel, straight after spawning), adjust `MU_NOMINAL`, the grip they start from.
+4. The grip bars learn each axle's tyre grip as you drive near the limit. If they sit too high or too low before that (a car on slicks straight after spawning), adjust `MU_NOMINAL`, the grip they start from.
 5. If a car's warnings are consistently early or late, `NEAR_ON` moves them (lower warns earlier).
 6. Reload vehicle Lua (Ctrl+R) to apply the changes.
 
@@ -1323,7 +1325,7 @@ BeamNG's tyres grip according to how fast the contact patch is sliding, and the 
 
 **The warnings seem early or late for a car.** Run `extensions.vgsHub.dumpTravel(10)` and drive. Its `[vgs grip]` lines show the tyres' stiffness and where it came from (BeamNG's calibration, or learnt while driving), how near each end is to its limit (1 = at it) and the state. *Still learning* means the car hasn't had enough gentle cornering yet and the fixed slip angles are in use: drive a few gentle bends. If a car's are consistently off, `NEAR_ON` moves the warning.
 
-**The grip bars read too high or too low right after spawning, or after a change of surface.** The grip is learnt per axle as you drive near the limit. Take a corner or two near the limit on the new surface. See [Known limits](#known-limits).
+**The grip bars read too high or too low right after spawning.** The tyres' own grip is learnt per axle as you drive near the limit (the surface is known at once). Take a corner or two near the limit. See [Known limits](#known-limits).
 
 **A trailer doesn't appear.** It should show within half a second of hitching, including one hitched before you opened the app. If not, unhitch and re-hitch once.
 
@@ -1363,8 +1365,8 @@ It only shows when the car is off balance. No marker means neither end is near i
 **Is the yellow warning bad?**
 No. It means you're using most of the grip at one or both ends. Fast driving lives at the edge of yellow. Orange-red and pink-magenta are the car actually doing something you didn't ask for.
 
-**Why do the bars sometimes read high on a race car, or low on gravel, right after spawning?**
-The grip is learnt per axle while you drive near the limit. Until then it assumes a road tyre on tarmac. After a corner or two near the limit they read right.
+**Why do the bars sometimes read high on a race car right after spawning?**
+The tyres' own grip is learnt per axle while you drive near the limit. Until then it assumes a road tyre. After a corner or two near the limit they read right. The surface under each tyre is known from the start, so gravel, snow or ice don't need learning.
 
 **Why does the G-force dot not move when I'm parked on a slope?**
 It shows the G-force from the car's change of velocity, the part that moves the weight around, not gravity.
@@ -1392,9 +1394,9 @@ It follows the same idea: a top-down car whose tyres show how hard they're worki
 
 ## Known limits
 
-- A learnt tyre stiffness and grip start again when the vehicle is spawned or reset (BeamNG's own calibration doesn't need learning). Until a few gentle bends have been driven, the warnings use fixed slip angles, and the grip bars assume a road tyre on tarmac until the car has been near its limit.
-- The grip is learnt per axle, not per surface: driving from tarmac onto gravel, the bars read low until the car has been near its limit on the gravel, and back on tarmac they read high for a while.
-- For the same reason it isn't learnt per wheel. With one side of the car on ice, a tyre rolling on the ice reads short, even when it's at its own limit. What does show per wheel is everything that comes from the tyre's own slip: a wheel spinning or locking on the ice turns pink or red and gets its own ABS or traction-control dot, while the wheels on tarmac stay white. The split-surface scene in the tour shows both.
+- A learnt tyre stiffness and grip start again when the vehicle is spawned or reset (BeamNG's own calibration doesn't need learning). Until a few gentle bends have been driven, the warnings use fixed slip angles, and the grip bars assume a road tyre until the car has been near its limit.
+- A surface's grip is its ground model's peak friction. Loose ground also gives way under a tyre (sand, mud), which the friction figure doesn't include, so there the bars can read a little low until the tyre's grip has been learnt on it. And a tyre's grip on one surface against another isn't always the same as the surfaces' (a winter tyre on snow): the learning covers that only for the surface it last learnt on.
+- The tour's split-surface scene was made before 2.20, so its tyres on ice still read short there.
 - On very tall, heavy vehicles with grippy tyres, the inside tyres carry so little in a hard corner that the axle stiffens less than expected, and the warning comes early (about 75 % of the grip instead of 85 %). A truck's rear warning comes a little early too: the rear-most axle of a tandem works harder than the group.
 - With a trailer hitched, the trailer's pull on the hitch adds to the forces the grip model works out from the car's own mass, so the warnings can be a little off while towing hard through a corner.
 - Grip loss through bumps, kerbs or a change of surface shows as it happens, but a surface change also skews the learnt stiffness for a while (it averages over about 40 s of gentle cornering).
@@ -1504,6 +1506,11 @@ What still trips it, in the simulation: very tall, heavy vehicles on grippy tyre
   - End-to-end rendering of the vehicle script's real output at five app sizes.
 
 ## Changelog
+
+**2.20**
+
+- **Each tyre knows the surface under it.** The grip bars were learnt per axle, so with one side of the car on ice (or dirt) the tyres on the slippery side read *less* full than those on tarmac, the opposite of the truth, and after driving onto gravel or snow the bars read low until the car had been near its limit there. Now the hub reads every ground model's peak grip from the game and sends it to the vehicles, and each tyre's grip is the tyre's own (learnt as if on tarmac) times the surface's under it. The axle's cornering force is still shared by the tyres' stiffness, but a tyre at its own limit hands the rest to the others. In the simulation, with brush-like tyres (as BeamNG's behave) and one side on a surface with half the grip, the low side's bar went from 0.37 to 0.72 against a true 0.67 (its error from 0.30 to 0.05); with a car on a low-grip surface it hadn't driven on, from 0.30 to 0.65 against 0.65. On tarmac nothing changes: the 845-run fleet test scores the same as 2.00.
+- Fixed: the game-engine renderer set a global variable (`soft`) every frame.
 
 **2.00**
 

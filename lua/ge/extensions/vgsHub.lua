@@ -68,6 +68,33 @@ local function sendToVehicle(vid, cmd)
   if veh then veh:queueLuaCommand(cmd) end
 end
 
+-- Every surface's peak grip against tarmac's, by ground-model ID (the ID BeamNG gives each wheel
+-- for what it's touching), for the grip bars: a tyre on ice has less grip to use than one on
+-- tarmac. Read from the game's ground models: their static friction over ASPHALT's. Built once
+-- per level.
+local REF_SURFACE, REF_FRICTION = 'ASPHALT', 0.92   -- tarmac, and its friction if it can't be read
+local surfaceCmd = nil
+local function surfacesCmd()
+  if surfaceCmd then return surfaceCmd end
+  if not (be and be.getGroundModelCount and be.getGroundModelByID) then return '' end
+  local ref = REF_FRICTION
+  local okR, r = pcall(function() return core_environment.groundModels[REF_SURFACE].cdata.staticFrictionCoefficient end)
+  if okR and tonumber(r) and tonumber(r) > 0.05 then ref = tonumber(r) end
+  local okN, n = pcall(be.getGroundModelCount, be)
+  if not okN or type(n) ~= "number" then return '' end
+  local parts = {}
+  for i = 0, n do
+    local okG, gm = pcall(be.getGroundModelByID, be, i)
+    local d = okG and gm and gm.data
+    local f = d and tonumber(d.staticFrictionCoefficient)
+    if f and f > 0 then parts[#parts + 1] = string.format("[%d]=%.3f", i, f / ref) end
+  end
+  if #parts == 0 then return '' end
+  surfaceCmd = ' if extensions.vgsTelemetry and extensions.vgsTelemetry.setSurfaces then extensions.vgsTelemetry.setSurfaces({' ..
+    table.concat(parts, ',') .. '}) end'
+  return surfaceCmd
+end
+
 -- With the game engine drawing, every vehicle sends every frame, through here.
 local function routeCmd()
   return 'if extensions.vgsTelemetry and extensions.vgsTelemetry.setRoute then extensions.vgsTelemetry.setRoute(' ..
@@ -76,7 +103,7 @@ end
 
 local function activate(vid)
   sendToVehicle(vid, 'extensions.load("vgsTelemetry") if extensions.vgsTelemetry then ' ..
-    'extensions.vgsTelemetry.setDetail(' .. tostring(detail) .. ') extensions.vgsTelemetry.setActive(true) end ' .. routeCmd())
+    'extensions.vgsTelemetry.setDetail(' .. tostring(detail) .. ') extensions.vgsTelemetry.setActive(true) end ' .. routeCmd() .. surfacesCmd())
   activated[vid] = simClock
 end
 
@@ -443,6 +470,13 @@ function M.dumpDrivetrain() toPlayerVehicle('dumpDrivetrain()') end
 function M.dumpTravel(seconds) toPlayerVehicle('dumpTravel(' .. (tonumber(seconds) or 10) .. ')') end
 
 -- Game-engine coupler hooks (objId1 and objId2 are the two vehicles involved)
+-- A new level brings its own ground models: read them again, and tell the running vehicles.
+function M.onClientPostStartMission()
+  surfaceCmd = nil
+  local cmd = surfacesCmd()
+  if cmd ~= '' then for vid in pairs(activated) do sendToVehicle(vid, cmd) end end
+end
+
 function M.onCouplerAttached(objId1, objId2) addLink(objId1, objId2) end
 function M.onCouplerDetached(objId1, objId2) removeLink(objId1, objId2) end
 

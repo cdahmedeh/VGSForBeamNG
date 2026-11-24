@@ -257,6 +257,11 @@ local watch = { travel = 0, travelNext = 0, assists = false, assistValues = {} }
 
 -- What's sent, reused every frame (nothing new is allocated per frame in steady state)
 local wstate = {}       -- [i] = { grip, sliding, severity, fzAvg }
+-- Each surface's peak grip against tarmac's (its friction coefficient over ASPHALT's), by the
+-- ground-model ID BeamNG gives every wheel for what it's touching (contactMaterialID1). Sent by
+-- the hub, which reads them from the game's ground models; nil until then (every surface counts
+-- as tarmac, as before 2.20).
+local surfaces = nil
 local out = { w = {}, src = {}, dg = {}, inp = {}, gf = { x = 0, y = 0 } }
 local vdOut = {}        -- the balance's degrees (sent as out.vd while the app is open)
 local couplerList = {}
@@ -1211,6 +1216,90 @@ local function updateGraph()
 end
 
 local tcBraked = {}
+-- Each tyre's surface, and its share of its axle's cornering force.
+-- S.surf: the peak grip of the surface under the tyre against tarmac's (1 on tarmac, about 0.7 on
+-- BeamNG's ice). gm.sF / gm.sR: the axle's average, by load. The grip learnt for each axle
+-- (gm.muF / gm.muR) is the tyres' own, as if on tarmac, so a tyre's grip is that times its surface.
+-- S.fyAx: its share of the axle's sideways force (from the grip model). Below the limit the
+-- tyres share it as their stiffness does, which comes from their loads, not the surface: on ice a
+-- tyre corners almost as stiffly as on tarmac, so it uses more of its smaller grip. A tyre at its
+-- own limit can't take more: the rest goes to the axle's other tyres.
+local AXLE_KEYS = { { e = "eF", n = "nF", nB = "nFB", mu = "muF", s = "sF" },
+                   { e = "eR", n = "nR", nB = "nRB", mu = "muR", s = "sR" } }
+local axleWheels = { wl = nil, front = nil, rear = nil, { }, { } }   -- each axle's wheel indices, per layout
+local function axleShares(front, rear)
+  if axleWheels.wl ~= lay.wheels or axleWheels.front ~= front or axleWheels.rear ~= rear then
+    axleWheels.wl, axleWheels.front, axleWheels.rear = lay.wheels, front, rear
+    axleWheels[1], axleWheels[2] = {}, {}
+    for i, L in pairs(lay.wheels) do
+      local a = (front and L.y > front.y - 0.3) and 1 or ((rear and L.y < rear.cut) and 2 or nil)
+      if a then axleWheels[a][#axleWheels[a] + 1] = i end
+    end
+  end
+  local exp = TUNE.GRIP_LOAD_EXP
+  for a = 1, 2 do
+    local ids, K = axleWheels[a], AXLE_KEYS[a]
+    -- each tyre's surface, and the axle's average by load over the tyres on a known surface
+    local zs, z = 0, 0
+    for q = 1, #ids do
+      local i = ids[q]
+      local S, w = wstate[i], wheels.wheels[i]
+      if S then
+        S.surf, S.fyAx, S.mu0 = 1, nil, nil
+        local id = w and tonumber(w.contactMaterialID1) or -1
+        if surfaces and id >= 0 then S.mu0 = surfaces[id] end
+        if S.mu0 then
+          S.surf = clamp(S.mu0, 0.05, 5)
+          local fz = S.fzB or 0
+          if fz > MIN_LOAD then zs, z = zs + S.surf * fz, z + fz end
+        end
+      end
+    end
+    local avg = z > 0 and clamp(zs / z, 0.05, 5) or 1
+    gm[K.s] = avg
+    -- the axle's sideways force, shared by stiffness, each tyre at most its own grip
+    if gm.m and (gm[K.e] or 0) > 0 then
+      local N = math.abs(gm[K.nB] or gm[K.n] or 0)
+      local mu = gm[K.mu] or MU_NOMINAL
+      local wsum = 0
+      for q = 1, #ids do
+        local S = wstate[ids[q]]
+        if S then
+          local fzB = S.fzB or 0
+          S.shW = (fzB > 0 and fzB or 0) ^ exp
+          S.cap = mu * S.surf * (fzB > MIN_LOAD and fzB or MIN_LOAD)
+          S.full = false
+          wsum = wsum + S.shW
+        end
+      end
+      local left = N
+      for _ = 1, #ids do   -- each pass settles at least one tyre at its limit, or all the rest
+        local free = 0
+        for q = 1, #ids do local S = wstate[ids[q]] if S and not S.full then free = free + S.shW end end
+        if free <= 0 then break end
+        local over = false
+        for q = 1, #ids do
+          local S = wstate[ids[q]]
+          if S and not S.full and left * S.shW / free > S.cap and S.surf < avg * 0.98 then
+            S.fyAx, S.full, over = S.cap, true, true
+            left = left - S.cap
+          end
+        end
+        if not over then
+          local share = (left > 0 and left or 0) / free
+          for q = 1, #ids do local S = wstate[ids[q]] if S and not S.full then S.fyAx = share * S.shW end end
+          break
+        end
+      end
+      -- an axle past its limit as a whole: by stiffness (the tyres all full)
+      for q = 1, #ids do
+        local S = wstate[ids[q]]
+        if S and not S.fyAx then S.fyAx = (wsum > 0) and N * S.shW / wsum or 0 end
+      end
+    end
+  end
+end
+
 local function updateWheels(dt, fwd, right, speed, ev, hasGraph)
   local throttle = ev.throttle or 0
   local gripK = 1 - (1 - GRIP_SMOOTHING) ^ (30 * dt)
@@ -1224,6 +1313,7 @@ local function updateWheels(dt, fwd, right, speed, ev, hasGraph)
   local fSum, fN, rSum, rN = 0, 0, 0, 0
   for k in pairs(tcBraked) do tcBraked[k] = nil end
   local front, rear = lay.front, lay.rear
+  axleShares(front, rear)
   est.drvF, est.drvR = false, false   -- an axle driven right now (front, rear): both = all-wheel drive
   for _, o in ipairs(out.w) do
     local i = o.i
@@ -1291,10 +1381,13 @@ local function updateWheels(dt, fwd, right, speed, ev, hasGraph)
       if not airborne then
         local ax2 = (front and L.y > front.y - 0.3) and "F" or ((rear and L.y < rear.cut) and "R" or nil)
         local fzU = math.max(S.fzB, MIN_LOAD)
-        local fy, mu = nil, MU_NOMINAL
-        if ax2 and gm.m and (gm["e" .. ax2] or 0) > 0 then
-          fy = math.abs(gm["n" .. ax2 .. "B"] or gm["n" .. ax2] or 0) * math.max(S.fzB, 0) ^ TUNE.GRIP_LOAD_EXP / gm["e" .. ax2]
-          mu = gm["mu" .. ax2] or MU_NOMINAL
+        -- the tyre's grip: its axle's, scaled by the surface under it against the axle's
+        -- average (1 with every tyre on the same surface); its share of the axle's force from
+        -- axleShares, which allows for a tyre at its own limit
+        local fy, mu = nil, MU_NOMINAL * (S.surf or 1)
+        if ax2 and gm.m and S.fyAx then
+          fy = S.fyAx
+          mu = (gm["mu" .. ax2] or MU_NOMINAL) * (S.surf or 1)
         else
           fy = fzU * math.abs(kin.latAccel) / G
         end
@@ -1672,7 +1765,8 @@ local function gripStep(dt, slipF, slipR, turn, rearSliding, steady, steerF, ste
   local function learnMu(key, F, fx, z, p, ok)
     local mu = gm[key] or MU_NOMINAL
     if z > MIN_LOAD * 2 and slowFade >= 1 and ok and math.abs(gm.rdot) < 0.5 then
-      local used = math.sqrt(F * F + fx * fx) / z
+      -- as on tarmac: the axle's grip over the grip of the surfaces under it
+      local used = math.sqrt(F * F + fx * fx) / z / (gm[key == "muF" and "sF" or "sR"] or 1)
       -- held for a moment, so a quick spike in the estimate doesn't ratchet it up
       if used > mu * 0.98 then mu = mu + (used / 0.98 - mu) * clamp(dt / 0.3, 0, 1) end
       if ok and gm.ready and p >= TUNE.PAST_ON and p < TUNE.PAST_ON + 0.2 then
@@ -2212,6 +2306,8 @@ end
 local function setDetail(on) detail = on and true or false end
 -- Send the layout with the next update (the app asks when it doesn't have it)
 local function requestLayout() tx.staticDue = true end
+-- Each surface's peak grip by ground-model ID, from the hub (see surfaces)
+local function setSurfaces(t) if type(t) == "table" then surfaces = t end end
 -- Who draws (see transmit): true, the game engine; send everything through the hub
 local function setRoute(viaHub)
   viaHub = viaHub and true or false
@@ -2291,6 +2387,7 @@ M.updateGFX         = updateGFX
 M.setActive         = setActive
 M.setDetail         = setDetail
 M.requestLayout     = requestLayout
+M.setSurfaces       = setSurfaces
 M.setRoute          = setRoute
 M.onCouplerAttached = function(...) protect('coupler attached', onCouplerAttached, ...) end
 M.onCouplerDetached = function(...) protect('coupler detached', onCouplerDetached, ...) end
