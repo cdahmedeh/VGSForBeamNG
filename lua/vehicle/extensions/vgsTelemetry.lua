@@ -1934,8 +1934,16 @@ local function playerVehicle()
   return playerInfo.firstPlayerSeated == true
 end
 
+-- When the game engine draws the display (vgsHub's 'lua' renderer), every vehicle sends every
+-- frame's update through the hub, which draws it the next frame and passes a few a second on to
+-- the app. The hub sets this.
+local route = { viaHub = false }
+
 local function transmit(payload)
-  if guihooks and guihooks.trigger and playerVehicle() then
+  if route.viaHub then
+    obj:queueGameEngineLua(string.format("if extensions.vgsHub then extensions.vgsHub.onVehicleRaw(%d, %q) end",
+      obj:getId(), jsonEncode(payload)))
+  elseif guihooks and guihooks.trigger and playerVehicle() then
     guihooks.trigger('VGSData', payload)          -- the player's vehicle: straight to the UI, no hop
   else                                            -- any other vehicle (and older games): through the hub
     obj:queueGameEngineLua(string.format("if extensions.vgsHub then extensions.vgsHub.onVehicleRaw(%d, %q) end",
@@ -1970,6 +1978,8 @@ end
 -- then means every update is drawn at once, with no backlog building up when the game runs
 -- faster than the UI.
 local function uiWantsFrame()
+  -- the game engine draws: every frame
+  if route.viaHub then return true end
   -- the UI never asks a vehicle the player isn't in for a frame: send at a steady rate instead
   if not playerVehicle() then return tx.since >= 0.95 / COUPLED_HZ end
   if tx.uiFlag == nil then
@@ -2202,6 +2212,12 @@ end
 local function setDetail(on) detail = on and true or false end
 -- Send the layout with the next update (the app asks when it doesn't have it)
 local function requestLayout() tx.staticDue = true end
+-- Who draws (see transmit): true, the game engine; send everything through the hub
+local function setRoute(viaHub)
+  viaHub = viaHub and true or false
+  if viaHub ~= route.viaHub then tx.staticDue = true end   -- the new receiver gets the layout at once
+  route.viaHub = viaHub
+end
 
 -- Couplers (fifth wheel, tow hitch, articulation joints between separate vehicles)
 local function onCouplerAttached(nodeId, obj2id)
@@ -2275,6 +2291,7 @@ M.updateGFX         = updateGFX
 M.setActive         = setActive
 M.setDetail         = setDetail
 M.requestLayout     = requestLayout
+M.setRoute          = setRoute
 M.onCouplerAttached = function(...) protect('coupler attached', onCouplerAttached, ...) end
 M.onCouplerDetached = function(...) protect('coupler detached', onCouplerDetached, ...) end
 

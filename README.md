@@ -1,6 +1,6 @@
 # VGS Display for BeamNG.drive
 
-*Version 1.21*
+*Version 2.00*
 
 A live grip and G-force display for BeamNG.drive, inspired by the VGS (Visual Gravity System) in Enthusia Professional Racing. It shows what a simulator can't let you feel: the G-forces that press you into the seat as the car brakes, accelerates and corners, how hard each tyre is working, when one lets go and how badly, where the car is really going against where you're steering, and whether it's the front or the rear that's giving up.
 
@@ -112,7 +112,8 @@ It's a tool for learning to drive at the limit (threshold braking, trail braking
 - **The balance in words and degrees.** Whenever the car is off balance, the top of the circle says so: *Front near limit*, *Rear near limit*, *At the limit*, *Understeer* or *Oversteer* with how many degrees it's out by, *Drift* with the drift angle, or *Powerslide* with how far the rear is sliding.
 - **Driver assists.** ABS, ESC and traction control per wheel and per engine, for both BeamNG's classic assist script and its newer driving-dynamics electronics.
 - **The drivetrain, live.** Engines, motors, gearbox and differentials where they sit, shafts tinted by torque, diff lock state, disconnectable shafts, part-time 4WD, broken driveshafts.
-- **Low latency.** The vehicle you're driving sends its data straight to the app, exactly once per UI frame, using the same handshake BeamNG's own gauges use. The app draws once per screen refresh, carrying moving parts on smoothly between updates. In the simulation, through a slalom, the marker, the G-force dot and the grip bars trail the physics by 10 ms or less.
+- **Drawn at the game's frame rate.** Everything that moves is drawn by the game engine every frame, in a click-through layer laid exactly over the app, the way BeamNG's own minimap is drawn. The app's UI canvas only holds the parts that change with the layout. Every vehicle sends its data every frame, so what you see is one frame behind the physics, whatever rate the UI runs at. If the game-engine drawing ever fails, the app takes over and draws everything itself, as before.
+- **Low latency.** In the simulation, through a slalom, the marker, the G-force dot and the grip bars trail the physics by 10 ms or less.
 - **Tested against the physics.** Version 1.0 was checked frame by frame against a full four-wheel vehicle simulation: 35 vehicles (front, rear and all-wheel drive, nose- and tail-heavy, trucks, slicks to all-terrain tyres) through 27 manoeuvres each, from gentle cornering to spins. See [How it was tested](#how-it-was-tested).
 
 ## Install
@@ -126,7 +127,7 @@ It's a tool for learning to drive at the limit (threshold braking, trail braking
    - For learning, a big app near the middle of your view (around 350–450 pixels, just below the horizon) is easiest to read without taking your eyes off the road for long. Once you know it, a smaller one in a corner is enough to catch colours out of the corner of your eye.
    - You can add the app more than once, say a small one and a large one.
 
-Nothing else is needed. The app loads its own game-engine script when it opens and stops it when it closes. It starts the per-vehicle script on whatever you're driving and anything coupled to it, and stops it on vehicles you leave.
+Nothing else is needed. The app loads its own game-engine script when it opens and stops it when it closes. The moving parts are drawn by the game engine over the app; if they ever look out of place, see [Troubleshooting](#troubleshooting). It starts the per-vehicle script on whatever you're driving and anything coupled to it, and stops it on vehicles you leave.
 
 To update, replace the zip and restart the game (or reload the UI and vehicle Lua). To remove it, delete the zip (or its folder) from `mods`.
 
@@ -829,9 +830,10 @@ This part is for the curious, and for anyone tuning the settings. Nothing here i
 
 | File | Runs in | What it does |
 |---|---|---|
-| `lua/vehicle/extensions/vgsTelemetry.lua` | Each displayed vehicle | Measures the wheel layout, body outline, mass and centre of gravity once, and maps the drivetrain. Then, every graphics frame, it works out each wheel's grip, slide, torque, steering and assists, the inputs, the G-force, the direction of travel and the balance. The vehicle you're driving sends them straight to the app as the `VGSData` UI hook, whenever the UI is ready for a frame; any other vehicle in the chain (a trailer, a dolly) sends them through the hub instead, about 30 times a second. |
-| `lua/ge/extensions/vgsHub.lua` | The game engine | Finds the vehicle you're driving and everything coupled to it, and keeps the telemetry running on exactly those. Four times a second it tells the app which vehicles make up the player's chain (`VGSChain`), which also tells it the game is still there while paused. It passes the updates of every vehicle in the chain other than the one you're driving on to the app, as they came. It passes the app's requests to the vehicles (the balance's values on or off, resend the layout) and has the [console commands](#console-commands). |
-| `ui/modules/apps/VGSDisplay/app.js` | The UI | Keeps each vehicle's layout and latest data, puts the chain in order front to back, lays everything out and draws it on a canvas once per screen refresh. The renderer has no BeamNG dependencies, so the same file also runs in a plain browser (that's how the images in this README are made). |
+| `lua/vehicle/extensions/vgsTelemetry.lua` | Each displayed vehicle | Measures the wheel layout, body outline, mass and centre of gravity once, and maps the drivetrain. Then, every graphics frame, it works out each wheel's grip, slide, torque, steering and assists, the inputs, the G-force, the direction of travel and the balance, and sends them through the hub. (With the app drawing everything, the vehicle you're driving sends them straight to the app as the `VGSData` UI hook whenever the UI is ready for a frame, and any other vehicle in the chain sends through the hub about 30 times a second.) |
+| `lua/ge/extensions/vgsHub.lua` | The game engine | Finds the vehicle you're driving and everything coupled to it, and keeps the telemetry running on exactly those. Keeps every vehicle's latest update, draws the moving parts of each app on screen every frame (with `vgs/draw.lua`), and passes each vehicle's layout and a few updates a second on to the app. Four times a second it tells the app which vehicles make up the player's chain and which renderer is drawing (`VGSChain`), which also tells it the game is still there while paused. It passes the app's requests to the vehicles (the balance's values on or off, resend the layout), falls back to the app's own renderer if drawing fails, and has the [console commands](#console-commands). |
+| `lua/ge/vgs/draw.lua` | The game engine | The game-engine renderer: draws the tyres, the drivetrain's live state, the G-force dot and trail, the rim, the direction marker, the assist dots and the balance with ImGui, in a click-through window over the app. A port of the app's canvas renderer, with the same constants. |
+| `ui/modules/apps/VGSDisplay/app.js` | The UI | Keeps each vehicle's layout and latest data and puts the chain in order front to back. It lays everything out, draws the parts that only change with the layout (the circle, the outlines, the hitches) on its canvas, and hands the game engine the rest of the layout in its own pixels, with where the app is on screen. If the game engine isn't drawing, it draws everything itself, once per screen refresh. The renderer has no BeamNG dependencies, so the same file also runs in a plain browser (that's how the images in this README are made). |
 | `ui/modules/apps/VGSDisplay/app.json`, `app.png` | The UI | The app's name, category, default size and icon. |
 
 When you open the app, it loads and enables the hub; when you close the last copy, it disables the hub, which stops the telemetry on every vehicle. The wheel layout is measured once per spawn or reset, preferably while the steering is centred (it waits up to 1.5 s for that), and the drivetrain is mapped at the same time. A reset (R) gives the layout a new version number, so the app picks up the new one.
@@ -994,7 +996,23 @@ The result isn't exact, but every part stays visible. Disconnect diamonds go on 
 
 ## Performance and latency
 
-The display is built to add as little delay as possible between the physics and what you see:
+The display is built to add as little delay as possible between the physics and what you see.
+
+### Three layers
+
+Since 2.00 the display is drawn in three layers, the way BeamNG's own minimap is:
+
+| Layer | Where | What it draws, and when |
+|---|---|---|
+| The app's element | The UI | Nothing: it's the app's place in your layout. It loads the game-engine scripts, and ten times a second it checks where it is on screen and whether it's showing (it hides on menus, like the minimap, and when the UI is hidden) and tells the game engine |
+| The app's canvas | The UI | The parts that only change with the layout: the dark circle, the vehicles' outlines and the hitches. Redrawn only when the layout, the chain or the app's size changes. It also works out the whole layout (where every tyre, shaft and part goes) and hands it over |
+| The game-engine layer | The game engine, every frame | Everything that moves: the tyres, the shafts' torque, the differentials, the disconnects, the G-force dot and trail, the rim, the marker, the assist dots and the balance. Drawn with ImGui in a click-through window laid exactly over the app |
+
+- **Every frame, one frame behind.** Every vehicle in the chain sends its update through the hub every frame (it's queued for the game engine's next frame), and the hub draws it. So the moving parts are drawn at the game's own frame rate, whatever rate the UI runs at, and they're one frame behind the physics. Nothing needs to be carried on between updates, because every frame has its own.
+- **Light on the UI.** The UI no longer draws every refresh: it gets each vehicle's layout and four updates a second (`FORWARD_EVERY`), enough to lay the picture out, and redraws its canvas only when the layout changes.
+- **The app's own renderer, as a fallback.** If the game engine can't draw (no ImGui, a drawing error three times, or `setRenderer('cef')`), the hub says so and the app draws everything itself, as in 1.x. The rest of this section describes how that renderer keeps up with the game.
+
+### The app's own renderer
 
 - **One hop.** The vehicle you're driving sends its data straight to the app as a UI hook from its own Lua. Before 2.0 it went through the game-engine Lua first, which added a frame and a second round of encoding.
 - **Coupled vehicles through the hub.** BeamNG only reliably delivers a vehicle's own UI messages from the vehicle you're driving. From the others (a trailer, a dolly, the tractor while you're in the trailer) they get through for a moment after a switch or a coupling, then stop. So every other vehicle in the chain sends through the game-engine hub, which passes the message on as it came, with no decoding. That costs them a frame. The UI never asks those vehicles for a frame, so they send at a steady rate instead, about 30 times a second (`COUPLED_HZ`), and the app carries their motion on smoothly between updates. When you switch vehicles, the routes swap by themselves.
@@ -1016,12 +1034,13 @@ The display is built to add as little delay as possible between the physics and 
 - **Cheap frames.** The vehicle's layout, its fit below the balance and the text measurements are worked out once and reused until the layout or the app's size changes, so a frame only draws. Before 2.0 everything went every frame, twice.
 - **Filters on real time.** Every smoothing filter runs every frame on the actual frame time, so the display behaves the same at 30 or 200 frames per second.
 
-What it costs, measured outside the game (LuaJIT for the vehicle script, Chromium for the app):
+What it costs, measured outside the game (LuaJIT for the vehicle script and the game-engine renderer, Chromium for the app):
 
 | Part | Cost |
 |---|---|
-| Vehicle script, per frame | about 0.1 ms for a car or a six-wheel truck |
-| App, per draw | about 0.04 ms on the test machine (2.5.1 there: 0.03 ms, or 0.11 ms with its numbers mode) |
+| Vehicle script, per frame | about 0.1 ms for a car or a six-wheel truck, for each vehicle in the chain |
+| Game-engine renderer, per frame | about 0.015 ms of Lua for a car, 0.025 ms for a tractor and trailer, plus its 40–110 ImGui drawing calls (not measurable outside the game) |
+| App, per draw (its own renderer) | about 0.04 ms on the test machine (2.5.1 there: 0.03 ms, or 0.11 ms with its numbers mode) |
 | App, per update received | about 0.015 ms |
 
 In a simulation of frame pacing (uneven game frames, the UI's update gate, delivery delays and clumps, 60 and 144 Hz screens), the marker's frame-to-frame unevenness fell to between a quarter and a thirteenth of what drawing each update as it landed gave, and its delay between the message and the screen's refresh fell to about nothing at 45 fps and up:
@@ -1201,6 +1220,21 @@ The defaults suit almost everything, and the display was tuned against a large s
 | `DUAL_WIDTH_RATIO` | 1.0 | Tyre width ÷ radius above which a big wheel counts as a dual pair |
 | `DUAL_MIN_RADIUS` | 0.42 m | Only wheels at least this big can count as a pair by width |
 
+### In `lua/ge/extensions/vgsHub.lua`
+
+| Setting | Default | What it does |
+|---|---|---|
+| `FORWARD_EVERY` | 0.25 s | With the game engine drawing, how often each vehicle's update goes on to the app (its layout, and a new layout version, go at once) |
+| `PLACE_TIMEOUT` | 1.5 s | An app that hasn't said where it is for this long isn't drawn |
+| `MAX_ERRORS` | 3 | Drawing errors before the app's own renderer takes over for the rest of the session |
+| `EDGE` | 4 px | Room round the app in the overlay window, so strokes on its edge aren't cut off |
+
+The game-engine renderer (`lua/ge/vgs/draw.lua`) uses the same colours and sizes as the app (below); a change to one needs the same change in the other. Its own settings:
+
+| Setting | Default | What it does |
+|---|---|---|
+| `SOFT_PER_STRETCH`, `SOFT_MAX` | 2.7, 1.1 px | When the game stretches the UI to the screen (it often draws the UI at 1920 wide on a 2560 screen), the app's own lines come out soft. The game-engine layer softens its lines to match: by this many screen pixels per unit of stretch, at most `SOFT_MAX` (about 0.9 px at a 1.33 stretch; none when the UI isn't stretched) |
+
 ### In `ui/modules/apps/VGSDisplay/app.js`
 
 | Setting | Default | What it does |
@@ -1227,6 +1261,8 @@ The defaults suit almost everything, and the display was tuned against a large s
 | `ASSIST` | red, green, blue | Colours of the ABS, traction control and ESC dots |
 | `READ_MS` | 150 ms | How long the balance's degrees are averaged over before they're refreshed |
 | `COMPACT_BELOW` | 62 px | Circle radius below which the balance's words are shortened |
+| `PLACE_EVERY_MS` / `PLACE_KEEPALIVE_MS` | 100 / 500 ms | With the game engine drawing, how often the app checks where it is on screen, and tells the game engine even when nothing changed |
+| `DRIVE_ROUTES` | `play` | The UI screens the game-engine layer shows on (the ones BeamNG's minimap shows on); anywhere else, such as a menu, it hides |
 
 ## Console commands
 
@@ -1239,6 +1275,8 @@ These are typed into the Lua console (`~`), in its normal game-engine context ("
 | `extensions.vgsHub.dumpAssists()` | Every assist-related value the vehicle reports (`hasABS`, `hasTCS`, `tcsActive`, `escActive` and so on), each wheel's ABS flag and brake torques, and which assist controllers the vehicle has |
 | `extensions.vgsHub.watchAssists(true)` | Prints every change in those values as it happens, while you drive. `watchAssists(false)` stops it |
 | `extensions.vgsHub.dumpTravel(10)` | For the next 10 seconds (or however many you give), four times a second: the direction marker's workings and the grip model (see below) |
+| `extensions.vgsHub.setRenderer('cef')` | Who draws the display, kept for good (in `settings/vgsDisplay.json`): `'lua'` the game engine draws the moving parts, `'cef'` the app draws everything (as in 1.x), `'auto'` (the default) the game engine whenever it can. Runs in the game engine itself |
+| `extensions.vgsHub.getRenderer()` | Which renderer is drawing, the one you picked, and why the game-engine one was given up this session, if it was |
 
 `dumpTravel` prints two lines four times a second:
 
@@ -1275,7 +1313,7 @@ BeamNG's tyres grip according to how fast the contact patch is sliding, and the 
 
   Mod devices are recognised by their device category, not their name. Assist dots only show for assists that use BeamNG's standard flags or controllers; a mod's own assist system shows only if it does the same.
 - **Other apps and mods:** it uses its own extension names (`vgsHub`, `vgsTelemetry`) and its own UI hooks (`VGSData`, `VGSChain`), and doesn't change anything in the game. It doesn't use or change BeamNG's streams, so it doesn't affect other apps.
-- **Several copies:** you can add the app more than once, say a small one and a large one. They share the vehicles' data.
+- **Several copies:** you can add the app more than once, say a small one and a large one. They share the vehicles' data, and the game engine draws each one.
 - **Multiplayer and split screen:** it shows the vehicle player one is driving.
 - **Input devices:** it reads the inputs as the game applies them, so it works the same with a wheel, a pad or a keyboard.
 
@@ -1288,6 +1326,10 @@ BeamNG's tyres grip according to how fast the contact patch is sliding, and the 
 **The grip bars read too high or too low right after spawning, or after a change of surface.** The grip is learnt per axle as you drive near the limit. Take a corner or two near the limit on the new surface. See [Known limits](#known-limits).
 
 **A trailer doesn't appear.** It should show within half a second of hitching, including one hitched before you opened the app. If not, unhitch and re-hitch once.
+
+**The moving parts are out of place, or don't show, while the circle does.** The moving parts are drawn by the game engine over the app; the circle and outlines are the app's own. The game engine moves its layer with the app within a tenth of a second. If they still don't line up, or nothing moves, switch to the app's own renderer: `extensions.vgsHub.setRenderer('cef')` (and `setRenderer('auto')` to go back). Please report it with your screen layout and any `vgsHub` lines in the log.
+
+**The display shows over a menu or another app.** The game-engine layer is drawn on top of the UI, like BeamNG's minimap. It hides when the UI is hidden and on the screens the minimap hides on (menus), but not under popups or other apps placed on top of it. Move the other app, or switch to the app's own renderer (above).
 
 **Trailers show for a second, then disappear** (version 1.20 and older). BeamNG stops delivering the UI messages of vehicles you aren't in. Update to 1.21, which sends them through the game-engine hub instead. Afterwards, `extensions.vgsHub.state().pings` should show every vehicle in the chain counting up.
 
@@ -1310,7 +1352,10 @@ BeamNG's tyres grip according to how fast the contact patch is sliding, and the 
 ## Questions and answers
 
 **Does it slow the game down?**
-Hardly: about 0.1 ms per frame in the vehicle script and 0.04 ms per draw in the app, measured outside the game. See [Performance and latency](#performance-and-latency).
+Hardly: about 0.1 ms per frame in the vehicle script for each vehicle shown, and a few hundredths of a millisecond of Lua per frame to draw it, plus the ImGui drawing calls, measured outside the game. The UI now redraws only when the layout changes. See [Performance and latency](#performance-and-latency).
+
+**Why does it draw in the game engine now?**
+The UI runs on its own and often at a lower rate than the game, and every message to it takes a moment to arrive. Drawn by the game engine, like BeamNG's minimap, the display moves at the game's own frame rate, one frame behind the physics, and the UI has less to do. If it ever misbehaves, `extensions.vgsHub.setRenderer('cef')` brings back the app's own renderer.
 
 **Why is there no marker most of the time?**
 It only shows when the car is off balance. No marker means neither end is near its limit, which is most driving.
@@ -1358,6 +1403,7 @@ It follows the same idea: a top-down car whose tyres show how hard they're worki
 - Engine position comes from the engine's torque-reaction nodes, then from nodes in an engine group. Mods that define neither get the dashed, estimated position.
 - Grip use is an estimate, not a value BeamNG reports. See [The grip bar](#the-grip-bar).
 - The balance words and the marker are for the vehicle you're driving; coupled vehicles get the readouts by their wheels.
+- The game-engine layer is drawn on top of the whole UI, so a popup or another app placed over the display is covered by it (it hides on menus and when the UI is hidden). Its text uses the game's ImGui font, which is a little plainer than the app's.
 
 ## Glossary
 
@@ -1458,6 +1504,19 @@ What still trips it, in the simulation: very tall, heavy vehicles on grippy tyre
   - End-to-end rendering of the vehicle script's real output at five app sizes.
 
 ## Changelog
+
+**2.00**
+
+The moving parts are now drawn by the game engine, every frame, the way BeamNG's own minimap is drawn. (Not to be confused with the development build 2.0 below.)
+
+- **Three layers.** The app's element only marks the app's place on screen and says where it is; the app's canvas draws the parts that change with the layout (the circle, the outlines, the hitches) only when they change; the game engine draws everything that moves (tyres, shafts and diffs, the G-force dot and trail, the rim, the marker, the assist dots, the balance) in a click-through ImGui window laid exactly over the app. See [Three layers](#three-layers).
+- **At the game's frame rate.** Every vehicle in the chain sends every frame's update to the game engine, which draws it the next frame. The moving parts move at the game's frame rate however fast the UI runs, one frame behind the physics, with nothing to smooth over between updates.
+- **Lighter on the UI.** The app gets each vehicle's layout and four updates a second instead of every update, and redraws its canvas only when the layout changes. It still works out the whole layout, so the two renderers can't disagree about where anything goes.
+- **The app's own renderer stays** as the fallback: if the game's ImGui isn't there, or drawing fails three times, the app draws everything itself, as in 1.x. `extensions.vgsHub.setRenderer('cef' | 'lua' | 'auto')` picks one for good.
+- The game-engine layer hides on menus and when the UI is hidden, as the minimap does.
+- **The balance is easier to read.** Its words are about a tenth bigger in a large app (up to 12.5 px, from 11), the degrees a size bigger again, with half a line between them and a clear gap above the vehicle, which is drawn a little smaller to make room. In the game-engine layer the text is sized to match the app's own, word by word.
+- The game-engine renderer is a port of the app's canvas renderer. Checked against it on 99 scenes (every preview vehicle in four states, and 13 of the tour's situations), the two pictures match to within a few dozen pixels, the differences being only the font and the corners of lines. It was also checked through the real Dear ImGui library, rasterized as a graphics card would, against the app's renderer stretched the way the game stretches the UI.
+- Outlines are drawn without ImGui's closed-path flag, which the game doesn't honour (each tyre's left side went missing), and lines are softened to match the app's own when the game stretches the UI to the screen.
 
 **1.21**
 

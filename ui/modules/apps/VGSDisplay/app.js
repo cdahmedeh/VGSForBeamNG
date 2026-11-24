@@ -472,14 +472,27 @@
     ctx.restore();
   }
 
-  // Driveshafts, half-shafts, differentials, gearbox and power sources (under the tyres).
+  // Driveshafts, half-shafts, differentials, gearbox and power sources (under the tyres), in two
+  // steps: where everything goes (layoutDrivetrain, from the layout alone, so it's worked out once
+  // and also handed to the game-engine renderer) and drawing it with the live values
+  // (paintDrivetrain).
   // map(x, y) converts vehicle metres to canvas pixels; s = pixels per metre; tyreBox(w) gives a
   // wheel's drawn tyre in px ({ x, y, hx, hy }: centre, reach across, reach along), so shafts
   // can stop at its edge.
-  function drawDrivetrain(ctx, body, map, s, tyreBox) {
+  //
+  // The result, all in px: { shafts, parts, marks, tc, par, sz }
+  //   shafts: { pts: [{ x, y }], ws: [wheel ids it feeds], node, wend } in drawing order; wend
+  //           (a shaft ending at a wheel): { ax: 0 across / 1 along the vehicle, own, set: tyre
+  //           indices }, so its end can follow the tyre as it steers
+  //   parts:  engines ('eng'), gearboxes ('gb'), differentials ('diff'), motors ('mot'), in drawing
+  //           order: { k, x, y, node, si, dash }
+  //   marks:  disconnect diamonds { x, y, ux, uy, node, j: which of the node's disconnects }; a
+  //           locking hub's also { hub: its shaft's index, back: how far it sits from the shaft's end }
+  //   tc:     where each source's traction-control dot goes { x, y, r, si }
+  //   par:    each node's parent index (-1: none), for what's cut off by a disconnection
+  //   sz:     { dw: shaft width, ew, eh: engine, diff, gb, cp: diamond, mr: motor radius }
+  function layoutDrivetrain(body, map, s, tyreBox) {
     var g = body.geo, axles = g.axles;
-    ctx.save();
-    ctx.lineCap = 'butt';
 
     // Car's centreline. Engines sit on it even if the vehicle data puts them slightly
     // off-centre; only a motor that drives wheels on one side keeps its own lateral position.
@@ -494,6 +507,7 @@
       return (left > 0) !== (right > 0) ? +src.x : centreX;
     }
     var nodes = placeDrivetrain(body, centreX, sourceX);
+    nodes.forEach(function (n, k) { n.idx = k; });
     var drivenWidth = clamp(0.09 * s, 2, 4.5);
     var ew = clamp(ENGINE_W * s, 12, 34), eh = clamp(ENGINE_H * s, 9, 26);   // engine block (px)
     var diffPx = clamp(DIFF * s, 6, 12), gbPx = clamp(GB_SIZE * s, 9, 18);
@@ -614,12 +628,12 @@
       return 0;
     }
 
-    // Every shaft of the drive graph, half-shafts out to the wheels included: tinted by the
-    // torque going to the wheels below it; grey and dashed when disconnected (or below a
-    // disconnection). Only shafts that can disconnect get a diamond: a locking hub's just inside
+    // Every shaft of the drive graph, half-shafts out to the wheels included (tinted by the
+    // torque going to the wheels below it when drawn; grey and dashed when disconnected, or below
+    // a disconnection). Only shafts that can disconnect get a diamond: a locking hub's just inside
     // its wheel, any other at the first free spot on the shaft counting from the end it feeds,
     // never on top of another part.
-    var marks = [], taken = [];
+    var shafts = [], marks = [], taken = [];
     nodes.forEach(function (n) {
       if (!n.pt) return;
       var hw = 0, hh = 0;
@@ -640,16 +654,17 @@
       // Shafts are never drawn diagonally: one that has to go both along and across the
       // vehicle runs fore/aft from the part feeding it first (along the centreline, for a
       // centre part), then turns square and runs across to the part it feeds.
-      var pts = [a];
+      var pts = [{ x: a.x, y: a.y }];
       if (Math.abs(b.x - a.x) > 0.5 && Math.abs(b.y - a.y) > 0.5) pts.push({ x: a.x, y: b.y });
-      pts.push(b);
+      pts.push({ x: b.x, y: b.y });
       // A shaft to a wheel stops flush at the tyre's inner edge, not at the middle of the tyre.
       // Across the vehicle it stops at the inside of the whole set (the inner tyre of a dual);
       // along it (a centre wheel), at the tyre's end.
-      var w0 = n.k === 'wheel' && tyreBox ? (n.ws || [])[0] : null;
+      var w0 = n.k === 'wheel' && tyreBox ? (n.ws || [])[0] : null, wend = null;
       if (w0) {
         var from = pts[pts.length - 2], end = { x: b.x, y: b.y };
-        var boxes = (w0._set ? w0._set.wheels : [w0]).map(tyreBox), own = tyreBox(w0);
+        var setW = w0._set ? w0._set.wheels : [w0];
+        var boxes = setW.map(tyreBox), own = tyreBox(w0);
         if (Math.abs(from.y - b.y) <= 0.5) {
           var toRight = from.x < own.x;
           end.x = toRight
@@ -664,6 +679,8 @@
           if (down ? end.y < from.y : end.y > from.y) end.y = from.y;
         }
         pts[pts.length - 1] = end;
+        wend = { ax: Math.abs(from.y - b.y) <= 0.5 ? 0 : 1, own: body.wheels.indexOf(w0),
+                 set: setW.map(function (w) { return body.wheels.indexOf(w); }) };
       }
       var segs = [], len = 0;
       for (var q = 1; q < pts.length; q++) {
@@ -681,33 +698,21 @@
         return { x: sg.a.x + sg.ux * t, y: sg.a.y + sg.uy * t, ux: sg.ux, uy: sg.uy };
       }
       var first = segs[0], last = segs[segs.length - 1];
-      var ws = n.ws || [];
-      var torque = ws.length ? ws.reduce(function (sum, w) { return sum + (+w.dr || 0); }, 0) / ws.length : 0;
-      ctx.save();
-      if (n.dead) {
-        ctx.setLineDash([3, 3]);
-        ctx.strokeStyle = DRIVETRAIN.axle; ctx.lineWidth = Math.max(1.5, drivenWidth * 0.7);
-      } else {
-        ctx.strokeStyle = torqueColour(torque * 0.7); ctx.lineWidth = drivenWidth;
-      }
-      ctx.lineJoin = 'round';
-      ctx.beginPath(); ctx.moveTo(pts[0].x, pts[0].y);
-      for (var q2 = 1; q2 < pts.length; q2++) ctx.lineTo(pts[q2].x, pts[q2].y);
-      ctx.stroke();
-      ctx.restore();
+      shafts.push({ pts: pts, ws: (n.ws || []).map(function (w) { return w.i; }), node: n.idx, wend: wend });
 
       var v0 = Math.min(reach(P, first.ux, first.uy), len), v1 = Math.max(v0, len - reach(n, -last.ux, -last.uy));
       var h = cpPx * 0.65, cursor = v1 - h;
       // a locking hub's diamond goes right next to its wheel
       if (n.k === 'wheel') {
-        toArray(n.cp).forEach(function (c) {
+        toArray(n.cp).forEach(function (c, j) {
           var p = at(v1 - h - 2);
           taken.push({ x: p.x, y: p.y, hw: h, hh: h });
-          marks.push({ p: p, ux: p.ux, uy: p.uy, open: !!+c.o });
+          // hub: the shaft it sits on, so it can follow the steered tyre (h + 2 back from the end)
+          marks.push({ x: p.x, y: p.y, ux: p.ux, uy: p.uy, node: n.idx, j: j, hub: shafts.length - 1, back: h + 2 });
         });
         return;
       }
-      toArray(n.cp).forEach(function (c) {
+      toArray(n.cp).forEach(function (c, j) {
         var spot = null;
         for (var d = cursor; d >= v0 + h; d -= 1) {
           if (free(at(d), h)) { spot = d; break; }
@@ -715,34 +720,83 @@
         if (spot === null) spot = Math.max(v0, v1 - h);   // nowhere free: next to the part it feeds
         var p = at(spot);
         taken.push({ x: p.x, y: p.y, hw: h, hh: h });
-        marks.push({ p: p, ux: p.ux, uy: p.uy, open: !!+c.o });
+        marks.push({ x: p.x, y: p.y, ux: p.ux, uy: p.uy, node: n.idx, j: j });
         cursor = spot - 2 * h - 1;
       });
     });
 
-    // Engines, then gearboxes, then differentials on top (a transaxle's diff is inside the gearbox, and an
-    // engine sitting over its driven axle mustn't hide the lock state), then electric motors.
-    var tcDots = [];
-    function drawSource(src, ev) {
+    // Engines, then gearboxes, then differentials on top (a transaxle's diff is inside the gearbox,
+    // and an engine sitting over its driven axle mustn't hide the lock state), then electric
+    // motors; the traction-control dots go on top of everything, so no part can hide one.
+    var parts = [], tc = [];
+    function source(src, si, ev) {
       var sn = nodes.filter(function (n) { return n.k === 'src' && n.src === src && n.pt; })[0];
       var p = sn ? sn.pt : map(sourceX(src), +src.y);
-      ctx.save();
-      ctx.setLineDash(+src.e ? [3, 2] : []);
-      if (ev) drawMotor(ctx, p, motorR);
-      else drawEngine(ctx, p, ew, eh);
-      ctx.restore();
-      if (+src.tc) tcDots.push({ p: p, r: ev ? clamp(motorR * 0.5, 1.6, 3) : clamp(Math.min(ew, eh) * 0.17, 2, 3.6) });
+      parts.push({ k: ev ? 'mot' : 'eng', x: p.x, y: p.y, si: si, dash: +src.e ? 1 : 0 });
+      tc.push({ x: p.x, y: p.y, si: si, r: ev ? clamp(motorR * 0.5, 1.6, 3) : clamp(Math.min(ew, eh) * 0.17, 2, 3.6) });
     }
-    body.sources.forEach(function (src) { if (src.k !== 'ev') drawSource(src, false); });
-    nodes.forEach(function (n) { if (n.k === 'gb' && n.pt) drawGearbox(ctx, n.pt, gbPx); });
-    nodes.forEach(function (n) { if (n.k === 'diff' && n.pt) drawDiff(ctx, n.pt, diffPx, n.st, n.dead); });
-    body.sources.forEach(function (src) { if (src.k === 'ev') drawSource(src, true); });
+    body.sources.forEach(function (src, si) { if (src.k !== 'ev') source(src, si, false); });
+    nodes.forEach(function (n) { if (n.k === 'gb' && n.pt) parts.push({ k: 'gb', x: n.pt.x, y: n.pt.y, node: n.idx }); });
+    nodes.forEach(function (n) { if (n.k === 'diff' && n.pt) parts.push({ k: 'diff', x: n.pt.x, y: n.pt.y, node: n.idx }); });
+    body.sources.forEach(function (src, si) { if (src.k === 'ev') source(src, si, true); });
+
+    return {
+      shafts: shafts, parts: parts, marks: marks, tc: tc,
+      par: nodes.map(function (n) { return n.parent ? n.parent.idx : -1; }),
+      sz: { dw: drivenWidth, ew: ew, eh: eh, diff: diffPx, gb: gbPx, cp: cpPx, mr: motorR }
+    };
+  }
+
+  // Which drive-graph nodes are cut off: disconnected there (dc) or further up the line.
+  // dt: the live graph (each node's dc), par: each node's parent (parents come first).
+  function deadNodes(par, dt) {
+    var dead = [];
+    for (var k = 0; k < par.length; k++) dead[k] = !!(+((dt[k] || {}).dc) || (par[k] >= 0 && dead[par[k]]));
+    return dead;
+  }
+
+  // The drivetrain with its live values: torque in the shafts, the differentials' lock states,
+  // what's disconnected, the traction-control dots.
+  function paintDrivetrain(ctx, lay, body) {
+    var sz = lay.sz, dt = toArray(body.dt), byId = {};
+    body.wheels.forEach(function (w) { if (!(w.i in byId)) byId[w.i] = w; });
+    var dead = deadNodes(lay.par, dt);
+    ctx.save();
+    ctx.lineCap = 'butt';
+    lay.shafts.forEach(function (sh) {
+      var sum = 0, n = 0;
+      sh.ws.forEach(function (i) { var w = byId[i]; if (w) { sum += +w.dr || 0; n++; } });
+      var torque = n ? sum / n : 0, pts = sh.pts;
+      ctx.save();
+      if (dead[sh.node]) {
+        ctx.setLineDash([3, 3]);
+        ctx.strokeStyle = DRIVETRAIN.axle; ctx.lineWidth = Math.max(1.5, sz.dw * 0.7);
+      } else {
+        ctx.strokeStyle = torqueColour(torque * 0.7); ctx.lineWidth = sz.dw;
+      }
+      ctx.lineJoin = 'round';
+      ctx.beginPath(); ctx.moveTo(pts[0].x, pts[0].y);
+      for (var q = 1; q < pts.length; q++) ctx.lineTo(pts[q].x, pts[q].y);
+      ctx.stroke();
+      ctx.restore();
+    });
+    lay.parts.forEach(function (pt) {
+      var p = { x: pt.x, y: pt.y };
+      if (pt.k === 'eng' || pt.k === 'mot') {
+        ctx.save();
+        ctx.setLineDash(pt.dash ? [3, 2] : []);
+        if (pt.k === 'mot') drawMotor(ctx, p, sz.mr); else drawEngine(ctx, p, sz.ew, sz.eh);
+        ctx.restore();
+      } else if (pt.k === 'gb') drawGearbox(ctx, p, sz.gb);
+      else drawDiff(ctx, p, sz.diff, (dt[pt.node] || {}).st, dead[pt.node]);
+    });
     // disconnect diamonds last among the parts, so none is ever hidden under one
-    marks.forEach(function (m) { drawDisconnect(ctx, m.p, m.ux, m.uy, m.open, cpPx); });
+    lay.marks.forEach(function (m) {
+      var c = toArray((dt[m.node] || {}).cp)[m.j] || {};
+      drawDisconnect(ctx, { x: m.x, y: m.y }, m.ux, m.uy, !!+c.o, sz.cp);
+    });
     // traction-control dots on top of everything, so no part can hide one
-    tcDots.forEach(function (d) { drawTcDot(ctx, d.p, d.r); });
-
-
+    lay.tc.forEach(function (d) { if (+(body.sources[d.si] || {}).tc) drawTcDot(ctx, { x: d.x, y: d.y }, d.r); });
     ctx.restore();
   }
 
@@ -1153,8 +1207,8 @@
 
   // The balance, on two lines at the top of the circle, in the marker's colour: the degrees on
   // top, large, and the words under them. Both lines always sit at the same height.
-  function balanceFont(rPx) { return clamp(rPx * 0.058, 8.5, 11); }   // the words
-  function degreeFont(rPx) { return balanceFont(rPx) * 1.15; }       // the degrees, a touch bigger
+  function balanceFont(rPx) { return clamp(rPx * 0.064, 8.75, 12.5); }   // the words
+  function degreeFont(rPx) { return balanceFont(rPx) * 1.2; }        // the degrees, a size bigger
   var SHORT_WORD = { 'Understeer': 'Under', 'Front near limit': 'Front near', 'Rear near limit': 'Rear near', 'At the limit': 'At limit', 'Oversteer': 'Over', 'Drift': 'Drift', 'Powerslide': 'Powerslide', 'Neutral': 'Neutral' };
   // { word, deg (text, or '' when there's nothing to show), colour }, or null when the marker is hidden
   var STATE_WORD = { near: 'Front near limit', rnear: 'Rear near limit', limit: 'At the limit', under: 'Understeer', over: 'Oversteer', drift: 'Drift', pslide: 'Powerslide' };
@@ -1194,16 +1248,21 @@
     balanceCache.key = key;
     return (balanceCache.val = balanceLayoutNow(ctx, rPx, inner, compact));
   }
+  // b1, b2: the two baselines below the top of the band. The degrees' tops sit just under the
+  // top; half a line of the words' size between the degrees and the words; and under the words
+  // room for their descenders and a clear gap before the vehicle.
+  var BAL_GAP = 0.5, BAL_BELOW = 0.75;
   function balanceLayoutNow(ctx, rPx, inner, compact) {
-    var fs = balanceFont(rPx), dfs = degreeFont(rPx), h1 = dfs * 1.0, h2 = fs * 1.15;
+    var fs = balanceFont(rPx), dfs = degreeFont(rPx);
+    var b1 = dfs * 0.78, b2 = b1 + fs * (BAL_GAP + 0.74);
     // room for the widest of the words
     var w1 = measure(ctx, '88.8°', dfs, 700), w2 = 0;
     Object.keys(STATE_WORD).forEach(function (k) {
       var word = STATE_WORD[k];
       w2 = Math.max(w2, measure(ctx, compact ? (SHORT_WORD[word] || word) : word, fs, 600));
     });
-    var drop = Math.max(chordDrop(inner, w1), chordDrop(inner, w2) - h1) + 1;
-    return { fs: fs, dfs: dfs, drop: drop, h1: h1, band: drop + h1 + h2 + fs * 0.25 };
+    var drop = Math.max(chordDrop(inner, w1), chordDrop(inner, w2) - (b2 - fs * 0.74)) + 2;
+    return { fs: fs, dfs: dfs, drop: drop, b1: b1, b2: b2, h1: b2 - fs, band: drop + b2 + fs * BAL_BELOW };
   }
   // the band at the top of the circle the balance needs
   function balanceBand(ctx, rPx, inner, compact) { return balanceLayout(ctx, rPx, inner, compact).band; }
@@ -1213,8 +1272,8 @@
     var L = balanceLayout(ctx, rPx, inner, compact), top = cy - inner + L.drop;
     ctx.save();
     ctx.shadowColor = 'rgba(0, 0, 0, 0.7)'; ctx.shadowBlur = 3;
-    if (st.deg) text(ctx, st.deg, cx, top + L.dfs * 0.9, L.dfs, 700, st.colour, 'center');
-    text(ctx, st.word, cx, top + L.h1 + L.fs, L.fs, 600, st.colour, 'center');
+    if (st.deg) text(ctx, st.deg, cx, top + L.b1, L.dfs, 700, st.colour, 'center');
+    text(ctx, st.word, cx, top + L.b2, L.fs, 600, st.colour, 'center');
     ctx.restore();
   }
 
@@ -1247,22 +1306,17 @@
       .filter(function (b) { return b.wheels.length > 0; });
   }
 
-  // draw(data, opts): data = { bodies: [...] } (lead vehicle first); opts.read: the averaged
-  // readouts (the balance's degrees).
-  VGSRenderer.prototype.draw = function (data, opts) {
-    opts = opts || {};
-    var size = this.fit(), ctx = this.ctx, W = size.w, H = size.h;
-    var trail = this.gTrail;
-    ctx.clearRect(0, 0, W, H);
-    var bodies = prepareBodies(data);
-    if (!bodies.length) { trail.length = 0; this.leadId = undefined; drawEmpty(ctx, W, H); return; }
-    // a different vehicle: no trail from the old one
-    if (!bodies[0].gf || (this.leadId !== undefined && bodies[0].id !== this.leadId)) trail.length = 0;
-    this.leadId = bodies[0].id;
+  // Where everything goes for these bodies in a W x H app (px): the circle, the vehicles' scale and
+  // placement, their outlines and hitches, each vehicle's tyres and drivetrain. live: the shafts
+  // end at the tyres as they're steered right now (the canvas renderer); without it the tyres are
+  // taken straight ahead (the scene for the game-engine renderer, which works out where the shafts
+  // end itself every frame), so the layout only changes when the layout does.
+  VGSRenderer.prototype.layout = function (bodies, W, H, live) {
+    var ctx = this.ctx;
     // every vehicle is laid out from its real footprint when the vehicle reports one
     bodies.forEach(function (b) { b.geo = b._prep.geo || (b._prep.geo = bodyGeometry(b.wheels, b.sources, b.ext)); });
 
-    var scale, placements = [];
+    var scale, places = [], hitches = [];
     // The big circle always fills the app; vehicles are scaled to fit inside it, clear of the
     // input arcs on its rim.
     var rPx = Math.max(4, Math.min(W, H) / 2 - 2), ccx = W / 2, ccy = H / 2;
@@ -1271,16 +1325,9 @@
     // its words are shortened
     var compact = rPx < COMPACT_BELOW;
     var band = balanceBand(ctx, rPx, inner, compact);
-    ctx.beginPath(); ctx.arc(ccx, ccy, rPx, 0, Math.PI * 2);
-    ctx.fillStyle = STYLE.panelFill; ctx.fill();
-    ctx.strokeStyle = STYLE.panelStroke; ctx.lineWidth = 1.5; ctx.stroke();
-    var mk = this.markerState(bodies[0].inp);
-    drawInputArcs(ctx, ccx, ccy, rPx, bodies[0].inp, mk);
-
-    function outline(b, ox, oy) {
+    function place(b, ox, oy, outline) {
       var hw = b.geo.boxHalfW * scale, hh = b.geo.boxHalfH * scale;
-      roundRect(ctx, ox - hw, oy - hh, hw * 2, hh * 2, Math.min(6, hw * 0.2));
-      ctx.strokeStyle = STYLE.panelStroke; ctx.lineWidth = 1; ctx.stroke();
+      places.push({ body: b, ox: ox, oy: oy, outline: outline ? { x: ox - hw, y: oy - hh, w: hw * 2, h: hh * 2, r: Math.min(6, hw * 0.2) } : null });
     }
 
     if (bodies.length === 1) {
@@ -1290,8 +1337,7 @@
       var sk = [scale.toFixed(4), inner.toFixed(2), band.toFixed(2)].join('|'), sc = this.shrinkCache;
       if (!sc || sc.geo !== bodies[0].geo || sc.key !== sk) sc = this.shrinkCache = { geo: bodies[0].geo, key: sk, k: bandShrink(bodies[0], scale, inner, band) };
       scale *= sc.k;
-      if (bodies[0].geo.hasExt) outline(bodies[0], ccx, ccy);
-      placements.push({ body: bodies[0], ox: ccx, oy: ccy });
+      place(bodies[0], ccx, ccy, bodies[0].geo.hasExt);
     } else {
       // tractor + trailer, articulated sections: stacked front to back, one shared scale, moved
       // down clear of the balance
@@ -1301,23 +1347,17 @@
       var y = ccy + band / 2 - totalH * scale / 2, prevBottom = null;
       bodies.forEach(function (b) {
         var hh = b.geo.halfH * scale, oy = y + hh;
-        if (prevBottom !== null) {           // hitch
-          ctx.beginPath(); ctx.moveTo(ccx, prevBottom); ctx.lineTo(ccx, oy - b.geo.boxHalfH * scale);
-          ctx.strokeStyle = STYLE.panelStroke; ctx.lineWidth = 2; ctx.stroke();
-        }
-        outline(b, ccx, oy);
-        placements.push({ body: b, ox: ccx, oy: oy });
+        if (prevBottom !== null) hitches.push({ x: ccx, y0: prevBottom, y1: oy - b.geo.boxHalfH * scale });
+        place(b, ccx, oy, true);
         prevBottom = oy + b.geo.boxHalfH * scale;
         y = oy + hh + BODY_GAP * scale;
       });
     }
 
-    // Pass 1: drivetrains. Then the G-force dot (centred on the circle, from the lead vehicle).
-    // Pass 2: tyres and assist dots on top. Pass 3: the balance.
     var dims = function (wh) {
       return { w: Math.max(wh._wd * scale, MIN_TYRE_W), h: Math.max(wh._len * scale, MIN_TYRE_L) };
     };
-    placements.forEach(function (p) {
+    places.forEach(function (p) {
       var g = p.body.geo;
       var map = p.map = function (x, y) {   // vehicle metres -> canvas pixels, forward = up
         return { x: p.ox + (x - g.cx) * scale, y: p.oy - (y - g.cy) * scale };
@@ -1330,27 +1370,143 @@
         var c = map(st.cx, +wh.y);
         return { x: c.x + wh._slot * Math.max(st.pitch * scale, widest + 1.5), y: c.y };
       };
-      drawDrivetrain(ctx, p.body, map, scale, function (wh) {
+      p.dt = layoutDrivetrain(p.body, map, scale, function (wh) {
         // hx, hy: how far the (possibly steered) tyre reaches from its centre across and along
-        var pt = p.wheelPoint(wh), d = dims(wh), st = +wh.s || 0;
+        var pt = p.wheelPoint(wh), d = dims(wh), st = live ? (+wh.s || 0) : 0;
         var c = Math.abs(Math.cos(st)), sn = Math.abs(Math.sin(st));
         return { x: pt.x, y: pt.y,
                  hx: Math.min(c > 1e-6 ? d.w / 2 / c : Infinity, sn > 1e-6 ? d.h / 2 / sn : Infinity),
                  hy: Math.min(c > 1e-6 ? d.h / 2 / c : Infinity, sn > 1e-6 ? d.w / 2 / sn : Infinity) };
       });
     });
-    if (bodies[0].gf) drawGForce(ctx, trail, ccx, ccy, rPx, bodies[0].gf);
+    return { W: W, H: H, rPx: rPx, ccx: ccx, ccy: ccy, inner: inner, compact: compact, band: band,
+             scale: scale, places: places, hitches: hitches, dims: dims };
+  };
 
-    placements.forEach(function (p) {
+  // The parts that only change with the layout: the circle, the vehicles' outlines and the hitches.
+  function paintStatic(ctx, L) {
+    ctx.beginPath(); ctx.arc(L.ccx, L.ccy, L.rPx, 0, Math.PI * 2);
+    ctx.fillStyle = STYLE.panelFill; ctx.fill();
+    ctx.strokeStyle = STYLE.panelStroke; ctx.lineWidth = 1.5; ctx.stroke();
+  }
+  function paintOutlines(ctx, L) {
+    L.places.forEach(function (p, k) {
+      var h = k > 0 ? L.hitches[k - 1] : null;
+      if (h) {
+        ctx.beginPath(); ctx.moveTo(h.x, h.y0); ctx.lineTo(h.x, h.y1);
+        ctx.strokeStyle = STYLE.panelStroke; ctx.lineWidth = 2; ctx.stroke();
+      }
+      var o = p.outline;
+      if (o) {
+        roundRect(ctx, o.x, o.y, o.w, o.h, o.r);
+        ctx.strokeStyle = STYLE.panelStroke; ctx.lineWidth = 1; ctx.stroke();
+      }
+    });
+  }
+
+  // draw(data, opts): data = { bodies: [...] } (lead vehicle first); opts.read: the averaged
+  // readouts (the balance's degrees). Everything, with its live values.
+  VGSRenderer.prototype.draw = function (data, opts) {
+    opts = opts || {};
+    var size = this.fit(), ctx = this.ctx, W = size.w, H = size.h;
+    var trail = this.gTrail;
+    ctx.clearRect(0, 0, W, H);
+    var bodies = prepareBodies(data);
+    if (!bodies.length) { trail.length = 0; this.leadId = undefined; drawEmpty(ctx, W, H); return; }
+    // a different vehicle: no trail from the old one
+    if (!bodies[0].gf || (this.leadId !== undefined && bodies[0].id !== this.leadId)) trail.length = 0;
+    this.leadId = bodies[0].id;
+    var L = this.layout(bodies, W, H, true);
+    paintStatic(ctx, L);
+    var mk = this.markerState(bodies[0].inp);
+    drawInputArcs(ctx, L.ccx, L.ccy, L.rPx, bodies[0].inp, mk);
+    paintOutlines(ctx, L);
+
+    // Pass 1: drivetrains. Then the G-force dot (centred on the circle, from the lead vehicle).
+    // Pass 2: tyres and assist dots on top. Pass 3: the balance.
+    L.places.forEach(function (p) { paintDrivetrain(ctx, p.dt, p.body); });
+    if (bodies[0].gf) drawGForce(ctx, trail, L.ccx, L.ccy, L.rPx, bodies[0].gf);
+
+    L.places.forEach(function (p) {
       var wheelPoint = p.wheelPoint;
       p.body.wheels.forEach(function (wh) {
-        var pt = wheelPoint(wh), d = dims(wh);
+        var pt = wheelPoint(wh), d = L.dims(wh);
         drawTyre(ctx, pt.x, pt.y, d.w, d.h, wh, wh._set.side < 0, opts);
       });
-      drawAssistDots(ctx, p.body, wheelPoint, dims);
+      drawAssistDots(ctx, p.body, wheelPoint, L.dims);
     });
 
-    drawBalance(ctx, bodies[0], ccx, ccy, inner, rPx, opts, compact, mk);
+    drawBalance(ctx, bodies[0], L.ccx, L.ccy, L.inner, L.rPx, opts, L.compact, mk);
+  };
+
+  // ===== The scene for the game-engine renderer ==============================
+  // When the game engine draws the moving parts (see vgsDraw.lua), the app draws only what
+  // changes with the layout (the circle, the outlines, the hitches) and hands over everything
+  // else it has worked out, in the app's own pixels: where each tyre goes, the drivetrain, the
+  // assist dots' groups and the balance's layout. Nothing in it is a live value, so it only
+  // changes when the layout does.
+  function r2(v) { return Math.round(v * 100) / 100; }
+  // How wide the balance's text is in the app's own font (px), so the game engine can draw its
+  // text the same size: every word it can show, and each character of the degrees.
+  var DEG_CHARS = '0123456789.\u00b0';
+  function balanceWidths(ctx, bl, compact) {
+    var words = {}, chars = {};
+    Object.keys(STATE_WORD).forEach(function (k) {
+      var w = STATE_WORD[k], shown = compact ? (SHORT_WORD[w] || w) : w;
+      words[shown] = r2(measure(ctx, shown, bl.fs, 600));
+    });
+    for (var i = 0; i < DEG_CHARS.length; i++) chars[DEG_CHARS.charAt(i)] = r2(measure(ctx, DEG_CHARS.charAt(i), bl.dfs, 700));
+    return { words: words, chars: chars };
+  }
+  function sceneOf(L, bodies, ctx) {
+    var bl = balanceLayout(ctx, L.rPx, L.inner, L.compact), bw = balanceWidths(ctx, bl, L.compact);
+    return {
+      v: 1, dpr: r2(window.devicePixelRatio || 1), w: r2(L.W), h: r2(L.H), cx: r2(L.ccx), cy: r2(L.ccy), r: r2(L.rPx), inner: r2(L.inner),
+      compact: L.compact ? 1 : 0, bal: { fs: r2(bl.fs), dfs: r2(bl.dfs), drop: r2(bl.drop), h1: r2(bl.h1), b1: r2(bl.b1), b2: r2(bl.b2), ww: bw.words, cw: bw.chars },
+      lead: bodies[0].id,
+      b: L.places.map(function (p) {
+        var body = p.body, d = p.dt, groups = [];
+        body.geo.axles.forEach(function (a) {
+          var left = [], right = [];
+          a.wheels.forEach(function (w) { (w._set.side < 0 ? left : right).push(body.wheels.indexOf(w)); });
+          if (left.length) groups.push({ s: -1, t: left });
+          if (right.length) groups.push({ s: 1, t: right });
+        });
+        return {
+          id: body.id,
+          t: body.wheels.map(function (w) { var pt = p.wheelPoint(w), dm = L.dims(w); return [w.i, r2(pt.x), r2(pt.y), r2(dm.w), r2(dm.h)]; }),
+          g: groups,
+          sh: d.shafts.map(function (sh) {
+            var o = { n: sh.node, ws: sh.ws, p: [] };
+            sh.pts.forEach(function (q) { o.p.push(r2(q.x), r2(q.y)); });
+            if (sh.wend) o.we = sh.wend;
+            return o;
+          }),
+          pa: d.parts.map(function (q) { return { k: q.k, x: r2(q.x), y: r2(q.y), n: q.node, si: q.si, dash: q.dash }; }),
+          mk: d.marks.map(function (m) {
+            var o = { x: r2(m.x), y: r2(m.y), ux: r2(m.ux), uy: r2(m.uy), n: m.node, j: m.j };
+            if (m.hub !== undefined) { o.hub = m.hub; o.back = r2(m.back); }
+            return o;
+          }),
+          tc: d.tc.map(function (q) { return { x: r2(q.x), y: r2(q.y), r: r2(q.r), si: q.si }; }),
+          par: d.par,
+          sz: { dw: r2(d.sz.dw), ew: r2(d.sz.ew), eh: r2(d.sz.eh), diff: r2(d.sz.diff), gb: r2(d.sz.gb), cp: r2(d.sz.cp), mr: r2(d.sz.mr) }
+        };
+      })
+    };
+  }
+
+  // Only the parts that change with the layout; returns the scene for the game-engine renderer
+  // (with no bodies while there's no vehicle).
+  VGSRenderer.prototype.drawStatic = function (data) {
+    var size = this.fit(), ctx = this.ctx, W = size.w, H = size.h;
+    ctx.clearRect(0, 0, W, H);
+    var bodies = prepareBodies(data);
+    if (!bodies.length) { drawEmpty(ctx, W, H); return { v: 1, w: r2(W), h: r2(H), b: [] }; }
+    var L = this.layout(bodies, W, H, false);
+    paintStatic(ctx, L);
+    paintOutlines(ctx, L);
+    return sceneOf(L, bodies, ctx);
   };
   var COMPACT_BELOW = 62;      // circle radius (px) below which the balance's words are shortened
 
@@ -1632,6 +1788,23 @@
   function pushDetail() { lua('if extensions.vgsHub then extensions.vgsHub.setDetail(' + (instances.length > 0) + ') end'); }
   function nowMsApp() { return (window.performance && performance.now) ? performance.now() : Date.now(); }
   var ANIMATE_AFTER_MS = 1500;   // keep drawing every refresh this long after the last update (the trail fades)
+  var PLACE_EVERY_MS = 100;      // how often the app checks where it is on screen (game-engine renderer)
+  var PLACE_KEEPALIVE_MS = 500;  // and tells the game engine even when nothing changed
+  var SCENE_KEEPALIVE_MS = 3000; // the scene is re-sent this often (a reloaded hub picks it up)
+  // Routes the game's own minimap draws on (the drive screen); anywhere else (a menu) it hides.
+  var DRIVE_ROUTES = { play: 1, '': 1 };
+
+  // Is the drive screen showing? (the new UI's router; unknown: yes)
+  function onDriveScreen() {
+    try {
+      var r = window.vueRouter && window.vueRouter.currentRoute;
+      var name = r && (r.value ? r.value.name : r.name);
+      if (typeof name !== 'string') return true;
+      return !!DRIVE_ROUTES[name];
+    } catch (e) { return true; }
+  }
+
+  var nextKey = 1;
 
   angular.module('beamng.apps')
   .directive('vgsDisplay', [function () {
@@ -1652,6 +1825,14 @@
         var opts = me.opts;
         instances.push(me);
         var pending = false, alive = true, lastData = 0, lastChain = 0;
+        // Who draws the moving parts: 'cef' this app, every screen refresh (as 1.x); 'lua' the game
+        // engine, every game frame, over the app (the hub says which, with the chain). In 'lua'
+        // this app only lays the picture out, draws the parts that change with the layout, and
+        // tells the game engine where it is on screen.
+        var mode = 'cef';
+        var key = 'v' + (nextKey++) + '_' + Math.floor(Math.random() * 1e6);
+        var sentScene = null, sentSceneAt = 0, sentPlace = null, sentPlaceAt = 0, cefVisible = true;
+
         // While updates are coming in, the app draws on every screen refresh, with the moving
         // parts where they are at that moment (see Motion), so motion is as smooth as the screen
         // allows whatever rate the updates come at. Several updates in one refresh cost one
@@ -1662,10 +1843,50 @@
           pending = false;
           if (!alive) return;
           var t = nowMsApp();
+          if (mode === 'lua') {
+            // the layout only: redrawn and handed over when it changes
+            try {
+              var scene = renderer.drawStatic(store.frame(t));
+              var json = JSON.stringify(scene);
+              if (json !== sentScene || t - sentSceneAt > SCENE_KEEPALIVE_MS) {
+                if (json.indexOf(']==]') < 0) lua('if extensions.vgsHub then extensions.vgsHub.setScene("' + key + '", [==[' + json + ']==]) end');
+                sentScene = json; sentSceneAt = t;
+              }
+            } catch (e) { if (window.console) console.error('VGS Display:', e); }
+            return;
+          }
           try { renderer.draw(store.frame(t), opts); } catch (e) { if (window.console) console.error('VGS Display:', e); }
           if (t - lastData < ANIMATE_AFTER_MS) schedule();
         }
         function schedule() { if (!pending && alive) { pending = true; raf(render); } }
+
+        // Where the app is on screen, as fractions of the window, and whether it's showing.
+        function place(force) {
+          if (mode !== 'lua' || !alive) return;
+          var t = nowMsApp(), r = element[0].getBoundingClientRect();
+          var vw = window.innerWidth || 1, vh = window.innerHeight || 1;
+          var vis = cefVisible && r.width > 0 && r.height > 0 && !document.hidden && onDriveScreen() &&
+                    r.right > 0 && r.bottom > 0 && r.left < vw && r.top < vh;
+          var f = function (v) { return (Math.round(v * 1e5) / 1e5).toString(); };
+          var msg = [f(r.left / vw), f(r.top / vh), f(r.width / vw), f(r.height / vh), vis].join(', ');
+          if (force || msg !== sentPlace || t - sentPlaceAt > PLACE_KEEPALIVE_MS) {
+            lua('if extensions.vgsHub then extensions.vgsHub.place("' + key + '", ' + msg + ') end');
+            sentPlace = msg; sentPlaceAt = t;
+          }
+          if (r.width !== renderer.lastW || r.height !== renderer.lastH) { renderer.lastW = r.width; renderer.lastH = r.height; schedule(); }
+        }
+        var placer = setInterval(function () { place(false); }, PLACE_EVERY_MS);
+
+        function setMode(m) {
+          m = m === 'lua' ? 'lua' : 'cef';
+          if (m === mode) return;
+          mode = m;
+          sentScene = null; sentPlace = null;
+          if (mode === 'cef') lua('if extensions.vgsHub then extensions.vgsHub.dropView("' + key + '") end');
+          else place(true);
+          schedule();
+        }
+
         function enableHub() {
           lua('extensions.load("vgsHub") if extensions.vgsHub then extensions.vgsHub.setEnabled(true) end');
           pushDetail();
@@ -1684,8 +1905,13 @@
         });
         scope.$on('VGSChain', function (event, chain) {
           lastChain = nowMsApp();
-          try { if (store.setChain(chain)) schedule(); } catch (e) { if (window.console) console.error('VGS Display: bad chain message', e); }
+          try {
+            if (chain && chain.r) setMode(chain.r);
+            if (store.setChain(chain)) schedule();
+          } catch (e) { if (window.console) console.error('VGS Display: bad chain message', e); }
         });
+        // the UI hidden (the game's hide-UI key): the game engine hides its part too
+        scope.$on('onCefVisibilityChanged', function (event, visible) { cefVisible = visible !== false; place(true); });
 
         // Re-enable the hub if it goes quiet (level change, Lua reload, another instance closed).
         // While the game is paused the hub keeps talking, so the last picture stays up.
@@ -1693,15 +1919,18 @@
           var t = nowMsApp();
           if (t - Math.max(lastData, lastChain) > 2500) enableHub();
           if (t - lastData > 6000 && t - lastChain > 6000 && store.hasData()) { store.clear(); schedule(); }
+          if (t - lastChain > 6000 && mode === 'lua') setMode('cef');   // no hub: draw everything here
         }, 1000);
 
-        var ro = window.ResizeObserver ? new ResizeObserver(schedule) : null;
+        var ro = window.ResizeObserver ? new ResizeObserver(function () { schedule(); place(true); }) : null;
         if (ro) ro.observe(element[0]);
 
         scope.$on('$destroy', function () {
           alive = false;
           clearInterval(watchdog);
+          clearInterval(placer);
           if (ro) ro.disconnect();
+          lua('if extensions.vgsHub then extensions.vgsHub.dropView("' + key + '") end');
           instances.splice(instances.indexOf(me), 1);
           if (instances.length) pushDetail();
           else lua('if extensions.vgsHub then extensions.vgsHub.setEnabled(false) end');
